@@ -151,14 +151,16 @@ fn build_from_tags(base: &str, from: &str, prefix: &str, no_pr: bool, dry: bool,
         let branch = format!("{}{}", prefix, g.tag);
         info!("({}/{}) Rebuilding branch {}", idx + 1, total_groups, branch);
 
-        git_rw(dry, &["checkout", "-B", &branch, &parent_branch])?;
-        for c in &g.commits {
-            git_rw(dry, &["cherry-pick", c])?;
-        }
-        git_rw(dry, &["push", "--force-with-lease", "origin", &branch])?;
+        // Use an ephemeral worktree to avoid touching the current checkout or local branches
+        let parent_remote = to_remote_ref(&parent_branch);
+        let tmpdir = format!("/tmp/spr-{}-{}-{}", g.tag, idx + 1, std::process::id());
+        git_rw(dry, &["worktree", "add", "--detach", &tmpdir, &parent_remote])?;
+        for c in &g.commits { git_rw_in(dry, &tmpdir, &["cherry-pick", c])?; }
+        git_rw_in(dry, &tmpdir, &["push", "--force-with-lease", "origin", &format!("HEAD:refs/heads/{}", &branch)])?;
+        git_rw(dry, &["worktree", "remove", "--force", &tmpdir])?;
 
         if !no_pr {
-            let num = upsert_pr(&branch, &parent_branch, &g.pr_title()?, &g.pr_body()?, dry)?;
+            let num = upsert_pr(&branch, &sanitize_gh_base_ref(&parent_branch), &g.pr_title()?, &g.pr_body()?, dry)?;
             stack.push(PrRef { number: num, head: branch.clone(), base: parent_branch.clone() });
         }
 
@@ -219,7 +221,7 @@ fn restack_existing(base: &str, prefix: &str, no_pr: bool, dry: bool, limit: Opt
             git_rw(dry, &["merge", "--no-ff", parent, "-m", &format!("spr: merge {} into {}", parent, child)])?;
             git_rw(dry, &["push", "origin", child])?;
 
-            if !no_pr { gh_rw(dry, &["pr", "edit", child, "--base", parent])?; }
+            if !no_pr { gh_rw(dry, &["pr", "edit", child, "--base", &sanitize_gh_base_ref(parent)])?; }
         }
 
         // Collect for the visual pass (bottom→top order)
@@ -443,10 +445,43 @@ fn shellish(args: &[&str]) -> String {
     }).collect::<Vec<_>>().join(" ")
 }
 
+fn sanitize_gh_base_ref(base: &str) -> String {
+    if let Some(stripped) = base.strip_prefix("origin/") { return stripped.to_string(); }
+    base.to_string()
+}
+
+fn safe_checkout_reset(dry: bool, branch: &str, start_point: &str) -> Result<()> {
+    // If branch exists, back it up to avoid losing local commits
+    let exists = git_ro(&["rev-parse", "--verify", branch]).is_ok();
+    if exists {
+        let sha = git_ro(&["rev-parse", branch])?.trim().to_string();
+        let backup = format!("spr-backup/{}-{}", branch.replace('/', "_"), &sha[..8.min(sha.len())]);
+        info!("Backing up existing branch {} to {}", branch, backup);
+        if !dry { git_ro(&["branch", &backup, branch])?; }
+    }
+    git_rw(dry, &["checkout", "-B", branch, start_point])?;
+    Ok(())
+}
+
 fn verbose_log_cmd(tool: &str, args: &[&str]) {
     if std::env::var_os("SPR_VERBOSE").is_some() {
         info!("{} {}", tool, shellish(args));
     }
+}
+
+fn git_rw_in(dry: bool, dir: &str, args: &[&str]) -> Result<String> {
+    let mut v: Vec<String> = Vec::with_capacity(args.len() + 2);
+    v.push("-C".to_string());
+    v.push(dir.to_string());
+    for a in args { v.push((*a).to_string()); }
+    let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+    git_rw(dry, &refs)
+}
+
+fn to_remote_ref(name: &str) -> String {
+    let name = name.strip_prefix("refs/heads/").unwrap_or(name);
+    let name = name.strip_prefix("origin/").unwrap_or(name);
+    format!("origin/{}", name)
 }
 
 /* ------------------ GitHub PR helpers ------------------ */
@@ -476,12 +511,12 @@ fn upsert_pr(branch: &str, parent: &str, title: &str, body: &str, dry: bool) -> 
     #[derive(Deserialize)] struct V { number: u64 }
     let existing: Vec<V> = serde_json::from_str(&json)?;
     if let Some(v) = existing.get(0) {
-        gh_rw(dry, &["pr", "edit", &format!("#{}", v.number), "--title", title, "--base", parent, "--body", body])?;
+        gh_rw(dry, &["pr", "edit", &format!("#{}", v.number), "--title", title, "--base", &sanitize_gh_base_ref(parent), "--body", body])?;
         return Ok(v.number);
     }
 
     // Create new PR
-    gh_rw(dry, &["pr", "create", "--head", branch, "--base", parent, "--title", title, "--body", body])?;
+    gh_rw(dry, &["pr", "create", "--head", branch, "--base", &sanitize_gh_base_ref(parent), "--title", title, "--body", body])?;
 
     // Fetch created PR number
     let json2 = gh_ro(&["pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number"])?;
