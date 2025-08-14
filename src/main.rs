@@ -430,62 +430,33 @@ fn ensure_tool(name: &str) -> Result<()> {
 fn git_ro(args: &[&str]) -> Result<String> {
     if std::env::var_os("SPR_DRY_RUN").is_some() {
         info!("DRY-RUN: git {}", shellish(args));
-        // Minimal placeholders to allow flow to continue printing commands
-        if args.get(0) == Some(&"merge-base") {
-            return Ok("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n".to_string());
-        }
-        if args.get(0) == Some(&"log") {
-            let fmt = args.iter().find(|a| a.starts_with("--format=")).map(|s| *s).unwrap_or("");
-            if fmt.contains("%H%x00%B%x1e") {
-                let s = "1111111111111111111111111111111111111111\x00feat: one\n\npr:newLogic\x1e2222222222222222222222222222222222222222\x00feat: two\n\npr:ghCmdUpdate\x1e";
-                return Ok(s.to_string());
-            }
-            if fmt.contains("%B") {
-                return Ok("feat: placeholder\n\npr:newLogic\n".to_string());
-            }
-            return Ok(String::new());
-        }
-        if args.get(0) == Some(&"rev-parse") { return Ok("cafebabecafebabecafebabecafebabecafebabe\n".to_string()); }
-        if args.get(0) == Some(&"ls-remote") { return Ok(String::new()); }
-        return Ok(String::new());
     }
     verbose_log_cmd("git", args);
     run("git", args)
 }
 fn git_rw(dry: bool, args: &[&str]) -> Result<String> {
     if dry {
+        // Allow executing safe local ops in dry-run to mimic real flow closely
+        let mut idx = 0;
+        let mut in_tmp = false;
+        if let Some(first) = args.get(0) { if *first == "-C" && args.len() >= 2 { idx = 2; in_tmp = args[1].starts_with("/tmp/spr-"); } }
+        let sub = args.get(idx).copied().unwrap_or("");
+        let is_push = sub == "push";
+        let is_worktree = sub == "worktree";
+        let allow = (in_tmp && !is_push) || is_worktree;
+        if allow {
+            info!("DRY-RUN (exec): git {}", shellish(args));
+            return run("git", args);
+        }
         info!("DRY-RUN: git {}", shellish(args));
-        Ok(String::new())
-    } else {
-        verbose_log_cmd("git", args);
-        run("git", args)
+        return Ok(String::new());
     }
+    verbose_log_cmd("git", args);
+    run("git", args)
 }
 fn gh_ro(args: &[&str]) -> Result<String> {
     if std::env::var_os("SPR_DRY_RUN").is_some() {
         info!("DRY-RUN: gh {}", shellish(args));
-        // Return simple placeholders so callers don't fail in dry-run
-        if args.len() >= 3 && args[0] == "pr" && args[1] == "list" && args.iter().any(|a| *a == "--json") {
-            if std::env::var_os("SPR_DRY_ASSUME_EXISTING").is_some() {
-                // Try to find --head value
-                let mut head_val: Option<String> = None;
-                let mut i = 0;
-                while i < args.len() {
-                    if args[i] == "--head" {
-                        if i + 1 < args.len() { head_val = Some(args[i+1].to_string()); break; }
-                    } else if let Some(rest) = args[i].strip_prefix("--head=") { head_val = Some(rest.to_string()); break; }
-                    i += 1;
-                }
-                let fake = head_val.map(|h| format!("[{{\"number\":{}}}]", fake_pr_number(&h))).unwrap_or_else(|| "[]".to_string());
-                return Ok(fake);
-            }
-            return Ok("[]".to_string());
-        }
-        if args.len() >= 3 && args[0] == "pr" && args[1] == "view" && args.iter().any(|a| *a == "--json") {
-            if args.iter().any(|a| *a == "body") { return Ok("{\"body\":\"\"}".to_string()); }
-            if args.iter().any(|a| *a == "number") { return Ok("{\"number\":0}".to_string()); }
-        }
-        return Ok(String::new());
     }
     verbose_log_cmd("gh", args);
     run("gh", args)
