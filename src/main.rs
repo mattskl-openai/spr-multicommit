@@ -58,9 +58,6 @@ enum Cmd {
 
     /// Prepare PRs for landing (e.g., squash)
     Prep {
-        #[command(subcommand)]
-        what: PrepWhat,
-
         /// Base branch to locate the root of the stack
         #[arg(short = 'b', long, default_value = "main")]
         base: String,
@@ -69,9 +66,33 @@ enum Cmd {
         #[arg(long, default_value = "spr/")]
         prefix: String,
 
+        /// Prep N PRs from bottom of stack (use 0 for all)
+        #[arg(long, conflicts_with = "exact")]
+        until: Option<usize>,
+
+        /// Prep exactly this PR index (1-based from bottom)
+        #[arg(long, conflicts_with = "until")]
+        exact: Option<usize>,
+
         /// Print state-changing commands instead of executing
         #[arg(long)]
         dry_run: bool,
+    },
+
+    
+
+    /// List entities
+    List {
+        #[command(subcommand)]
+        what: ListWhat,
+
+        /// Base branch to locate the root of the stack
+        #[arg(short = 'b', long, default_value = "main")]
+        base: String,
+
+        /// Branch prefix for per-PR branches
+        #[arg(long, default_value = "spr/")]
+        prefix: String,
     },
 }
 
@@ -83,10 +104,13 @@ enum Extent {
     Commits { n: usize },
 }
 
-#[derive(Subcommand, Debug)]
-enum PrepWhat {
-    /// Squash the first N PRs (bottom-up) into a single commit each and force-push (use 0 for all)
-    Pr { n: usize },
+#[derive(Clone, Copy, Debug)]
+enum PrepSelection { Until(usize), Exact(usize), All }
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+enum ListWhat {
+    /// List PRs in the stack (bottom-up)
+    Pr,
 }
 
 fn main() -> Result<()> {
@@ -135,20 +159,21 @@ fn main() -> Result<()> {
                 restack_existing(&base, &prefix, no_pr, dry_run, limit)?;
             }
         }
-        Cmd::Prep {
-            what,
-            base,
-            prefix,
-            dry_run,
-        } => {
+        Cmd::Prep { base, prefix, until, exact, dry_run } => {
             ensure_tool("git")?;
             ensure_tool("gh")?;
             if dry_run {
                 std::env::set_var("SPR_DRY_RUN", "1");
             }
-            match what {
-                PrepWhat::Pr { n } => prep_squash_first_n_prs(&base, &prefix, n, dry_run)?,
-            }
+            let selection = if let Some(n) = until { if n == 0 { PrepSelection::All } else { PrepSelection::Until(n) } }
+                            else if let Some(i) = exact { PrepSelection::Exact(i) }
+                            else { PrepSelection::All };
+            prep_squash(&base, &prefix, selection, dry_run)?;
+        }
+        Cmd::List { what, base, prefix } => {
+            ensure_tool("git")?;
+            ensure_tool("gh")?;
+            match what { ListWhat::Pr => list_prs_display(&base, &prefix)? }
         }
     }
     Ok(())
@@ -387,8 +412,8 @@ fn restack_existing(
 
 /* ------------------ prep (squash) ------------------ */
 
-/// Squash the first N PRs (bottom-up) into a single commit each and force-push.
-fn prep_squash_first_n_prs(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
+/// Squash PRs according to selection; operate locally then run update for the affected groups.
+fn prep_squash(base: &str, prefix: &str, selection: PrepSelection, dry: bool) -> Result<()> {
     // Work purely on local commit stack: build groups from base..HEAD
     let merge_base = git_ro(&["merge-base", base, "HEAD"])?.trim().to_string();
     let lines = git_ro(&["log", "--format=%H%x00%B%x1e", "--reverse", &format!("{}..HEAD", merge_base)])?;
@@ -396,9 +421,9 @@ fn prep_squash_first_n_prs(base: &str, prefix: &str, n: usize, dry: bool) -> Res
     if groups.is_empty() { info!("Nothing to prep"); return Ok(()); }
 
     let total_groups = groups.len();
-    let num_to_prep = if n == 0 { total_groups } else { n.min(total_groups) };
-    let to_prep = groups.iter().take(num_to_prep).cloned().collect::<Vec<_>>();
-    info!("Locally squashing first {} group(s)", to_prep.len());
+    let num_to_prep = match selection { PrepSelection::All => total_groups, PrepSelection::Until(n) => n.min(total_groups), PrepSelection::Exact(i) => { if i==0 || i>total_groups { bail!("--exact out of range (1..={})", total_groups); } 1 } };
+    let to_prep = match selection { PrepSelection::Exact(i) => groups.iter().skip(i-1).take(1).cloned().collect::<Vec<_>>(), _ => groups.iter().take(num_to_prep).cloned().collect::<Vec<_>>() };
+    info!("Locally squashing {} group(s)", to_prep.len());
     for (i, g) in to_prep.iter().enumerate() {
         info!("Group {}: tag = {}", i + 1, g.tag);
         for (j, sha) in g.commits.iter().enumerate() {
@@ -406,8 +431,8 @@ fn prep_squash_first_n_prs(base: &str, prefix: &str, n: usize, dry: bool) -> Res
         }
     }
       
-    // Build a new linear chain: for each group, create a single commit with tree of group tip
-    let mut parent_sha = merge_base;
+    // Build a new chain: starting parent depends on selection
+    let mut parent_sha = match selection { PrepSelection::Exact(i) => { if i==1 { merge_base.clone() } else { groups[i-2].commits.last().unwrap().clone() } }, _ => merge_base.clone() };
     for g in &to_prep {
         let tip = g.commits.last().ok_or_else(|| anyhow!("Empty group {}", g.tag))?;
         let tree = git_ro(&["rev-parse", &format!("{}^{{tree}}", tip)])?.trim().to_string();
@@ -417,7 +442,8 @@ fn prep_squash_first_n_prs(base: &str, prefix: &str, n: usize, dry: bool) -> Res
     }
 
     // Replay the remaining commits (not prepped) on top to preserve the rest of the stack
-    let remainder: Vec<String> = groups.iter().skip(num_to_prep).flat_map(|g| g.commits.iter().cloned()).collect();
+    let skip_after = match selection { PrepSelection::Exact(i) => i, _ => num_to_prep };
+    let remainder: Vec<String> = groups.iter().skip(skip_after).flat_map(|g| g.commits.iter().cloned()).collect();
     for sha in remainder {
         let tree = git_ro(&["rev-parse", &format!("{}^{{tree}}", sha)])?.trim().to_string();
         let msg = git_ro(&["log", "-1", "--format=%B", &sha])?.trim_end().to_string();
@@ -429,8 +455,8 @@ fn prep_squash_first_n_prs(base: &str, prefix: &str, n: usize, dry: bool) -> Res
     let cur_branch = git_ro(&["symbolic-ref", "--quiet", "--short", "HEAD"])?.trim().to_string();
     git_rw(dry, &["update-ref", &format!("refs/heads/{}", cur_branch), &parent_sha])?;
 
-    // Immediately run update for the prepped groups only (0 means all)
-    let limit = if n == 0 { None } else { Some(Limit::ByPr(num_to_prep)) };
+    // Immediately run update for affected groups
+    let limit = match selection { PrepSelection::All => None, PrepSelection::Until(_) => Some(Limit::ByPr(num_to_prep)), PrepSelection::Exact(_) => None };
     build_from_tags(base, "HEAD", prefix, false, dry, limit)
 }
 
@@ -536,6 +562,28 @@ fn parse_groups(raw: &str) -> Result<Vec<Group>> {
         }
     }
     Ok(groups)
+}
+
+fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
+    // Derive stack from local commits (source of truth)
+    let merge_base = git_ro(&["merge-base", base, "HEAD"])?.trim().to_string();
+    let lines = git_ro(&["log", "--format=%H%x00%B%x1e", "--reverse", &format!("{}..HEAD", merge_base)])?;
+    let groups = parse_groups(&lines)?;
+    if groups.is_empty() { info!("No groups discovered; nothing to list."); return Ok(()); }
+
+    // Fetch PRs to annotate with numbers when available
+    let prs = list_spr_prs(prefix)?; // may be empty; that's fine
+
+    for (i, g) in groups.iter().enumerate() {
+        let head_branch = format!("{}{}", prefix, g.tag);
+        let num = prs.iter().find(|p| p.head == head_branch).map(|p| p.number);
+        let count = g.commits.len();
+        match num {
+            Some(n) => info!("{}: {} (#{}) - {} commit(s)", i+1, head_branch, n, count),
+            None => info!("{}: {} - {} commit(s)", i+1, head_branch, count),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
