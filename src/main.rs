@@ -1,401 +1,517 @@
-use std::env;
-use std::error::Error;
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Parser, Subcommand};
+use regex::Regex;
+use serde::Deserialize;
 use std::process::Command;
+use tracing::{error, info, warn};
 
-const HELP: &str = r#"
-spr creates a series of GitHub PRs that are 'stacked' by managing the base branch
-Each commit that should start a new PR should be tagged with `pr:<unique name>`
-spr update creates 1 PR per commit with a `pr:<tag>`
-Any intermediate commits without a tag get added to the first ancestor PR that has a tag, as a separate commit
-"#;
-
-fn print_help() {
-    println!("{HELP}");
+#[derive(Parser, Debug)]
+#[command(name = "spr", version, about = "Stacked PRs from commit tags or existing spr/* branches")]
+struct Cli {
+    /// Verbose output for underlying git/gh commands
+    #[arg(long)]
+    verbose: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Build/refresh stacked PRs
+    Update {
+        /// Base branch to stack onto (root PR bases on this)
+        #[arg(short = 'b', long, default_value = "main")]
+        base: String,
 
-    // Print usage info when requested and exit early
-    if args.iter().any(|a| a == "--help" || a == "--h") {
-        print_help();
-        return;
-    }
+        /// Branch prefix for per-PR branches
+        #[arg(long, default_value = "spr/")]
+        prefix: String,
 
-    // Dispatch to the `update` subcommand when invoked
-    if args.get(1).map(|s| s.as_str()) == Some("update") {
-        let dry_run = args.iter().any(|a| a == "--dry-run");
-        let mut runner = RealRunner;
-        if let Err(e) = update_with_runner(dry_run, &mut runner) {
-            eprintln!("{e}");
-            std::process::exit(1);
+        /// Source ref to read commits from (if building from tags)
+        #[arg(long, default_value = "HEAD")]
+        from: String,
+
+        /// Don’t create PRs, only (re)create branches
+        #[arg(long)]
+        no_pr: bool,
+
+        /// If set, always restack existing spr/* PR branches (skip tag parsing)
+        #[arg(long)]
+        restack: bool,
+
+        /// Print all state-changing git/gh commands instead of executing them
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Limit how much to update (optional sub-mode)
+        #[command(subcommand)]
+        extent: Option<Extent>,
+    },
+
+    /// Prepare PRs for landing (e.g., squash)
+    Prep {
+        #[command(subcommand)]
+        what: PrepWhat,
+
+        /// Base branch to locate the root of the stack
+        #[arg(short = 'b', long, default_value = "main")]
+        base: String,
+
+        /// Branch prefix for per-PR branches
+        #[arg(long, default_value = "spr/")]
+        prefix: String,
+
+        /// Print state-changing commands instead of executing
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+enum Extent {
+    /// Update the first N PRs (bottom-up)
+    Pr { n: usize },
+    /// Update only the first N commits from base..from (push partial groups if needed)
+    Commits { n: usize },
+}
+
+#[derive(Subcommand, Debug)]
+enum PrepWhat {
+    /// Squash the first N PRs (bottom-up) into a single commit each and force-push
+    Pr { n: usize },
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_target(false)
+        .compact()
+        .init();
+
+    let cli = Cli::parse();
+    if cli.verbose { std::env::set_var("SPR_VERBOSE", "1"); }
+    match cli.cmd {
+        Cmd::Update { base, prefix, from, no_pr, restack, dry_run, extent } => {
+            ensure_tool("git")?;
+            ensure_tool("gh")?;
+            let limit = extent.map(|e| match e { Extent::Pr { n } => Limit::ByPr(n), Extent::Commits { n } => Limit::ByCommits(n) });
+            if restack {
+                restack_existing(&base, &prefix, no_pr, dry_run, limit)?;
+            } else if has_tagged_commits(&base, &from)? {
+                build_from_tags(&base, &from, &prefix, no_pr, dry_run, limit)?;
+            } else {
+                info!("No pr:<tag> markers found between {} and {}. Falling back to --restack.", base, from);
+                restack_existing(&base, &prefix, no_pr, dry_run, limit)?;
+            }
+        }
+        Cmd::Prep { what, base, prefix, dry_run } => {
+            ensure_tool("git")?;
+            ensure_tool("gh")?;
+            match what {
+                PrepWhat::Pr { n } => prep_squash_first_n_prs(&base, &prefix, n, dry_run)?,
+            }
         }
     }
+    Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct Commit {
-    hash: String,
-    message: String,
-}
+/* ------------------ update (from tags) ------------------ */
 
-#[derive(Debug, Clone)]
-struct Pr {
-    tag: String,
-    base: String,
-    commits: Vec<Commit>,
-}
+/// Bootstrap/refresh stack from pr:<tag> markers on `from` vs merge-base(base, from).
+fn build_from_tags(base: &str, from: &str, prefix: &str, no_pr: bool, dry: bool, limit: Option<Limit>) -> Result<()> {
+    let merge_base = git_ro(&["merge-base", base, from])?.trim().to_string();
+    let lines = git_ro(&[
+        "log",
+        "--format=%H%x00%B%x1e",
+        "--reverse",
+        &format!("{merge_base}..{from}"),
+    ])?;
+    let mut groups: Vec<Group> = parse_groups(&lines)?;
 
-#[derive(Clone)]
-struct CmdOutput {
-    status: i32,
-    stdout: String,
-}
-
-trait Runner {
-    fn run(&mut self, cmd: &str, args: &[&str]) -> Result<CmdOutput, Box<dyn Error>>;
-}
-
-struct RealRunner;
-
-impl Runner for RealRunner {
-    fn run(&mut self, cmd: &str, args: &[&str]) -> Result<CmdOutput, Box<dyn Error>> {
-        let output = Command::new(cmd).args(args).output()?;
-        Ok(CmdOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8(output.stdout)?,
-        })
-    }
-}
-
-fn update_with_runner<R: Runner>(dry_run: bool, runner: &mut R) -> Result<(), Box<dyn Error>> {
-    // Determine base branch and stack prefix from the environment
-    let main_branch = env::var("SPR_MAIN_BRANCH").unwrap_or_else(|_| "main".to_string());
-    let spr_name = env::var("SPR_NAME").unwrap_or_else(|_| "spr".to_string());
-
-    // Collect commits that are newer than the base branch so we can figure out
-    // which PRs need to be updated
-    let out = runner.run(
-        "git",
-        &[
-            "log",
-            &format!("{}..HEAD", main_branch),
-            "--oneline",
-            "--reverse",
-        ],
-    )?;
-    if out.status != 0 {
-        return Err("git log failed".into());
-    }
-    let log = out.stdout;
-
-    // Track the set of PRs we need to update and the most recent tag seen
-    let mut prs: Vec<Pr> = Vec::new();
-    let mut current_tag: Option<String> = None;
-
-    // Walk each commit ahead of the base branch
-    for line in log.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(2, ' ');
-        let hash = parts.next().unwrap().to_string();
-        let message = parts.next().unwrap_or("").to_string();
-
-        // Start a new PR whenever a commit carries a `pr:<tag>` marker
-        if let Some(tag) = extract_tag(&message) {
-            current_tag = Some(tag.clone());
-            let base = prs
-                .last()
-                .map(|p| format!("{}/{}", spr_name, p.tag))
-                .unwrap_or_else(|| main_branch.clone());
-            prs.push(Pr {
-                tag,
-                base,
-                commits: Vec::new(),
-            });
-        } else if current_tag.is_none() {
-            // An untagged commit at the start has nowhere to go
-            return Err(format!("commit {} has no pr:<tag>", hash).into());
-        }
-
-        // Skip commits that already exist on the remote branch
-        let tag = current_tag.clone().unwrap();
-        let branch = format!("{}/{}", spr_name, tag);
-        let res = runner.run(
-            "git",
-            &[
-                "merge-base",
-                "--is-ancestor",
-                &hash,
-                &format!("origin/{}", branch),
-            ],
-        );
-        let already = matches!(res, Ok(ref o) if o.status == 0);
-        if already {
-            continue;
-        }
-
-        // Record the commit (minus any tag marker) for the appropriate PR
-        let pr = prs.iter_mut().find(|p| p.tag == tag).unwrap();
-        let msg = if extract_tag(&message).is_some() {
-            strip_tag(&message)
-        } else {
-            message
-        };
-        pr.commits.push(Commit { hash, message: msg });
+    if groups.is_empty() {
+        info!("No groups discovered; nothing to do.");
+        return Ok(());
     }
 
-    // Push updated branches and create PRs when not in dry-run mode
-    for pr in prs {
-        if pr.commits.is_empty() {
-            continue;
+    // Apply extent limits
+    groups = apply_limit_groups(groups, limit)?;
+    let total_groups = groups.len();
+
+    info!(
+        "Preparing {} group(s): {}",
+        groups.len(),
+        groups.iter().map(|g| g.tag.as_str()).collect::<Vec<_>>().join(", ")
+    );
+
+    // Build bottom→top and collect PR refs for the visual update pass.
+    let mut parent_branch = base.to_string();
+    let mut stack: Vec<PrRef> = vec![];
+
+    for (idx, g) in groups.iter_mut().enumerate() {
+        let branch = format!("{}{}", prefix, g.tag);
+        info!("({}/{}) Rebuilding branch {}", idx + 1, total_groups, branch);
+
+        git_rw(dry, &["checkout", "-B", &branch, &parent_branch])?;
+        for c in &g.commits {
+            git_rw(dry, &["cherry-pick", c])?;
         }
-        let branch = format!("{}/{}", spr_name, pr.tag);
-        let head = pr.commits.last().unwrap().hash.clone();
-        if dry_run {
-            println!("git push origin {}:refs/heads/{}", head, branch);
-            println!("gh pr create --base {} --head {}", pr.base, branch);
-        } else {
-            runner.run(
-                "git",
-                &["push", "origin", &format!("{}:refs/heads/{}", head, branch)],
-            )?;
-            runner.run(
-                "gh",
-                &["pr", "create", "--base", &pr.base, "--head", &branch],
-            )?;
+        git_rw(dry, &["push", "--force-with-lease", "origin", &branch])?;
+
+        if !no_pr {
+            let num = upsert_pr(&branch, &parent_branch, &g.pr_title()?, &g.pr_body()?, dry)?;
+            stack.push(PrRef { number: num, head: branch.clone(), base: parent_branch.clone() });
         }
+
+        parent_branch = branch;
+    }
+
+    if !no_pr && !dry {
+        update_stack_bodies(&stack, dry)?;
+    } else if !no_pr && dry {
+        info!("DRY-RUN: would update PR descriptions with stack visual for {} PRs", stack.len());
     }
 
     Ok(())
 }
 
-fn extract_tag(message: &str) -> Option<String> {
-    for word in message.split_whitespace() {
-        if let Some(tag) = word.strip_prefix("pr:") {
-            return Some(tag.to_string());
-        }
+/* ------------------ update (restack existing) ------------------ */
+
+/// Restack existing spr/* PRs by rebase --onto Parent → Child, bottom→top.
+fn restack_existing(base: &str, prefix: &str, no_pr: bool, dry: bool, limit: Option<Limit>) -> Result<()> {
+    let prs = list_spr_prs(prefix)?;
+    if prs.is_empty() {
+        bail!("No open PRs with head starting with `{prefix}`.");
     }
-    None
+
+    // Build linear chains for each root (baseRefName == base)
+    let mut roots: Vec<&PrInfo> = prs.iter().filter(|p| p.base == base).collect();
+    if roots.is_empty() {
+        bail!("Could not find a root PR basing on `{base}`. Ensure one PR has base `{base}`.");
+    }
+    if roots.len() > 1 { warn!("Found {} roots basing on `{base}`; processing each chain independently.", roots.len()); }
+
+    let mut overall_stack: Vec<PrRef> = vec![];
+
+    for root in roots {
+        let mut order: Vec<&PrInfo> = vec![];
+        let mut cur = root;
+        loop {
+            order.push(cur);
+            if let Some(next) = prs.iter().find(|p| p.base == cur.head) { cur = next; } else { break; }
+        }
+
+        // Apply extent limits for restack
+        let order = apply_limit_prs_for_restack(base, &order, limit)?;
+
+        info!(
+            "Restacking {} PR(s): {}",
+            order.len(),
+            order.iter().map(|p| p.head.as_str()).collect::<Vec<_>>().join(" → ")
+        );
+
+        for win in order.windows(2) {
+            let parent = &win[0].head;
+            let child = &win[1].head;
+
+            info!("Rebasing {child} onto {parent}");
+            git_rw(dry, &["fetch", "origin"])?; // state-changing, print in dry-run
+            git_ro(&["checkout", child])?;
+            let old_base = git_ro(&["merge-base", child, parent])?.trim().to_string();
+            git_rw(dry, &["rebase", "--onto", parent, &old_base, child])?;
+            git_rw(dry, &["push", "--force-with-lease", "origin", child])?;
+
+            if !no_pr { gh_rw(dry, &["pr", "edit", "-H", child, "--base", parent])?; }
+        }
+
+        // Collect for the visual pass (bottom→top order)
+        for pr in &order { overall_stack.push(PrRef { number: pr.number, head: pr.head.clone(), base: pr.base.clone() }); }
+    }
+
+    if !no_pr && !dry { update_stack_bodies(&overall_stack, dry)?; }
+    else if !no_pr && dry { info!("DRY-RUN: would update PR descriptions with stack visual for {} PRs", overall_stack.len()); }
+
+    Ok(())
 }
 
-fn strip_tag(message: &str) -> String {
-    message
-        .split_whitespace()
-        .filter(|w| !w.starts_with("pr:"))
-        .collect::<Vec<_>>()
-        .join(" ")
+/* ------------------ prep (squash) ------------------ */
+
+/// Squash the first N PRs (bottom-up) into a single commit each and force-push.
+fn prep_squash_first_n_prs(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
+    let prs = list_spr_prs(prefix)?;
+    if prs.is_empty() { bail!("No open PRs with head starting with `{prefix}`."); }
+
+    // Build the single chain from root basing on `base`
+    let root = prs.iter().find(|p| p.base == base).ok_or_else(|| anyhow!("No root PR with base `{base}`"))?;
+    let mut order: Vec<&PrInfo> = vec![]; let mut cur = root;
+    loop { order.push(cur); if let Some(next) = prs.iter().find(|p| p.base == cur.head) { cur = next; } else { break; } }
+
+    let to_prep = order.into_iter().take(n).collect::<Vec<_>>();
+    if to_prep.is_empty() { info!("Nothing to prep"); return Ok(()); }
+
+    info!("Squashing first {} PR(s): {}", to_prep.len(), to_prep.iter().map(|p| format!("#{}", p.number)).collect::<Vec<_>>().join(", "));
+
+    for (i, pr) in to_prep.iter().enumerate() {
+        // Parent is base for first element, else previous head
+        let parent = if i == 0 { base.to_string() } else { to_prep[i-1].head.clone() };
+
+        // Count unique commits to know if there is anything to squash
+        let cnt_s = git_ro(&["rev-list", "--count", &format!("{}..{}", parent, pr.head)])?;
+        let cnt: usize = cnt_s.trim().parse().unwrap_or(0);
+        if cnt == 0 { info!("PR #{} has no unique commits over {}; skipping", pr.number, parent); continue; }
+
+        // Get PR title for commit message
+        let meta_json = gh_ro(&["pr", "view", &format!("#{}", pr.number), "--json", "title,number"]) ?;
+        #[derive(Deserialize)] struct Meta { title: String, number: u64 }
+        let meta: Meta = serde_json::from_str(&meta_json)?;
+        let msg = format!("{} (#{})", meta.title.trim(), meta.number);
+
+        info!("Squashing PR #{} ({} commits) into one", pr.number, cnt);
+        git_ro(&["checkout", &pr.head])?;
+        // Create single commit preserving tree of HEAD
+        git_rw(dry, &["reset", "--soft", &parent])?;
+        // Ensure there is something staged; if dry-run, just print commit
+        if dry { info!("DRY-RUN: git commit -m {:?}", msg); }
+        else {
+            // If nothing staged (shouldn't happen when cnt>0), skip commit gracefully
+            let diff = Command::new("git").args(["diff", "--cached", "--quiet"]).status()?;
+            if !diff.success() { git_rw(false, &["commit", "-m", &msg])?; } else { info!("Nothing staged after reset; skipping commit for #{}", pr.number); }
+        }
+        git_rw(dry, &["push", "--force-with-lease", "origin", &pr.head])?;
+    }
+
+    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/* ------------------ data & helpers ------------------ */
 
-    struct MockRunner {
-        scripts: Vec<(Vec<String>, CmdOutput)>,
-        idx: usize,
+#[derive(Debug, Default, Clone)]
+struct Group {
+    tag: String,
+    subjects: Vec<String>,
+    commits: Vec<String>, // SHAs oldest→newest
+}
+
+impl Group {
+    fn pr_title(&self) -> Result<String> {
+        if let Some(s) = self.subjects.first() {
+            let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
+            let t = re.replace_all(s, "").trim().to_string();
+            if !t.is_empty() { return Ok(t); }
+        }
+        Ok(self.tag.clone())
     }
+    fn pr_body(&self) -> Result<String> {
+        Ok(format!(
+            "This PR is part of a stacked series.\n\nContains {} commit(s).\nTag: `{}`\n\n<!-- spr-stack:start -->\n(placeholder; will be filled by spr)\n<!-- spr-stack:end -->",
+            self.commits.len(), self.tag,
+        ))
+    }
+}
 
-    impl MockRunner {
-        fn new(scripts: Vec<(Vec<String>, CmdOutput)>) -> Self {
-            Self { scripts, idx: 0 }
+/// Parse commit stream from `git log --format=%H%x00%B%x1e --reverse <range>`
+fn parse_groups(raw: &str) -> Result<Vec<Group>> {
+    let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
+    let mut groups: Vec<Group> = vec![];
+    let mut current: Option<Group> = None;
+
+    for chunk in raw.split('\u{001e}') {
+        let chunk = chunk.trim_end_matches('\n');
+        if chunk.trim().is_empty() { continue; }
+        let mut parts = chunk.splitn(2, '\0');
+        let sha = parts.next().unwrap_or_default().trim().to_string();
+        let message = parts.next().unwrap_or_default().to_string();
+        let subj = message.lines().next().unwrap_or_default().to_string();
+
+        let tag_matches = re.captures_iter(&message).count();
+        if tag_matches > 1 {
+            bail!("Multiple pr:<tag> markers found in commit {sha}");
+        }
+
+        if tag_matches == 1 {
+            let cap = re.captures(&message).unwrap();
+            if let Some(g) = current.take() { if !g.commits.is_empty() { groups.push(g); } }
+            let tag = cap.get(1).unwrap().as_str().to_string();
+            current = Some(Group { tag, subjects: vec![subj.clone()], commits: vec![sha] });
+        } else if let Some(g) = current.as_mut() {
+            g.subjects.push(subj);
+            g.commits.push(sha);
+        } else {
+            warn!("Untagged commit before first pr:<tag>; ignored");
         }
     }
+    if let Some(g) = current.take() { if !g.commits.is_empty() { groups.push(g); } }
+    Ok(groups)
+}
 
-    impl Runner for MockRunner {
-        fn run(&mut self, cmd: &str, args: &[&str]) -> Result<CmdOutput, Box<dyn Error>> {
-            let call = std::iter::once(cmd.to_string())
-                .chain(args.iter().map(|s| s.to_string()))
-                .collect::<Vec<_>>();
-            let (expected, out) = &self.scripts[self.idx];
-            assert_eq!(call, *expected);
-            self.idx += 1;
-            Ok(out.clone())
+#[derive(Clone, Copy)]
+enum Limit { ByPr(usize), ByCommits(usize) }
+
+fn apply_limit_groups(mut groups: Vec<Group>, limit: Option<Limit>) -> Result<Vec<Group>> {
+    match limit {
+        None => Ok(groups),
+        Some(Limit::ByPr(n)) => Ok(groups.into_iter().take(n).collect()),
+        Some(Limit::ByCommits(mut n)) => {
+            let mut out = vec![];
+            for mut g in groups.drain(..) {
+                if n == 0 { break; }
+                let len = g.commits.len();
+                if len <= n { out.push(g); n -= len; }
+                else {
+                    g.commits.truncate(n);
+                    if !g.subjects.is_empty() { g.subjects.truncate(g.commits.len().min(g.subjects.len())); }
+                    out.push(g);
+                    n = 0;
+                }
+            }
+            Ok(out)
         }
     }
+}
 
-    #[test]
-    fn update_dry_run_only_queries_git() {
-        // Simulated `git log` with two PRs (addThings2 and addNewThings3)
-        let log = "a Add some thigns 2 pr:addThings2\nb Fixes to 2\nc adding some things 3 pr:addNewThings3\n";
+fn apply_limit_prs_for_restack<'a>(base: &str, order: &'a Vec<&'a PrInfo>, limit: Option<Limit>) -> Result<Vec<&'a PrInfo>> {
+    match limit {
+        None => Ok(order.clone()),
+        Some(Limit::ByPr(n)) => Ok(order.iter().take(n).cloned().collect()),
+        Some(Limit::ByCommits(mut n)) => {
+            // Keep adding PRs while cumulative unique commit count (over parent) <= n
+            let mut out: Vec<&PrInfo> = vec![];
+            for (i, pr) in order.iter().enumerate() {
+                out.push(pr);
+                if i == order.len() - 1 { break; }
+                let parent = if i == 0 { base.to_string() } else { order[i].head.clone() };
+                let child = &order[i+1].head;
+                let cnt_s = git_ro(&["rev-list", "--count", &format!("{}..{}", parent, child)])?;
+                let cnt: usize = cnt_s.trim().parse().unwrap_or(0);
+                if cnt > n { break; }
+                n = n.saturating_sub(cnt);
+            }
+            Ok(out)
+        }
+    }
+}
 
-        // Only `git` commands should run in dry-run mode
-        let scripts = vec![
-            (
-                vec![
-                    "git".into(),
-                    "log".into(),
-                    "main..HEAD".into(),
-                    "--oneline".into(),
-                    "--reverse".into(),
-                ],
-                CmdOutput {
-                    status: 0,
-                    stdout: log.into(),
-                },
-            ),
-            (
-                vec![
-                    "git".into(),
-                    "merge-base".into(),
-                    "--is-ancestor".into(),
-                    "a".into(),
-                    "origin/spr/addThings2".into(),
-                ],
-                CmdOutput {
-                    status: 1,
-                    stdout: String::new(),
-                },
-            ),
-            (
-                vec![
-                    "git".into(),
-                    "merge-base".into(),
-                    "--is-ancestor".into(),
-                    "b".into(),
-                    "origin/spr/addThings2".into(),
-                ],
-                CmdOutput {
-                    status: 1,
-                    stdout: String::new(),
-                },
-            ),
-            (
-                vec![
-                    "git".into(),
-                    "merge-base".into(),
-                    "--is-ancestor".into(),
-                    "c".into(),
-                    "origin/spr/addNewThings3".into(),
-                ],
-                CmdOutput {
-                    status: 1,
-                    stdout: String::new(),
-                },
-            ),
-        ];
-        let mut runner = MockRunner::new(scripts);
-        update_with_runner(true, &mut runner).unwrap();
-        assert_eq!(runner.idx, 4); // only git commands executed
+fn has_tagged_commits(base: &str, from: &str) -> Result<bool> {
+    let merge_base = git_ro(&["merge-base", base, from])?.trim().to_string();
+    let out = git_ro(&["log", "--format=%B", &format!("{merge_base}..{from}")])?;
+    Ok(out.lines().any(|s| s.contains("pr:")))
+}
+
+fn ensure_tool(name: &str) -> Result<()> {
+    let status = Command::new(name).arg("--version").status().with_context(|| format!("{} not found in PATH", name))?;
+    if !status.success() { bail!("{} appears to be installed but not runnable", name); }
+    Ok(())
+}
+
+/* ------------------ command runners ------------------ */
+
+fn git_ro(args: &[&str]) -> Result<String> {
+    verbose_log_cmd("git", args);
+    run("git", args)
+}
+fn git_rw(dry: bool, args: &[&str]) -> Result<String> {
+    if dry { info!("DRY-RUN: git {}", shellish(args)); Ok(String::new()) } else { run("git", args) }
+}
+fn gh_ro(args: &[&str]) -> Result<String> {
+    verbose_log_cmd("gh", args);
+    run("gh", args)
+}
+fn gh_rw(dry: bool, args: &[&str]) -> Result<String> {
+    if dry {
+        let printable = if args.contains(&"--body") {
+            let mut v = args.to_vec();
+            if let Some(i) = v.iter().position(|a| *a == "--body") { if i + 1 < v.len() { v[i + 1] = "<elided-body>"; } }
+            v
+        } else { args.to_vec() };
+        info!("DRY-RUN: gh {}", shellish(&printable));
+        Ok(String::new())
+    } else { run("gh", args) }
+}
+
+fn run(bin: &str, args: &[&str]) -> Result<String> {
+    let out = Command::new(bin).args(args).output().with_context(|| format!("failed to spawn {}", bin))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        error!("{} {:?} failed\nstdout:\n{}\nstderr:\n{}", bin, args, stdout, stderr);
+        bail!("command failed: {} {:?}", bin, args);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn shellish(args: &[&str]) -> String {
+    args.iter().map(|a| {
+        if a.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'') { format!("{:?}", a) } else { a.to_string() }
+    }).collect::<Vec<_>>().join(" ")
+}
+
+fn verbose_log_cmd(tool: &str, args: &[&str]) {
+    if std::env::var_os("SPR_VERBOSE").is_some() {
+        info!("{} {}", tool, shellish(args));
+    }
+}
+
+/* ------------------ GitHub PR helpers ------------------ */
+
+#[derive(Debug, Deserialize, Clone)]
+struct PrInfo { number: u64, head: String, base: String }
+
+#[derive(Debug, Clone)]
+struct PrRef { number: u64, head: String, base: String }
+
+/// List open PRs, filtering to those whose head starts with `prefix`
+fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
+    let json = gh_ro(&["pr", "list", "--state", "open", "--limit", "200", "--json", "number,headRefName,baseRefName"]) ?;
+    #[derive(Deserialize)]
+    struct Raw { number: u64, #[serde(rename="headRefName")] headRefName: String, #[serde(rename="baseRefName")] baseRefName: String }
+    let raws: Vec<Raw> = serde_json::from_str(&json)?;
+    let mut out = vec![];
+    for r in raws { if r.headRefName.starts_with(prefix) { out.push(PrInfo { number: r.number, head: r.headRefName, base: r.baseRefName }); } }
+    if out.is_empty() { warn!("No open PRs with head starting with `{}` found.", prefix); }
+    Ok(out)
+}
+
+/// Create or update a PR for `branch` with base `parent`. Returns PR number.
+fn upsert_pr(branch: &str, parent: &str, title: &str, body: &str, dry: bool) -> Result<u64> {
+    // Try to view existing PR
+    let existing = gh_ro(&["pr", "view", "-H", branch, "--json", "number"]).ok();
+    if let Some(json) = existing {
+        #[derive(Deserialize)] struct V { number: u64 }
+        let v: V = serde_json::from_str(&json)?;
+        gh_rw(dry, &["pr", "edit", "-H", branch, "--title", title, "--base", parent, "--body", body])?;
+        return Ok(v.number);
     }
 
-    #[test]
-    fn update_pushes_and_creates_prs() {
-        // Simulated `git log` with two PRs (addThings2 and addNewThings3)
-        let log = "a Add some thigns 2 pr:addThings2\nb Fixes to 2\nc adding some things 3 pr:addNewThings3\n";
+    gh_rw(dry, &["pr", "create", "-H", branch, "-B", parent, "--title", title, "--body", body])?;
 
-        // In full mode we expect pushes and PR creations after the queries
-        let scripts = vec![
-            (
-                vec![
-                    "git".into(),
-                    "log".into(),
-                    "main..HEAD".into(),
-                    "--oneline".into(),
-                    "--reverse".into(),
-                ],
-                CmdOutput {
-                    status: 0,
-                    stdout: log.into(),
-                },
-            ),
-            (
-                vec![
-                    "git".into(),
-                    "merge-base".into(),
-                    "--is-ancestor".into(),
-                    "a".into(),
-                    "origin/spr/addThings2".into(),
-                ],
-                CmdOutput {
-                    status: 1,
-                    stdout: String::new(),
-                },
-            ),
-            (
-                vec![
-                    "git".into(),
-                    "merge-base".into(),
-                    "--is-ancestor".into(),
-                    "b".into(),
-                    "origin/spr/addThings2".into(),
-                ],
-                CmdOutput {
-                    status: 1,
-                    stdout: String::new(),
-                },
-            ),
-            (
-                vec![
-                    "git".into(),
-                    "merge-base".into(),
-                    "--is-ancestor".into(),
-                    "c".into(),
-                    "origin/spr/addNewThings3".into(),
-                ],
-                CmdOutput {
-                    status: 1,
-                    stdout: String::new(),
-                },
-            ),
-            (
-                vec![
-                    "git".into(),
-                    "push".into(),
-                    "origin".into(),
-                    "b:refs/heads/spr/addThings2".into(),
-                ],
-                CmdOutput {
-                    status: 0,
-                    stdout: String::new(),
-                },
-            ),
-            (
-                vec![
-                    "gh".into(),
-                    "pr".into(),
-                    "create".into(),
-                    "--base".into(),
-                    "main".into(),
-                    "--head".into(),
-                    "spr/addThings2".into(),
-                ],
-                CmdOutput {
-                    status: 0,
-                    stdout: String::new(),
-                },
-            ),
-            (
-                vec![
-                    "git".into(),
-                    "push".into(),
-                    "origin".into(),
-                    "c:refs/heads/spr/addNewThings3".into(),
-                ],
-                CmdOutput {
-                    status: 0,
-                    stdout: String::new(),
-                },
-            ),
-            (
-                vec![
-                    "gh".into(),
-                    "pr".into(),
-                    "create".into(),
-                    "--base".into(),
-                    "spr/addThings2".into(),
-                    "--head".into(),
-                    "spr/addNewThings3".into(),
-                ],
-                CmdOutput {
-                    status: 0,
-                    stdout: String::new(),
-                },
-            ),
-        ];
-        let mut runner = MockRunner::new(scripts);
-        update_with_runner(false, &mut runner).unwrap();
-        assert_eq!(runner.idx, 8);
+    let json = gh_ro(&["pr", "view", "-H", branch, "--json", "number"]) ?;
+    #[derive(Deserialize)] struct V { number: u64 }
+    let v: V = serde_json::from_str(&json)?;
+    Ok(v.number)
+}
+
+/// Update the stack visual in each PR body (only for the set we touched).
+fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
+    if stack.is_empty() { return Ok(()); }
+
+    let numbers: Vec<u64> = stack.iter().map(|p| p.number).collect();
+
+    for (idx, pr) in stack.iter().enumerate() {
+        let json = gh_ro(&["pr", "view", &format!("#{}", pr.number), "--json", "body"]) ?;
+        #[derive(Deserialize)] struct B { body: String }
+        let mut b: B = serde_json::from_str(&json)?;
+
+        let start = "<!-- spr-stack:start -->"; let end = "<!-- spr-stack:end -->";
+        let re = Regex::new(&format!(r"(?s){}.*?{}", regex::escape(start), regex::escape(end)))?;
+        b.body = re.replace(&b.body, "").trim().to_string();
+
+        let em_space = "\u{2003}"; // U+2003 EM SPACE for non-current entries
+        let mut lines = String::new();
+        for (j, n) in numbers.iter().enumerate() { if j == idx { lines.push_str(&format!("➡ #{}\n", n)); } else { lines.push_str(&format!("{} #{}\n", em_space, n)); } }
+        let block = format!("\n\n{}\n{}\n{}\n", start, lines.trim_end(), end);
+        let new_body = if b.body.is_empty() { block.clone() } else { format!("{}\n\n{}", b.body, block) };
+
+        gh_rw(dry, &["pr", "edit", &format!("#{}", pr.number), "--body", &new_body])?;
+        info!("Updated stack visual in PR #{}", pr.number);
     }
+    Ok(())
 }
