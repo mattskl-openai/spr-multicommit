@@ -156,7 +156,13 @@ fn build_from_tags(base: &str, from: &str, prefix: &str, no_pr: bool, dry: bool,
         let tmpdir = format!("/tmp/spr-{}-{}-{}", g.tag, idx + 1, std::process::id());
         git_rw(dry, &["worktree", "add", "--detach", &tmpdir, &parent_remote])?;
         for c in &g.commits { git_rw_in(dry, &tmpdir, &["cherry-pick", c])?; }
-        git_rw_in(dry, &tmpdir, &["push", "--force-with-lease", "origin", &format!("HEAD:refs/heads/{}", &branch)])?;
+        let new_head = git_ro_in(&tmpdir, &["rev-parse", "HEAD"])?.trim().to_string();
+        let remote_head = get_remote_branch_sha(&branch)?;
+        if remote_head.as_deref() == Some(new_head.as_str()) {
+            info!("No changes for {}; skipping push", branch);
+        } else {
+            git_rw_in(dry, &tmpdir, &["push", "--force-with-lease", "origin", &format!("HEAD:refs/heads/{}", &branch)])?;
+        }
         git_rw(dry, &["worktree", "remove", "--force", &tmpdir])?;
 
         if !no_pr {
@@ -302,9 +308,18 @@ impl Group {
         Ok(self.tag.clone())
     }
     fn pr_body(&self) -> Result<String> {
+        // Use only the body (drop the subject/title line); remove pr:<tag> markers
+        let base_body = if let Some(full) = &self.first_message {
+            let mut it = full.lines();
+            let _ = it.next();
+            it.collect::<Vec<_>>().join("\n")
+        } else { String::new() };
+        let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
+        let cleaned = re.replace_all(&base_body, "").to_string().trim().to_string();
+        let sep = if cleaned.is_empty() { "" } else { "\n\n" };
         Ok(format!(
-            "This PR is part of a stacked series.\n\nContains {} commit(s).\nTag: `{}`\n\n<!-- spr-stack:start -->\n(placeholder; will be filled by spr)\n<!-- spr-stack:end -->",
-            self.commits.len(), self.tag,
+            "{}{}<!-- spr-stack:start -->\n(placeholder; will be filled by spr)\n<!-- spr-stack:end -->",
+            cleaned, sep,
         ))
     }
 }
@@ -410,7 +425,13 @@ fn git_ro(args: &[&str]) -> Result<String> {
     run("git", args)
 }
 fn git_rw(dry: bool, args: &[&str]) -> Result<String> {
-    if dry { info!("DRY-RUN: git {}", shellish(args)); Ok(String::new()) } else { run("git", args) }
+    if dry {
+        info!("DRY-RUN: git {}", shellish(args));
+        Ok(String::new())
+    } else {
+        verbose_log_cmd("git", args);
+        run("git", args)
+    }
 }
 fn gh_ro(args: &[&str]) -> Result<String> {
     verbose_log_cmd("gh", args);
@@ -425,7 +446,10 @@ fn gh_rw(dry: bool, args: &[&str]) -> Result<String> {
         } else { args.to_vec() };
         info!("DRY-RUN: gh {}", shellish(&printable));
         Ok(String::new())
-    } else { run("gh", args) }
+    } else {
+        verbose_log_cmd("gh", args);
+        run("gh", args)
+    }
 }
 
 fn run(bin: &str, args: &[&str]) -> Result<String> {
@@ -478,10 +502,25 @@ fn git_rw_in(dry: bool, dir: &str, args: &[&str]) -> Result<String> {
     git_rw(dry, &refs)
 }
 
+fn git_ro_in(dir: &str, args: &[&str]) -> Result<String> {
+    let mut v: Vec<String> = Vec::with_capacity(args.len() + 2);
+    v.push("-C".to_string());
+    v.push(dir.to_string());
+    for a in args { v.push((*a).to_string()); }
+    let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+    git_ro(&refs)
+}
+
 fn to_remote_ref(name: &str) -> String {
     let name = name.strip_prefix("refs/heads/").unwrap_or(name);
     let name = name.strip_prefix("origin/").unwrap_or(name);
     format!("origin/{}", name)
+}
+
+fn get_remote_branch_sha(branch: &str) -> Result<Option<String>> {
+    let out = git_ro(&["ls-remote", "--heads", "origin", branch])?;
+    let sha = out.split_whitespace().next().unwrap_or("").trim();
+    if sha.is_empty() { Ok(None) } else { Ok(Some(sha.to_string())) }
 }
 
 /* ------------------ GitHub PR helpers ------------------ */
@@ -530,6 +569,7 @@ fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
     if stack.is_empty() { return Ok(()); }
 
     let numbers: Vec<u64> = stack.iter().map(|p| p.number).collect();
+    let numbers_rev: Vec<u64> = numbers.iter().cloned().rev().collect();
 
     for (idx, pr) in stack.iter().enumerate() {
         let json = gh_ro(&["pr", "view", &format!("#{}", pr.number), "--json", "body"]) ?;
@@ -540,10 +580,15 @@ fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
         let re = Regex::new(&format!(r"(?s){}.*?{}", regex::escape(start), regex::escape(end)))?;
         b.body = re.replace(&b.body, "").trim().to_string();
 
-        let em_space = "\u{2003}"; // U+2003 EM SPACE for non-current entries
+        let em_space = "\u{2003}"; // U+2003 EM SPACE for indentation
         let mut lines = String::new();
-        for (j, n) in numbers.iter().enumerate() { if j == idx { lines.push_str(&format!("➡ #{}\n", n)); } else { lines.push_str(&format!("{} #{}\n", em_space, n)); } }
-        let block = format!("\n\n{}\n{}\n{}\n", start, lines.trim_end(), end);
+        for n in &numbers_rev { lines.push_str(&format!("- {} #{}\n", em_space, n)); }
+        let block = format!(
+            "\n\n{}\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n{}\n",
+            start,
+            lines.trim_end(),
+            end,
+        );
         let new_body = if b.body.is_empty() { block.clone() } else { format!("{}\n\n{}", b.body, block) };
 
         gh_rw(dry, &["pr", "edit", &format!("#{}", pr.number), "--body", &new_body])?;
