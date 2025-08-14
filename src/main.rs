@@ -113,6 +113,21 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Fix PR base connectivity to match local commit stack
+    FixChain {
+        /// Base branch to locate the root of the stack
+        #[arg(short = 'b', long, default_value = "main")]
+        base: String,
+
+        /// Branch prefix for per-PR branches
+        #[arg(long, default_value = "spr/")]
+        prefix: String,
+
+        /// Print state-changing commands instead of executing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -198,6 +213,11 @@ fn main() -> Result<()> {
             ensure_tool("git")?;
             ensure_tool("gh")?;
             merge_prs_until(&base, &prefix, until, dry_run)?;
+        }
+        Cmd::FixChain { base, prefix, dry_run } => {
+            ensure_tool("git")?;
+            ensure_tool("gh")?;
+            fix_chain(&base, &prefix, dry_run)?;
         }
     }
     Ok(())
@@ -651,6 +671,43 @@ fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> 
         gh_rw(dry, &["pr", "close", &format!("#{}", pr.number), "--comment", &format!("Merged as part of PR #{}", nth.number)])?;
     }
 
+    Ok(())
+}
+
+fn fix_chain(base: &str, prefix: &str, dry: bool) -> Result<()> {
+    let base_n = normalize_branch_name(base);
+    // Build local expected chain from base..HEAD
+    let merge_base = git_ro(&["merge-base", base, "HEAD"])?.trim().to_string();
+    let lines = git_ro(&["log", "--format=%H%x00%B%x1e", "--reverse", &format!("{}..HEAD", merge_base)])?;
+    let groups = parse_groups(&lines)?;
+    if groups.is_empty() { info!("No local groups found; nothing to fix."); return Ok(()); }
+
+    // Existing PRs map by head
+    let prs = list_spr_prs(prefix)?;
+    if prs.is_empty() { bail!("No open PRs with head starting with `{prefix}`."); }
+
+    // Expected connectivity bottom-up
+    let mut expected: Vec<(String, String)> = vec![]; // (head, base)
+    let mut parent = base_n.clone();
+    for g in &groups {
+        let head = format!("{}{}", prefix, g.tag);
+        expected.push((head.clone(), parent.clone()));
+        parent = head;
+    }
+
+    // Apply base edits where needed
+    for (head, want_base) in expected {
+        if let Some(pr) = prs.iter().find(|p| p.head == head) {
+            if pr.base != want_base {
+                info!("Updating base of {} (#{}) from {} to {}", head, pr.number, pr.base, want_base);
+                gh_rw(dry, &["pr", "edit", &format!("#{}", pr.number), "--base", &sanitize_gh_base_ref(&want_base)])?;
+            } else {
+                info!("{} (#{}) already basing on {}", head, pr.number, want_base);
+            }
+        } else {
+            warn!("No open PR found for {}; skipping", head);
+        }
+    }
     Ok(())
 }
 
