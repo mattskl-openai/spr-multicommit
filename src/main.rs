@@ -94,6 +94,25 @@ enum Cmd {
         #[arg(long, default_value = "spr/")]
         prefix: String,
     },
+
+    /// Merge PRs from the bottom of the stack
+    Merge {
+        /// Base branch to locate the root of the stack
+        #[arg(short = 'b', long, default_value = "main")]
+        base: String,
+
+        /// Branch prefix for per-PR branches
+        #[arg(long, default_value = "spr/")]
+        prefix: String,
+
+        /// Merge the first N PRs (bottom-up)
+        #[arg(long, value_name = "N")]
+        until: usize,
+
+        /// Print state-changing commands instead of executing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -174,6 +193,11 @@ fn main() -> Result<()> {
             ensure_tool("git")?;
             ensure_tool("gh")?;
             match what { ListWhat::Pr => list_prs_display(&base, &prefix)? }
+        }
+        Cmd::Merge { base, prefix, until, dry_run } => {
+            ensure_tool("git")?;
+            ensure_tool("gh")?;
+            merge_prs_until(&base, &prefix, until, dry_run)?;
         }
     }
     Ok(())
@@ -583,6 +607,50 @@ fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
             None => info!("{}: {} - {} commit(s)", i+1, head_branch, count),
         }
     }
+    Ok(())
+}
+
+fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
+    if n == 0 { bail!("--until must be >= 1"); }
+    let base_n = normalize_branch_name(base);
+    let prs = list_spr_prs(prefix)?;
+    if prs.is_empty() { bail!("No open PRs with head starting with `{prefix}`."); }
+    let root = prs.iter().find(|p| p.base == base_n).ok_or_else(|| anyhow!("No root PR with base `{}`", base_n))?;
+
+    // Build ordered chain bottom-up
+    let mut ordered: Vec<&PrInfo> = vec![]; let mut cur = root;
+    loop { ordered.push(cur); if let Some(next) = prs.iter().find(|p| p.base == cur.head) { cur = next; } else { break; } }
+    if ordered.is_empty() { bail!("No PR chain found"); }
+
+    let take_n = n.min(ordered.len());
+    let segment = &ordered[..take_n];
+
+    // Verify each has exactly one unique commit over its parent
+    git_rw(dry, &["fetch", "origin"])?; // ensure remotes up to date
+    let mut offenders: Vec<u64> = vec![];
+    for (i, pr) in segment.iter().enumerate() {
+        let parent = if i == 0 { base_n.clone() } else { segment[i-1].head.clone() };
+        let parent_ref = to_remote_ref(&parent);
+        let child_ref = to_remote_ref(&pr.head);
+        let cnt_s = git_ro(&["rev-list", "--count", &format!("{}..{}", parent_ref, child_ref)])?;
+        let cnt: usize = cnt_s.trim().parse().unwrap_or(0);
+        if cnt != 1 { offenders.push(pr.number); }
+    }
+    if !offenders.is_empty() {
+        warn!("The following PRs have != 1 commit: {}", offenders.iter().map(|x| format!("#{}", x)).collect::<Vec<_>>().join(", "));
+        bail!("Run `spr prep` to squash them first");
+    }
+
+    // Change base of Nth PR to actual base and merge it with rebase
+    let nth = segment[take_n-1];
+    gh_rw(dry, &["pr", "edit", &format!("#{}", nth.number), "--base", &sanitize_gh_base_ref(base)])?;
+    gh_rw(dry, &["pr", "merge", &format!("#{}", nth.number), "--rebase"])?;
+
+    // Close others with a comment
+    for pr in &segment[..take_n-1] {
+        gh_rw(dry, &["pr", "close", &format!("#{}", pr.number), "--comment", &format!("Merged as part of PR #{}", nth.number)])?;
+    }
+
     Ok(())
 }
 
