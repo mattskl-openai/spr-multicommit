@@ -623,7 +623,10 @@ fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
 
         let em_space = "\u{2003}"; // U+2003 EM SPACE for indentation
         let mut lines = String::new();
-        for n in &numbers_rev { lines.push_str(&format!("- {} #{}\n", em_space, n)); }
+        for n in &numbers_rev {
+            let marker = if *n == pr.number { "➡" } else { em_space };
+            lines.push_str(&format!("- {} #{}\n", marker, n));
+        }
         let block = format!(
             "\n\n{}\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n{}\n",
             start,
