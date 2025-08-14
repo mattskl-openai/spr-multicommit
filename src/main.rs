@@ -85,7 +85,7 @@ enum Extent {
 
 #[derive(Subcommand, Debug)]
 enum PrepWhat {
-    /// Squash the first N PRs (bottom-up) into a single commit each and force-push
+    /// Squash the first N PRs (bottom-up) into a single commit each and force-push (use 0 for all)
     Pr { n: usize },
 }
 
@@ -286,20 +286,26 @@ fn restack_existing(
     dry: bool,
     limit: Option<Limit>,
 ) -> Result<()> {
+    let base_n = normalize_branch_name(base);
     let prs = list_spr_prs(prefix)?;
     if prs.is_empty() {
         bail!("No open PRs with head starting with `{prefix}`.");
     }
 
     // Build linear chains for each root (baseRefName == base)
-    let mut roots: Vec<&PrInfo> = prs.iter().filter(|p| p.base == base).collect();
+    let mut roots: Vec<&PrInfo> = prs.iter().filter(|p| p.base == base_n).collect();
     if roots.is_empty() {
-        bail!("Could not find a root PR basing on `{base}`. Ensure one PR has base `{base}`.");
+        bail!(
+            "Could not find a root PR basing on `{}`. Ensure one PR has base `{}`.",
+            base_n,
+            base_n
+        );
     }
     if roots.len() > 1 {
         warn!(
-            "Found {} roots basing on `{base}`; processing each chain independently.",
-            roots.len()
+            "Found {} roots basing on `{}`; processing each chain independently.",
+            roots.len(),
+            base_n
         );
     }
 
@@ -318,7 +324,7 @@ fn restack_existing(
         }
 
         // Apply extent limits for restack
-        let order = apply_limit_prs_for_restack(base, &order, limit)?;
+        let order = apply_limit_prs_for_restack(&base_n, &order, limit)?;
 
         info!(
             "Restacking {} PR(s): {}",
@@ -383,103 +389,49 @@ fn restack_existing(
 
 /// Squash the first N PRs (bottom-up) into a single commit each and force-push.
 fn prep_squash_first_n_prs(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
-    let prs = list_spr_prs(prefix)?;
-    if prs.is_empty() {
-        bail!("No open PRs with head starting with `{prefix}`.");
-    }
+    // Work purely on local commit stack: build groups from base..HEAD
+    let merge_base = git_ro(&["merge-base", base, "HEAD"])?.trim().to_string();
+    let lines = git_ro(&["log", "--format=%H%x00%B%x1e", "--reverse", &format!("{}..HEAD", merge_base)])?;
+    let groups = parse_groups(&lines)?;
+    if groups.is_empty() { info!("Nothing to prep"); return Ok(()); }
 
-    // Build the single chain from root basing on `base`
-    let root = prs
-        .iter()
-        .find(|p| p.base == base)
-        .ok_or_else(|| anyhow!("No root PR with base `{base}`"))?;
-    let mut order: Vec<&PrInfo> = vec![];
-    let mut cur = root;
-    loop {
-        order.push(cur);
-        if let Some(next) = prs.iter().find(|p| p.base == cur.head) {
-            cur = next;
-        } else {
-            break;
+    let total_groups = groups.len();
+    let num_to_prep = if n == 0 { total_groups } else { n.min(total_groups) };
+    let to_prep = groups.iter().take(num_to_prep).cloned().collect::<Vec<_>>();
+    info!("Locally squashing first {} group(s)", to_prep.len());
+    for (i, g) in to_prep.iter().enumerate() {
+        info!("Group {}: tag = {}", i + 1, g.tag);
+        for (j, sha) in g.commits.iter().enumerate() {
+            info!("  Commit {}: {}", j + 1, sha);
         }
     }
-
-    let to_prep = order.into_iter().take(n).collect::<Vec<_>>();
-    if to_prep.is_empty() {
-        info!("Nothing to prep");
-        return Ok(());
+      
+    // Build a new linear chain: for each group, create a single commit with tree of group tip
+    let mut parent_sha = merge_base;
+    for g in &to_prep {
+        let tip = g.commits.last().ok_or_else(|| anyhow!("Empty group {}", g.tag))?;
+        let tree = git_ro(&["rev-parse", &format!("{}^{{tree}}", tip)])?.trim().to_string();
+        let msg = g.squash_commit_message()?;
+        let new_commit = git_rw(dry, &["commit-tree", &tree, "-p", &parent_sha, "-m", &msg])?.trim().to_string();
+        parent_sha = new_commit;
     }
 
-    info!(
-        "Squashing first {} PR(s): {}",
-        to_prep.len(),
-        to_prep
-            .iter()
-            .map(|p| format!("#{}", p.number))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    for (i, pr) in to_prep.iter().enumerate() {
-        // Parent is base for first element, else previous head
-        let parent = if i == 0 {
-            base.to_string()
-        } else {
-            to_prep[i - 1].head.clone()
-        };
-
-        // Count unique commits to know if there is anything to squash
-        let cnt_s = git_ro(&["rev-list", "--count", &format!("{}..{}", parent, pr.head)])?;
-        let cnt: usize = cnt_s.trim().parse().unwrap_or(0);
-        if cnt == 0 {
-            info!(
-                "PR #{} has no unique commits over {}; skipping",
-                pr.number, parent
-            );
-            continue;
-        }
-
-        // Get PR title for commit message
-        let meta_json = gh_ro(&[
-            "pr",
-            "view",
-            &format!("#{}", pr.number),
-            "--json",
-            "title,number",
-        ])?;
-        #[derive(Deserialize)]
-        struct Meta {
-            title: String,
-            number: u64,
-        }
-        let meta: Meta = serde_json::from_str(&meta_json)?;
-        let msg = format!("{} (#{})", meta.title.trim(), meta.number);
-
-        info!("Squashing PR #{} ({} commits) into one", pr.number, cnt);
-        git_ro(&["checkout", &pr.head])?;
-        // Create single commit preserving tree of HEAD
-        git_rw(dry, &["reset", "--soft", &parent])?;
-        // Ensure there is something staged; if dry-run, just print commit
-        if dry {
-            info!("DRY-RUN: git commit -m {:?}", msg);
-        } else {
-            // If nothing staged (shouldn't happen when cnt>0), skip commit gracefully
-            let diff = Command::new("git")
-                .args(["diff", "--cached", "--quiet"])
-                .status()?;
-            if !diff.success() {
-                git_rw(false, &["commit", "-m", &msg])?;
-            } else {
-                info!(
-                    "Nothing staged after reset; skipping commit for #{}",
-                    pr.number
-                );
-            }
-        }
-        git_rw(dry, &["push", "--force-with-lease", "origin", &pr.head])?;
+    // Replay the remaining commits (not prepped) on top to preserve the rest of the stack
+    let remainder: Vec<String> = groups.iter().skip(num_to_prep).flat_map(|g| g.commits.iter().cloned()).collect();
+    for sha in remainder {
+        let tree = git_ro(&["rev-parse", &format!("{}^{{tree}}", sha)])?.trim().to_string();
+        let msg = git_ro(&["log", "-1", "--format=%B", &sha])?.trim_end().to_string();
+        let new_commit = git_rw(dry, &["commit-tree", &tree, "-p", &parent_sha, "-m", &msg])?.trim().to_string();
+        parent_sha = new_commit;
     }
 
-    Ok(())
+    // Move current branch to new head (includes squashed N groups + unchanged remainder)
+    let cur_branch = git_ro(&["symbolic-ref", "--quiet", "--short", "HEAD"])?.trim().to_string();
+    git_rw(dry, &["update-ref", &format!("refs/heads/{}", cur_branch), &parent_sha])?;
+
+    // Immediately run update for the prepped groups only (0 means all)
+    let limit = if n == 0 { None } else { Some(Limit::ByPr(num_to_prep)) };
+    build_from_tags(base, "HEAD", prefix, false, dry, limit)
 }
 
 /* ------------------ data & helpers ------------------ */
@@ -489,6 +441,7 @@ struct Group {
     tag: String,
     subjects: Vec<String>,
     commits: Vec<String>, // SHAs oldest→newest
+    first_message: Option<String>,
 }
 
 impl Group {
@@ -501,6 +454,22 @@ impl Group {
             }
         }
         Ok(self.tag.clone())
+    }
+    fn squash_commit_message(&self) -> Result<String> {
+        if let Some(full) = &self.first_message {
+            // Validate the first commit contains the expected pr:<tag> marker
+            let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
+            if let Some(cap) = re.captures(full) {
+                let found = cap.get(1).unwrap().as_str();
+                if !found.eq_ignore_ascii_case(&self.tag) {
+                    bail!("First commit tag mismatch for group `{}`: expected `pr:{}`, found `pr:{}`", self.tag, self.tag, found);
+                }
+            } else {
+                bail!("First commit is missing required `pr:{}` tag for group `{}`.", self.tag, self.tag);
+            }
+            return Ok(full.trim_end().to_string());
+        }
+        bail!("First commit message missing for group `{}`", self.tag)
     }
     fn pr_body(&self) -> Result<String> {
         // Use only the body (drop the subject/title line); remove pr:<tag> markers
@@ -552,6 +521,7 @@ fn parse_groups(raw: &str) -> Result<Vec<Group>> {
                 tag,
                 subjects: vec![subj.clone()],
                 commits: vec![sha],
+                first_message: Some(message.clone()),
             });
         } else if let Some(g) = current.as_mut() {
             g.subjects.push(subj);
@@ -619,7 +589,7 @@ fn apply_limit_prs_for_restack<'a>(
                     break;
                 }
                 let parent = if i == 0 {
-                    base.to_string()
+                    normalize_branch_name(base)
                 } else {
                     order[i].head.clone()
                 };
@@ -752,6 +722,12 @@ fn sanitize_gh_base_ref(base: &str) -> String {
         return stripped.to_string();
     }
     base.to_string()
+}
+
+fn normalize_branch_name(name: &str) -> String {
+    let mut out = name.strip_prefix("refs/heads/").unwrap_or(name);
+    out = out.strip_prefix("origin/").unwrap_or(out);
+    out.to_string()
 }
 
 fn safe_checkout_reset(dry: bool, branch: &str, start_point: &str) -> Result<()> {
