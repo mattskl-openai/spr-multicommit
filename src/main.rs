@@ -216,11 +216,10 @@ fn restack_existing(base: &str, prefix: &str, no_pr: bool, dry: bool, limit: Opt
             info!("Rebasing {child} onto {parent}");
             git_rw(dry, &["fetch", "origin"])?; // state-changing, print in dry-run
             git_ro(&["checkout", child])?;
-            let old_base = git_ro(&["merge-base", child, parent])?.trim().to_string();
-            git_rw(dry, &["rebase", "--onto", parent, &old_base, child])?;
-            git_rw(dry, &["push", "--force-with-lease", "origin", child])?;
+            git_rw(dry, &["merge", "--no-ff", parent, "-m", &format!("spr: merge {} into {}", parent, child)])?;
+            git_rw(dry, &["push", "origin", child])?;
 
-            if !no_pr { gh_rw(dry, &["pr", "edit", "-H", child, "--base", parent])?; }
+            if !no_pr { gh_rw(dry, &["pr", "edit", child, "--base", parent])?; }
         }
 
         // Collect for the visual pass (bottom→top order)
@@ -472,21 +471,23 @@ fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
 
 /// Create or update a PR for `branch` with base `parent`. Returns PR number.
 fn upsert_pr(branch: &str, parent: &str, title: &str, body: &str, dry: bool) -> Result<u64> {
-    // Try to view existing PR
-    let existing = gh_ro(&["pr", "view", "-H", branch, "--json", "number"]).ok();
-    if let Some(json) = existing {
-        #[derive(Deserialize)] struct V { number: u64 }
-        let v: V = serde_json::from_str(&json)?;
-        gh_rw(dry, &["pr", "edit", "-H", branch, "--title", title, "--base", parent, "--body", body])?;
+    // Check for existing open PR by head
+    let json = gh_ro(&["pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number"])?;
+    #[derive(Deserialize)] struct V { number: u64 }
+    let existing: Vec<V> = serde_json::from_str(&json)?;
+    if let Some(v) = existing.get(0) {
+        gh_rw(dry, &["pr", "edit", &format!("#{}", v.number), "--title", title, "--base", parent, "--body", body])?;
         return Ok(v.number);
     }
 
-    gh_rw(dry, &["pr", "create", "-H", branch, "-B", parent, "--title", title, "--body", body])?;
+    // Create new PR
+    gh_rw(dry, &["pr", "create", "--head", branch, "--base", parent, "--title", title, "--body", body])?;
 
-    let json = gh_ro(&["pr", "view", "-H", branch, "--json", "number"]) ?;
-    #[derive(Deserialize)] struct V { number: u64 }
-    let v: V = serde_json::from_str(&json)?;
-    Ok(v.number)
+    // Fetch created PR number
+    let json2 = gh_ro(&["pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number"])?;
+    let created: Vec<V> = serde_json::from_str(&json2)?;
+    let num = created.get(0).map(|v| v.number).ok_or_else(|| anyhow!("Failed to determine PR number for {}", branch))?;
+    Ok(num)
 }
 
 /// Update the stack visual in each PR body (only for the set we touched).
