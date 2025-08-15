@@ -278,6 +278,12 @@ fn build_from_tags(
         .collect();
     let remote_map = get_remote_branches_sha(&branch_names)?; // branch -> sha
 
+    // Stage push actions to batch git push calls
+    #[derive(Clone, Copy, PartialEq)]
+    enum PushKind { Skip, FastForward, Force }
+    struct PlannedPush { branch: String, target_sha: String, kind: PushKind }
+    let mut planned: Vec<PlannedPush> = vec![];
+
     for (idx, g) in groups.iter_mut().enumerate() {
         let branch = format!("{}{}", prefix, g.tag);
         info!(
@@ -294,38 +300,48 @@ fn build_from_tags(
             .last()
             .cloned()
             .ok_or_else(|| anyhow!("Group {} has no commits", g.tag))?;
-        if remote_head.as_deref() == Some(target_sha.as_str()) {
+        let kind = if remote_head.as_deref() == Some(target_sha.as_str()) {
             info!("No changes for {}; skipping push", branch);
+            PushKind::Skip
         } else {
-            // If remote exists but is not an ancestor of our target, switch to force-with-lease for current and subsequent pushes
             if let Some(ref remote_sha) = remote_head {
                 let ff_ok = git_is_ancestor(remote_sha, &target_sha)?;
-                if !ff_ok {
-                    force_from_now = true;
-                }
+                if !ff_ok { force_from_now = true; }
             }
-            if force_from_now {
-                git_rw(
-                    dry,
-                    &[
-                        "push",
-                        "--force-with-lease",
-                        "origin",
-                        &format!("{}:refs/heads/{}", &target_sha, &branch),
-                    ],
-                )?;
-            } else {
-                git_rw(
-                    dry,
-                    &[
-                        "push",
-                        "origin",
-                        &format!("{}:refs/heads/{}", &target_sha, &branch),
-                    ],
-                )?;
-            }
-        }
+            if force_from_now { PushKind::Force } else { PushKind::FastForward }
+        };
+        planned.push(PlannedPush { branch: branch.clone(), target_sha: target_sha.clone(), kind });
 
+        parent_branch = branch;
+    }
+
+    // Execute batched pushes: first fast-forward, then force-with-lease
+    let ff_refspecs: Vec<String> = planned.iter()
+        .filter(|p| p.kind == PushKind::FastForward)
+        .map(|p| format!("{}:refs/heads/{}", p.target_sha, p.branch))
+        .collect();
+    if !ff_refspecs.is_empty() {
+        // Build argv: ["push", "origin", refspecs...]
+        let mut argv: Vec<String> = vec!["push".into(), "origin".into()];
+        argv.extend(ff_refspecs.clone());
+        let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        git_rw(dry, &args)?;
+    }
+    let force_refspecs: Vec<String> = planned.iter()
+        .filter(|p| p.kind == PushKind::Force)
+        .map(|p| format!("{}:refs/heads/{}", p.target_sha, p.branch))
+        .collect();
+    if !force_refspecs.is_empty() {
+        let mut argv: Vec<String> = vec!["push".into(), "--force-with-lease".into(), "origin".into()];
+        argv.extend(force_refspecs.clone());
+        let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        git_rw(dry, &args)?;
+    }
+
+    // After pushes, (create or) update PRs
+    let mut parent_branch = base.to_string();
+    for g in &groups {
+        let branch = format!("{}{}", prefix, g.tag);
         if !no_pr {
             let num = upsert_pr_cached(
                 &branch,
@@ -335,13 +351,8 @@ fn build_from_tags(
                 dry,
                 &mut prs_by_head,
             )?;
-            stack.push(PrRef {
-                number: num,
-                head: branch.clone(),
-                base: parent_branch.clone(),
-            });
+            stack.push(PrRef { number: num, head: branch.clone(), base: parent_branch.clone() });
         }
-
         parent_branch = branch;
     }
 
