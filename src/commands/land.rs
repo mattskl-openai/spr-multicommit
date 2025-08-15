@@ -1,11 +1,11 @@
 use anyhow::{anyhow, bail, Result};
 use tracing::warn;
 
+use crate::cli::LandCmd;
 use crate::git::{
     gh_rw, git_ro, git_rw, normalize_branch_name, sanitize_gh_base_ref, to_remote_ref,
 };
 use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs};
-use crate::cli::LandCmd;
 
 pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) -> Result<()> {
     let base_n = normalize_branch_name(base);
