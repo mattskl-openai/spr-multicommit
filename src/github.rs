@@ -160,28 +160,46 @@ pub fn upsert_pr_cached(
         // Defer edits to the final pass
         return Ok(num);
     }
-    gh_rw(
+    // Create PR and retrieve number in a single API call
+    let (owner, name) = get_repo_owner_name()?;
+    let path = format!("repos/{}/{}/pulls", owner, name);
+    let created_number = gh_rw(
         dry,
         [
-            "pr", "create", "--head", branch, "--base", parent, "--title", title, "--body", body,
+            "api",
+            &path,
+            "-X",
+            "POST",
+            "-f",
+            &format!("head={}", branch),
+            "-f",
+            &format!("base={}", parent),
+            "-f",
+            &format!("title={}", title),
+            "-f",
+            &format!("body={}", body),
+            "--jq",
+            ".number",
         ]
         .as_slice(),
     )?;
-    let json = gh_ro(
-        [
-            "pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number",
-        ]
-        .as_slice(),
-    )?;
-    #[derive(Deserialize)]
-    struct V {
-        number: u64,
+    let mut num: u64 = created_number.trim().parse().unwrap_or(0);
+    if num == 0 && !dry {
+        // Fallback: query the number if jq parse failed for some reason
+        let json = gh_ro(
+            [
+                "pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number",
+            ]
+            .as_slice(),
+        )?;
+        #[derive(Deserialize)]
+        struct V { number: u64 }
+        let arr: Vec<V> = serde_json::from_str(&json)?;
+        num = arr.first().map(|v| v.number).unwrap_or(0);
     }
-    let arr: Vec<V> = serde_json::from_str(&json)?;
-    let num = arr
-        .first()
-        .map(|v| v.number)
-        .ok_or_else(|| anyhow!("Failed to determine PR number for {}", branch))?;
+    if num == 0 {
+        return Err(anyhow!("Failed to determine PR number for {}", branch));
+    }
     prs_by_head.insert(branch.to_string(), num);
     Ok(num)
 }
