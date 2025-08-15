@@ -26,12 +26,12 @@ pub enum Cmd {
     /// Build/refresh stacked PRs
     Update {
         /// Base branch to stack onto (root PR bases on this)
-        #[arg(short = 'b', long, default_value = "main")]
-        base: String,
+        #[arg(short = 'b', long)]
+        base: Option<String>,
 
         /// Branch prefix for per-PR branches
-        #[arg(long, default_value = "spr/")]
-        prefix: String,
+        #[arg(long)]
+        prefix: Option<String>,
 
         /// Source ref to read commits from (if building from tags)
         #[arg(long, default_value = "HEAD")]
@@ -65,12 +65,12 @@ pub enum Cmd {
     /// Prepare PRs for landing (e.g., squash)
     Prep {
         /// Base branch to locate the root of the stack
-        #[arg(short = 'b', long, default_value = "main")]
-        base: String,
+        #[arg(short = 'b', long)]
+        base: Option<String>,
 
         /// Branch prefix for per-PR branches
-        #[arg(long, default_value = "spr/")]
-        prefix: String,
+        #[arg(long)]
+        prefix: Option<String>,
 
         /// Prep N PRs from bottom of stack (use 0 for all)
         #[arg(long, conflicts_with = "exact")]
@@ -91,23 +91,23 @@ pub enum Cmd {
         what: ListWhat,
 
         /// Base branch to locate the root of the stack
-        #[arg(short = 'b', long, default_value = "main")]
-        base: String,
+        #[arg(short = 'b', long)]
+        base: Option<String>,
 
         /// Branch prefix for per-PR branches
-        #[arg(long, default_value = "spr/")]
-        prefix: String,
+        #[arg(long)]
+        prefix: Option<String>,
     },
 
     /// Merge PRs from the bottom of the stack
     Merge {
         /// Base branch to locate the root of the stack
-        #[arg(short = 'b', long, default_value = "main")]
-        base: String,
+        #[arg(short = 'b', long)]
+        base: Option<String>,
 
         /// Branch prefix for per-PR branches
-        #[arg(long, default_value = "spr/")]
-        prefix: String,
+        #[arg(long)]
+        prefix: Option<String>,
 
         /// Merge the first N PRs (bottom-up)
         #[arg(long, value_name = "N")]
@@ -121,12 +121,12 @@ pub enum Cmd {
     /// Fix PR base connectivity to match local commit stack
     FixChain {
         /// Base branch to locate the root of the stack
-        #[arg(short = 'b', long, default_value = "main")]
-        base: String,
+        #[arg(short = 'b', long)]
+        base: Option<String>,
 
         /// Branch prefix for per-PR branches
-        #[arg(long, default_value = "spr/")]
-        prefix: String,
+        #[arg(long)]
+        prefix: Option<String>,
 
         /// Print state-changing commands instead of executing
         #[arg(long)]
