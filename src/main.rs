@@ -130,7 +130,7 @@ fn main() -> Result<()> {
                 crate::cli::ListWhat::Pr => crate::commands::list_prs_display(&base, &prefix)?,
             }
         }
-        crate::cli::Cmd::Merge {
+        crate::cli::Cmd::Land {
             base,
             prefix,
             until,
@@ -138,7 +138,7 @@ fn main() -> Result<()> {
         } => {
             set_dry_run_env(dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
-            crate::commands::merge_prs_until(&base, &prefix, until, dry_run)?;
+            crate::commands::land_prs_until(&base, &prefix, until, dry_run)?;
         }
         crate::cli::Cmd::FixChain {
             base,

@@ -99,8 +99,8 @@ pub enum Cmd {
         prefix: Option<String>,
     },
 
-    /// Merge PRs from the bottom of the stack
-    Merge {
+    /// Land PRs from the bottom of the stack
+    Land {
         /// Base branch to locate the root of the stack
         #[arg(short = 'b', long)]
         base: Option<String>,
@@ -109,7 +109,7 @@ pub enum Cmd {
         #[arg(long)]
         prefix: Option<String>,
 
-        /// Merge the first N PRs (bottom-up)
+        /// Land the first N PRs (bottom-up). Use 0 for all
         #[arg(long, value_name = "N")]
         until: usize,
 
