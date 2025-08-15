@@ -32,79 +32,82 @@ pub fn prep_squash(
         return Ok(());
     }
 
-    // Decide which index to operate on, honoring selection
-    let k_opt: Option<usize> = match selection {
-        crate::cli::PrepSelection::All => groups
-            .iter()
-            .enumerate()
-            .find(|(_i, g)| g.commits.len() > 1)
-            .map(|(i, _)| i),
-        crate::cli::PrepSelection::Until(n) => {
-            let upper = n.min(groups.len());
-            groups
-                .iter()
-                .take(upper)
-                .enumerate()
-                .find(|(_i, g)| g.commits.len() > 1)
-                .map(|(i, _)| i)
-        }
+    // Determine selected range of groups to prep (squash)
+    let (start_idx, end_idx_exclusive) = match selection {
+        crate::cli::PrepSelection::All => (0usize, groups.len()),
+        crate::cli::PrepSelection::Until(n) => (0usize, n.min(groups.len())),
         crate::cli::PrepSelection::Exact(i) => {
             if i == 0 || i > groups.len() { bail!("--exact out of range (1..={})", groups.len()); }
-            let idx = i - 1;
-            if groups[idx].commits.len() > 1 { Some(idx) } else { None }
+            (i - 1, (i - 1) + 1)
         }
     };
 
-    // If no multi-commit group in range, nothing to do
-    let Some(k) = k_opt else {
-        info!("No multi-commit PR found in the selected range; nothing to squash");
-        return Ok(());
-    };
-
-    // Start rebuilding history from just before the first multi-commit group
-    let mut parent_sha = if k == 0 {
+    // Start rebuilding history from just before the selected window
+    let mut parent_sha = if start_idx == 0 {
         merge_base.clone()
     } else {
-        groups[k - 1]
+        groups[start_idx - 1]
             .commits
             .last()
             .cloned()
             .expect("group has at least one commit")
     };
 
-    // Squash the first multi-commit group into a single commit
-    let tip = groups[k]
-        .commits
-        .last()
-        .ok_or_else(|| anyhow!("Empty group {}", groups[k].tag))?;
-    let tip_tree = git_ro(["rev-parse", &format!("{}^{{tree}}", tip)].as_slice())?
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    // Skip creating a commit if tree equals parent's tree (no changes)
-    let parent_tree = git_ro(["rev-parse", &format!("{}^{{tree}}", parent_sha)].as_slice())?
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if tip_tree != parent_tree {
-        let msg = groups[k].squash_commit_message()?;
-        let new_commit = git_rw(
-            dry,
-            ["commit-tree", &tip_tree, "-p", &parent_sha, "-m", &msg].as_slice(),
-        )?
-        .trim()
-        .to_string();
-        parent_sha = new_commit;
-    } else {
-        info!("Skipping empty squashed commit for group {} (no tree changes)", groups[k].tag);
+    // Prepare tip trees for selected groups
+    if start_idx < end_idx_exclusive {
+        let mut args: Vec<String> = vec!["rev-parse".into()];
+        for g in &groups[start_idx..end_idx_exclusive] {
+            let tip = g.commits.last().ok_or_else(|| anyhow!("Empty group {}", g.tag))?;
+            args.push(format!("{}^{{tree}}", tip));
+        }
+        let ref_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let trees_out = git_ro(&ref_args)?;
+        let sel_trees: Vec<&str> = trees_out.lines().collect();
+
+        // Fetch original messages for single-commit groups
+        let mut msg_args: Vec<&str> = vec!["log", "--no-walk=unsorted", "--format=%B%x1e"];
+        let mut tip_shas: Vec<&str> = vec![];
+        for g in &groups[start_idx..end_idx_exclusive] {
+            if g.commits.len() == 1 {
+                tip_shas.push(g.commits.last().unwrap());
+            }
+        }
+        if !tip_shas.is_empty() {
+            msg_args.extend(tip_shas.clone());
+        }
+        let single_msgs_raw = if tip_shas.is_empty() { String::new() } else { git_ro(&msg_args)? };
+        let single_msgs: Vec<&str> = if tip_shas.is_empty() { vec![] } else { single_msgs_raw.split('\u{001e}').map(|s| s.trim_end_matches('\n')).collect() };
+        let mut single_idx = 0usize;
+
+        for (offset, g) in groups[start_idx..end_idx_exclusive].iter().enumerate() {
+            let tree = sel_trees.get(offset).copied().unwrap_or("");
+            // Determine message: squash multi-commit groups, keep original for single-commit
+            let msg = if g.commits.len() > 1 {
+                g.squash_commit_message()?
+            } else {
+                let m = single_msgs.get(single_idx).copied().unwrap_or("");
+                single_idx += 1;
+                m.to_string()
+            };
+            // Skip creating a commit if tree equals parent's tree (no changes)
+            let parent_tree = git_ro(["rev-parse", &format!("{}^{{tree}}", parent_sha)].as_slice())?
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if tree != parent_tree {
+                let new_commit = git_rw(dry, ["commit-tree", tree, "-p", &parent_sha, "-m", &msg].as_slice())?.trim().to_string();
+                parent_sha = new_commit;
+            } else {
+                info!("Skipping empty commit for group {} (no tree changes)", g.tag);
+            }
+        }
     }
 
-    // Replay the remaining commits (above k) as-is on top to preserve their messages
+    // Replay the remaining commits (above selected window) as-is on top to preserve their messages
     let remainder: Vec<String> = groups
         .iter()
-        .skip(k + 1)
+        .skip(end_idx_exclusive)
         .flat_map(|g| g.commits.iter().cloned())
         .collect();
     if !remainder.is_empty() {
