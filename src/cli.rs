@@ -142,7 +142,7 @@ pub enum Cmd {
 )]
 pub struct Cli {
     /// Verbose output for underlying git/gh commands
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub verbose: bool,
     #[command(subcommand)]
     pub cmd: Cmd,
