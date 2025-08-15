@@ -68,6 +68,20 @@ impl Group {
             cleaned, sep,
         ))
     }
+
+    /// Body derived from the first commit message (without the title line) and with pr:<tag> markers removed.
+    /// Does not include any stack markers. Trimmed.
+    pub fn pr_body_base(&self) -> Result<String> {
+        let base_body = if let Some(full) = &self.first_message {
+            let mut it = full.lines();
+            let _ = it.next();
+            it.collect::<Vec<_>>().join("\n")
+        } else {
+            String::new()
+        };
+        let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
+        Ok(re.replace_all(&base_body, "").to_string().trim().to_string())
+    }
 }
 
 /// Parse commit stream from `git log --format=%H%x00%B%x1e --reverse <range>`

@@ -21,9 +21,9 @@ pub struct PrRef {
 }
 
 #[derive(Clone)]
-struct PrBodyInfo {
-    id: String,
-    body: String,
+pub struct PrBodyInfo {
+    pub id: String,
+    pub body: String,
 }
 
 pub fn fetch_pr_bodies_graphql(numbers: &Vec<u64>) -> Result<HashMap<u64, PrBodyInfo>> {

@@ -82,14 +82,24 @@ pub fn prep_squash(
         .next()
         .unwrap_or("")
         .to_string();
-    let msg = groups[k].squash_commit_message()?;
-    let new_commit = git_rw(
-        dry,
-        ["commit-tree", &tip_tree, "-p", &parent_sha, "-m", &msg].as_slice(),
-    )?
-    .trim()
-    .to_string();
-    parent_sha = new_commit;
+    // Skip creating a commit if tree equals parent's tree (no changes)
+    let parent_tree = git_ro(["rev-parse", &format!("{}^{{tree}}", parent_sha)].as_slice())?
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if tip_tree != parent_tree {
+        let msg = groups[k].squash_commit_message()?;
+        let new_commit = git_rw(
+            dry,
+            ["commit-tree", &tip_tree, "-p", &parent_sha, "-m", &msg].as_slice(),
+        )?
+        .trim()
+        .to_string();
+        parent_sha = new_commit;
+    } else {
+        info!("Skipping empty squashed commit for group {} (no tree changes)", groups[k].tag);
+    }
 
     // Replay the remaining commits (above k) as-is on top to preserve their messages
     let remainder: Vec<String> = groups
@@ -106,19 +116,28 @@ pub fn prep_squash(
         let ref_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let trees_out = git_ro(&ref_args)?;
         let trees: Vec<&str> = trees_out.lines().collect();
-        // Batch bodies
-        let mut log_args: Vec<&str> = vec!["log", "-1", "--format=%B%x1e"]; // RS-separated
+        // Batch bodies: ensure 1:1 with input order and include empty messages
+        let mut log_args: Vec<&str> = vec!["log", "--no-walk=unsorted", "--format=%B%x1e"]; // RS-separated
         let rem_refs: Vec<&str> = remainder.iter().map(|s| s.as_str()).collect();
         log_args.extend(rem_refs);
         let bodies_raw = git_ro(&log_args)?;
         let bodies: Vec<&str> = bodies_raw
             .split('\u{001e}')
             .map(|s| s.trim_end_matches('\n'))
-            .filter(|s| !s.is_empty())
             .collect();
         for i in 0..remainder.len() {
             let tree = trees.get(i).copied().unwrap_or("");
             let msg = bodies.get(i).copied().unwrap_or("");
+            // Skip creating a commit if this commit's tree equals parent's tree
+            let parent_tree = git_ro(["rev-parse", &format!("{}^{{tree}}", parent_sha)].as_slice())?
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if tree == parent_tree {
+                info!("Skipping empty replay commit {} of {} (no changes)", i + 1, remainder.len());
+                continue;
+            }
             let new_commit = git_rw(
                 dry,
                 ["commit-tree", tree, "-p", &parent_sha, "-m", msg].as_slice(),
