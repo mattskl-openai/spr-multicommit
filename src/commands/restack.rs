@@ -4,14 +4,15 @@ use tracing::info;
 use crate::git::{git_ro, git_rw};
 use crate::parsing::parse_groups;
 
-/// Restack the top of the local stack after the bottom `after` PRs.
+/// Restack the local stack by rebasing all commits after the first `after` PRs onto `base`.
 ///
-/// Steps:
-/// - Compute groups (PRs) from `base..HEAD`
-/// - Let K = total commits in the first `after` groups
-/// - Rebase the remaining commits onto `base` using:
-///   `git rebase --onto <base> <upstream> <current-branch>` where
-///   `<upstream>` is the tip commit of the Nth group (or merge-base if N==0)
+/// How it works:
+/// - Compute PR groups from `base..HEAD` (via `pr:<tag>` markers), bottom→top.
+/// - If `after == 0`: set `upstream = merge-base(base, HEAD)`.
+/// - Else: set `upstream = <first_commit_of_group_{after+1}>^` (parent of the first commit after the first N groups).
+/// - Run: `git rebase --onto <base> <upstream> <current-branch>`.
+///
+/// This moves the entire range starting at the first commit of group N+1 onto `base`, leaving the first N PRs untouched.
 pub fn restack_after(base: &str, _prefix: &str, after: usize, dry: bool) -> Result<()> {
     let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
         .trim()
@@ -39,26 +40,17 @@ pub fn restack_after(base: &str, _prefix: &str, after: usize, dry: bool) -> Resu
         return Ok(());
     }
 
-    // K = number of commits in the first N groups
-    let mut first_commits: Vec<String> = vec![];
-    for g in groups.iter().take(after) {
-        first_commits.extend(g.commits.iter().cloned());
-    }
-    let k = first_commits.len();
-    if k == 0 {
-        info!(
-            "First {} PR(s) contain zero commits; rebasing entire stack onto {}",
-            after, base
-        );
-    } else {
-        info!("K = {} commits in the first {} PR(s)", k, after);
-    }
-
-    // Determine upstream for rebase: first commit after the first N groups, or merge-base if none
-    let upstream = if k == 0 {
+    // Determine upstream for rebase. To include the first commit of group N+1 in the rebase,
+    // set upstream to the parent of that commit (i.e., `<first>^`). For N == 0, use merge-base.
+    let upstream: String = if after == 0 {
         merge_base
     } else {
-        first_commits[k].clone()
+        let next = &groups[after];
+        if let Some(first) = next.commits.first() {
+            format!("{}^", first)
+        } else {
+            merge_base
+        }
     };
 
     let cur_branch = git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
