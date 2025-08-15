@@ -68,7 +68,6 @@ fn main() -> Result<()> {
         crate::cli::Cmd::Update {
             from,
             no_pr,
-            restack,
             assume_existing_prs,
             update_pr_body,
             extent,
@@ -79,9 +78,7 @@ fn main() -> Result<()> {
                 crate::cli::Extent::Pr { n } => crate::limit::Limit::ByPr(n),
                 crate::cli::Extent::Commits { n } => crate::limit::Limit::ByCommits(n),
             });
-            if restack {
-                crate::commands::restack_existing(&base, &prefix, no_pr, cli.dry_run, limit)?;
-            } else if crate::parsing::has_tagged_commits(&base, &from)? {
+            if crate::parsing::has_tagged_commits(&base, &from)? {
                 crate::commands::build_from_tags(
                     &base,
                     &from,
@@ -93,7 +90,7 @@ fn main() -> Result<()> {
                 )?;
             } else {
                 info!(
-                    "No pr:<tag> markers found between {} and {}. Falling back to --restack.",
+                    "No pr:<tag> markers found between {} and {}. Falling back to restacking existing spr/* branches.",
                     base, from
                 );
                 crate::commands::restack_existing(&base, &prefix, no_pr, cli.dry_run, limit)?;

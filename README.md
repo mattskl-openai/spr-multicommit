@@ -49,7 +49,7 @@ Precedence for defaults:
 Global flags
 ------------
 
- - `--base, -b <BRANCH>`: root base branch (default from config)
+- `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
 - `--dry-run`: print state-changing commands instead of executing
 - `--until <N>`: target range used by `prep` and `land` (0 means all)
@@ -61,7 +61,7 @@ Commands
 
 ### spr update
 
-Build/refresh the stack from commit markers, or restack existing branches.
+Build/refresh the stack from commit markers.
 
 Key options:
 

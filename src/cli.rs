@@ -33,10 +33,6 @@ pub enum Cmd {
         #[arg(long)]
         no_pr: bool,
 
-        /// If set, always restack existing spr/* PR branches (skip tag parsing)
-        #[arg(long)]
-        restack: bool,
-
         /// In --dry-run, assume PRs already exist for branches (so we print 'edit' instead of 'create')
         #[arg(long)]
         assume_existing_prs: bool,
