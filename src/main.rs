@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::HashMap;
 use clap::{Parser, Subcommand};
 use regex::Regex;
 use serde::Deserialize;
@@ -265,7 +266,17 @@ fn build_from_tags(
     // Build bottom→top and collect PR refs for the visual update pass.
     let mut parent_branch = base.to_string();
     let mut stack: Vec<PrRef> = vec![];
+    // Prefetch open PRs to reduce per-branch lookups
+    let mut prs_by_head: HashMap<String, u64> =
+        list_spr_prs(prefix)?.into_iter().map(|p| (p.head, p.number)).collect();
     let mut force_from_now = false; // flip to true on first divergence with remote
+
+    // Batch fetch remote SHAs for all target branches
+    let branch_names: Vec<String> = groups
+        .iter()
+        .map(|g| format!("{}{}", prefix, g.tag))
+        .collect();
+    let remote_map = get_remote_branches_sha(&branch_names)?; // branch -> sha
 
     for (idx, g) in groups.iter_mut().enumerate() {
         let branch = format!("{}{}", prefix, g.tag);
@@ -277,7 +288,7 @@ fn build_from_tags(
         );
 
         // Use local commit SHA as source of truth; avoid rewriting commits when possible
-        let remote_head = get_remote_branch_sha(&branch)?;
+        let remote_head = remote_map.get(&branch).cloned();
         let target_sha = g
             .commits
             .last()
@@ -316,12 +327,13 @@ fn build_from_tags(
         }
 
         if !no_pr {
-            let num = upsert_pr(
+            let num = upsert_pr_cached(
                 &branch,
                 &sanitize_gh_base_ref(&parent_branch),
                 &g.pr_title()?,
                 &g.pr_body()?,
                 dry,
+                &mut prs_by_head,
             )?;
             stack.push(PrRef {
                 number: num,
@@ -405,12 +417,13 @@ fn restack_existing(
                 .join(" → ")
         );
 
+        // Ensure we only fetch once per chain
+        git_rw(dry, &["fetch", "origin"])?;
         for win in order.windows(2) {
             let parent = &win[0].head;
             let child = &win[1].head;
 
             info!("Rebasing {child} onto {parent}");
-            git_rw(dry, &["fetch", "origin"])?; // state-changing, print in dry-run
             git_ro(&["checkout", child])?;
             git_rw(
                 dry,
@@ -477,22 +490,46 @@ fn prep_squash(base: &str, prefix: &str, selection: PrepSelection, dry: bool) ->
       
     // Build a new chain: starting parent depends on selection
     let mut parent_sha = match selection { PrepSelection::Exact(i) => { if i==1 { merge_base.clone() } else { groups[i-2].commits.last().unwrap().clone() } }, _ => merge_base.clone() };
-    for g in &to_prep {
-        let tip = g.commits.last().ok_or_else(|| anyhow!("Empty group {}", g.tag))?;
-        let tree = git_ro(&["rev-parse", &format!("{}^{{tree}}", tip)])?.trim().to_string();
-        let msg = g.squash_commit_message()?;
-        let new_commit = git_rw(dry, &["commit-tree", &tree, "-p", &parent_sha, "-m", &msg])?.trim().to_string();
-        parent_sha = new_commit;
+    // Batch tip trees
+    if !to_prep.is_empty() {
+        let mut args: Vec<String> = vec!["rev-parse".into()];
+        for g in &to_prep {
+            let tip = g.commits.last().ok_or_else(|| anyhow!("Empty group {}", g.tag))?;
+            args.push(format!("{}^{{tree}}", tip));
+        }
+        let ref_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let trees_out = git_ro(&ref_args)?;
+        let trees: Vec<&str> = trees_out.lines().collect();
+        for (idx, g) in to_prep.iter().enumerate() {
+            let tree = trees.get(idx).copied().unwrap_or("");
+            let msg = g.squash_commit_message()?;
+            let new_commit = git_rw(dry, &["commit-tree", tree, "-p", &parent_sha, "-m", &msg])?.trim().to_string();
+            parent_sha = new_commit;
+        }
     }
 
     // Replay the remaining commits (not prepped) on top to preserve the rest of the stack
     let skip_after = match selection { PrepSelection::Exact(i) => i, _ => num_to_prep };
     let remainder: Vec<String> = groups.iter().skip(skip_after).flat_map(|g| g.commits.iter().cloned()).collect();
-    for sha in remainder {
-        let tree = git_ro(&["rev-parse", &format!("{}^{{tree}}", sha)])?.trim().to_string();
-        let msg = git_ro(&["log", "-1", "--format=%B", &sha])?.trim_end().to_string();
-        let new_commit = git_rw(dry, &["commit-tree", &tree, "-p", &parent_sha, "-m", &msg])?.trim().to_string();
-        parent_sha = new_commit;
+    if !remainder.is_empty() {
+        // Batch trees
+        let mut args: Vec<String> = vec!["rev-parse".into()];
+        for sha in &remainder { args.push(format!("{}^{{tree}}", sha)); }
+        let ref_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let trees_out = git_ro(&ref_args)?;
+        let trees: Vec<&str> = trees_out.lines().collect();
+        // Batch bodies
+        let mut log_args: Vec<&str> = vec!["log", "-1", "--format=%B%x1e"]; // RS-separated
+        let rem_refs: Vec<&str> = remainder.iter().map(|s| s.as_str()).collect();
+        log_args.extend(rem_refs);
+        let bodies_raw = git_ro(&log_args)?;
+        let bodies: Vec<&str> = bodies_raw.split('\u{001e}').map(|s| s.trim_end_matches('\n')).filter(|s| !s.is_empty()).collect();
+        for i in 0..remainder.len() {
+            let tree = trees.get(i).copied().unwrap_or("");
+            let msg = bodies.get(i).copied().unwrap_or("");
+            let new_commit = git_rw(dry, &["commit-tree", tree, "-p", &parent_sha, "-m", msg])?.trim().to_string();
+            parent_sha = new_commit;
+        }
     }
 
     // Move current branch to new head (includes squashed N groups + unchanged remainder)
@@ -628,6 +665,51 @@ fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn fetch_pr_bodies_graphql(numbers: &Vec<u64>) -> Result<HashMap<u64, String>> {
+    let mut out = HashMap::new();
+    if numbers.is_empty() { return Ok(out); }
+    let (owner, name) = get_repo_owner_name()?;
+    let mut q = String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (i, n) in numbers.iter().enumerate() {
+        q.push_str(&format!("pr{}: pullRequest(number: {}) {{ body }} ", i, n));
+    }
+    q.push_str("} }");
+    let json = gh_ro(&["api", "graphql", "-f", &format!("query={}", q), "-F", &format!("owner={}", owner), "-F", &format!("name={}", name)])?;
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &v["data"]["repository"];
+    for (i, n) in numbers.iter().enumerate() {
+        let key = format!("pr{}", i);
+        let body = repo[&key]["body"].as_str().unwrap_or("").to_string();
+        out.insert(*n, body);
+    }
+    Ok(out)
+}
+
+fn get_repo_owner_name() -> Result<(String, String)> {
+    let url = git_ro(&["config", "--get", "remote.origin.url"])?.trim().to_string();
+    if let Some(idx) = url.find("://") {
+        let rest = &url[idx+3..];
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() >= 3 {
+            let owner = parts[1].to_string();
+            let mut name = parts[2].to_string();
+            if let Some(s) = name.strip_suffix(".git") { name = s.to_string(); }
+            return Ok((owner, name));
+        }
+    } else if let Some(pos) = url.find(":") {
+        // git@github.com:owner/name.git
+        let rest = &url[pos+1..];
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() >= 2 {
+            let owner = parts[0].to_string();
+            let mut name = parts[1].to_string();
+            if let Some(s) = name.strip_suffix(".git") { name = s.to_string(); }
+            return Ok((owner, name));
+        }
+    }
+    bail!("Unable to parse remote.origin.url: {}", url)
 }
 
 fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
@@ -966,6 +1048,25 @@ fn get_remote_branch_sha(branch: &str) -> Result<Option<String>> {
     }
 }
 
+fn get_remote_branches_sha(branches: &Vec<String>) -> Result<HashMap<String, String>> {
+    let mut out_map: HashMap<String, String> = HashMap::new();
+    if branches.is_empty() { return Ok(out_map); }
+    let mut args: Vec<&str> = vec!["ls-remote", "--heads", "origin"];
+    let owned: Vec<String> = branches.iter().map(|b| b.to_string()).collect();
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    args.extend(refs);
+    let out = git_ro(&args)?;
+    for line in out.lines() {
+        let mut parts = line.split_whitespace();
+        let sha = parts.next().unwrap_or("").trim();
+        let r = parts.next().unwrap_or("").trim();
+        if sha.is_empty() || r.is_empty() { continue; }
+        let name = r.strip_prefix("refs/heads/").unwrap_or(r).to_string();
+        out_map.insert(name, sha.to_string());
+    }
+    Ok(out_map)
+}
+
 fn git_is_ancestor_in(dir: &str, ancestor: &str, descendant: &str) -> Result<bool> {
     let status = Command::new("git")
         .args([
@@ -1100,20 +1201,7 @@ fn upsert_pr(branch: &str, parent: &str, title: &str, body: &str, dry: bool) -> 
     }
     let existing: Vec<V> = serde_json::from_str(&json)?;
     if let Some(v) = existing.get(0) {
-        gh_rw(
-            dry,
-            &[
-                "pr",
-                "edit",
-                &format!("#{}", v.number),
-                "--title",
-                title,
-                "--base",
-                &sanitize_gh_base_ref(parent),
-                "--body",
-                body,
-            ],
-        )?;
+        // Defer edits (title/body) to final update pass; just return the number
         return Ok(v.number);
     }
 
@@ -1146,6 +1234,26 @@ fn upsert_pr(branch: &str, parent: &str, title: &str, body: &str, dry: bool) -> 
     Ok(num)
 }
 
+fn upsert_pr_cached(
+    branch: &str,
+    parent: &str,
+    title: &str,
+    body: &str,
+    dry: bool,
+    prs_by_head: &mut HashMap<String, u64>,
+) -> Result<u64> {
+    if let Some(&num) = prs_by_head.get(branch) {
+        // Defer edits to the final pass
+        return Ok(num);
+    }
+    gh_rw(dry, &["pr", "create", "--head", branch, "--base", parent, "--title", title, "--body", body])?;
+    let json = gh_ro(&["pr", "view", "-H", branch, "--json", "number"])?;
+    #[derive(Deserialize)] struct V { number: u64 }
+    let v: V = serde_json::from_str(&json)?;
+    prs_by_head.insert(branch.to_string(), v.number);
+    Ok(v.number)
+}
+
 /// Update the stack visual in each PR body (only for the set we touched).
 fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
     if stack.is_empty() {
@@ -1154,14 +1262,10 @@ fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
 
     let numbers: Vec<u64> = stack.iter().map(|p| p.number).collect();
     let numbers_rev: Vec<u64> = numbers.iter().cloned().rev().collect();
+    let bodies_by_number = fetch_pr_bodies_graphql(&numbers)?;
 
     for (idx, pr) in stack.iter().enumerate() {
-        let json = gh_ro(&["pr", "view", &format!("#{}", pr.number), "--json", "body"])?;
-        #[derive(Deserialize)]
-        struct B {
-            body: String,
-        }
-        let mut b: B = serde_json::from_str(&json)?;
+        let mut body = bodies_by_number.get(&pr.number).cloned().unwrap_or_default();
 
         let start = "<!-- spr-stack:start -->";
         let end = "<!-- spr-stack:end -->";
@@ -1170,7 +1274,7 @@ fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
             regex::escape(start),
             regex::escape(end)
         ))?;
-        b.body = re.replace(&b.body, "").trim().to_string();
+        body = re.replace(&body, "").trim().to_string();
 
         let em_space = "\u{2003}"; // U+2003 EM SPACE for indentation
         let mut lines = String::new();
@@ -1184,10 +1288,10 @@ fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
             lines.trim_end(),
             end,
         );
-        let new_body = if b.body.is_empty() {
+        let new_body = if body.is_empty() {
             block.clone()
         } else {
-            format!("{}\n\n{}", b.body, block)
+            format!("{}\n\n{}", body, block)
         };
 
         gh_rw(
