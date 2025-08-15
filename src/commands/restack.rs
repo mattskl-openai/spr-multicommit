@@ -20,7 +20,7 @@ pub fn restack_existing(
     }
 
     // Build linear chains for each root (baseRefName == base)
-    let mut roots: Vec<&PrInfo> = prs.iter().filter(|p| p.base == base_n).collect();
+    let roots: Vec<&PrInfo> = prs.iter().filter(|p| p.base == base_n).collect();
     if roots.is_empty() {
         bail!(
             "Could not find a root PR basing on `{}`. Ensure one PR has base `{}`.",

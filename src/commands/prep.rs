@@ -3,7 +3,7 @@ use tracing::info;
 
 use crate::git::{git_ro, git_rw};
 use crate::limit::Limit;
-use crate::parsing::{parse_groups, Group};
+use crate::parsing::parse_groups;
 
 /// Squash PRs according to selection; operate locally then run update for the affected groups.
 pub fn prep_squash(
