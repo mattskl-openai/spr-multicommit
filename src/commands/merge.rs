@@ -124,6 +124,11 @@ pub fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<
         ));
     }
     m.push('}');
+    tracing::info!(
+        "Merging PR #{} and closing {} other PR(s) on GitHub... this might take a few seconds.",
+        nth.number,
+        take_n - 1
+    );
     gh_rw(
         dry,
         ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
