@@ -53,6 +53,10 @@ pub enum Cmd {
         #[arg(long)]
         assume_existing_prs: bool,
 
+        /// Rewrite PR descriptions (bodies) even when content would be unchanged
+        #[arg(long, default_value_t = false)]
+        update_pr_body: bool,
+
         /// Limit how much to update (optional sub-mode)
         #[command(subcommand)]
         extent: Option<Extent>,
