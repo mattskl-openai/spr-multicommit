@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -11,11 +10,6 @@ pub struct PrInfo {
     pub number: u64,
     pub head: String,
     pub base: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct PrRef {
-    pub number: u64,
 }
 
 #[derive(Clone)]
@@ -209,82 +203,6 @@ pub fn upsert_pr_cached(
     }
     prs_by_head.insert(branch.to_string(), num);
     Ok(num)
-}
-
-pub fn update_stack_bodies(stack: &[PrRef], dry: bool) -> Result<()> {
-    if stack.is_empty() {
-        return Ok(());
-    }
-
-    let numbers: Vec<u64> = stack.iter().map(|p| p.number).collect();
-    let numbers_rev: Vec<u64> = numbers.iter().cloned().rev().collect();
-    let bodies_by_number = fetch_pr_bodies_graphql(&numbers)?;
-    let mut to_update: Vec<(u64, String, String)> = vec![]; // (number, id, new_body)
-
-    for pr in stack.iter() {
-        let mut body = bodies_by_number
-            .get(&pr.number)
-            .map(|x| x.body.clone())
-            .unwrap_or_default();
-
-        let start = "<!-- spr-stack:start -->";
-        let end = "<!-- spr-stack:end -->";
-        let re = Regex::new(&format!(
-            r"(?s){}.*?{}",
-            regex::escape(start),
-            regex::escape(end)
-        ))?;
-        body = re.replace(&body, "").trim().to_string();
-
-        let em_space = "\u{2003}"; // U+2003 EM SPACE for indentation
-        let mut lines = String::new();
-        for n in &numbers_rev {
-            let marker = if *n == pr.number { "➡" } else { em_space };
-            lines.push_str(&format!("- {} #{}\n", marker, n));
-        }
-        let block = format!(
-            "\n\n{}\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n{}\n",
-            start,
-            lines.trim_end(),
-            end,
-        );
-        let new_body = if body.is_empty() {
-            block.clone()
-        } else {
-            format!("{}\n\n{}", body, block)
-        };
-
-        if new_body.trim() == body.trim() {
-            info!("PR #{} body unchanged; skipping edit", pr.number);
-        } else {
-            let id = bodies_by_number
-                .get(&pr.number)
-                .map(|x| x.id.clone())
-                .unwrap_or_default();
-            if !id.is_empty() {
-                to_update.push((pr.number, id, new_body));
-            }
-        }
-    }
-    if !to_update.is_empty() {
-        tracing::info!(
-            "Updating stack visuals for {} PR(s) on GitHub... this might take a few seconds.",
-            to_update.len()
-        );
-        let mut m = String::from("mutation {");
-        for (i, (_num, id, body)) in to_update.iter().enumerate() {
-            m.push_str(&format!("m{}: updatePullRequest(input:{{pullRequestId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ", i, id, graphql_escape(body)));
-        }
-        m.push('}');
-        gh_rw(
-            dry,
-            ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
-        )?;
-        for (num, _, _) in to_update {
-            info!("Updated stack visual in PR #{}", num);
-        }
-    }
-    Ok(())
 }
 
 /// Append a warning line to a specific PR body (idempotent). Returns Ok(()) whether updated or skipped.

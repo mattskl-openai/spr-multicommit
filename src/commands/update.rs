@@ -6,7 +6,7 @@ use crate::git::{
     get_remote_branches_sha, gh_rw, git_is_ancestor, git_ro, git_rw, sanitize_gh_base_ref,
 };
 use crate::github::{
-    fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached, PrRef,
+    fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached,
 };
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{parse_groups, Group};
@@ -55,7 +55,6 @@ pub fn build_from_tags(
     );
 
     // Build bottom→top and collect PR refs for the visual update pass.
-    let mut stack: Vec<PrRef> = vec![];
     let mut just_created_numbers: Vec<u64> = vec![];
     // Prefetch open PRs to reduce per-branch lookups
     let mut prs_by_head: HashMap<String, u64> = list_spr_prs(prefix)?
@@ -167,7 +166,6 @@ pub fn build_from_tags(
             if !was_known {
                 just_created_numbers.push(num);
             }
-            stack.push(PrRef { number: num });
         }
         parent_branch = branch;
     }
