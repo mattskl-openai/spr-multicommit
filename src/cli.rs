@@ -50,6 +50,13 @@ pub enum Cmd {
         extent: Option<Extent>,
     },
 
+    /// Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base
+    Restack {
+        /// Ignore the bottom N PRs; rebase the remaining commits onto base
+        #[arg(long, value_name = "N")]
+        after: usize,
+    },
+
     /// Prepare PRs for landing (e.g., squash)
     Prep {
         // selection is provided via global --until/--exact flags
