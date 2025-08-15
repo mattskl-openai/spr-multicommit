@@ -280,6 +280,10 @@ pub fn build_from_tags(
             }
         }
         if !update_specs.is_empty() {
+            info!(
+                "Updating {} PR(s) on GitHub (bodies and/or base refs)... this might take a few seconds.",
+                update_specs.len()
+            );
             let mut m = String::from("mutation {");
             for (i, (_num, spec)) in update_specs.into_iter().enumerate() {
                 let mut fields: Vec<String> = vec![format!("pullRequestId:\"{}\"", spec.id)];

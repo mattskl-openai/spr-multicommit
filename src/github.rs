@@ -242,6 +242,10 @@ pub fn update_stack_bodies(stack: &[PrRef], dry: bool) -> Result<()> {
         }
     }
     if !to_update.is_empty() {
+        tracing::info!(
+            "Updating stack visuals for {} PR(s) on GitHub... this might take a few seconds.",
+            to_update.len()
+        );
         let mut m = String::from("mutation {");
         for (i, (_num, id, body)) in to_update.iter().enumerate() {
             m.push_str(&format!("m{}: updatePullRequest(input:{{pullRequestId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ", i, id, graphql_escape(body)));
@@ -272,6 +276,7 @@ pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()>
         } else {
             format!("{}\n\n{}", warning, body)
         };
+        info!("Appending warning to PR #{} on GitHub...", number);
         let mut m = String::from("mutation {");
         m.push_str(&format!(
             "u: updatePullRequest(input:{{pullRequestId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ",
