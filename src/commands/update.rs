@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tracing::info;
 use regex::Regex;
 
-use crate::git::{get_remote_branches_sha, git_is_ancestor, git_ro, git_rw, sanitize_gh_base_ref, gh_rw, normalize_branch_name};
+use crate::git::{get_remote_branches_sha, git_is_ancestor, git_ro, git_rw, sanitize_gh_base_ref, gh_rw};
 use crate::github::{list_spr_prs, upsert_pr_cached, PrRef, fetch_pr_bodies_graphql, graphql_escape};
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{parse_groups, Group};
@@ -52,7 +52,7 @@ pub fn build_from_tags(
     );
 
     // Build bottom→top and collect PR refs for the visual update pass.
-    let mut parent_branch = base.to_string();
+    // removed unused variable `parent_branch`
     let mut stack: Vec<PrRef> = vec![];
     let mut just_created_numbers: Vec<u64> = vec![];
     // Prefetch open PRs to reduce per-branch lookups
@@ -115,7 +115,7 @@ pub fn build_from_tags(
             kind,
         });
 
-        parent_branch = branch;
+        // removed unused assignment to `parent_branch`
     }
 
     // Execute batched pushes: first fast-forward, then force-with-lease
@@ -146,7 +146,7 @@ pub fn build_from_tags(
 
     // After pushes, (create or) update PRs
     let mut parent_branch = base.to_string();
-    for (_idx, g) in groups.iter().enumerate() {
+    for g in groups.iter() {
         let branch = format!("{}{}", prefix, g.tag);
         if !no_pr {
             let was_known = prs_by_head.contains_key(&branch);
@@ -159,7 +159,7 @@ pub fn build_from_tags(
                 &mut prs_by_head,
             )?;
             if !was_known { just_created_numbers.push(num); }
-            stack.push(PrRef { number: num, head: branch.clone(), base: parent_branch.clone() });
+            stack.push(PrRef { number: num });
         }
         parent_branch = branch;
     }
@@ -204,8 +204,8 @@ pub fn build_from_tags(
 
         // Fetch PR ids/bodies for union of all PRs in local stack (for base) and those we may rewrite bodies for
         let mut fetch_set: std::collections::HashSet<u64> = numbers_full.iter().cloned().collect();
-        for (&n, _) in &desired_by_number { fetch_set.insert(n); }
-        for (&n, _) in &desired_base_by_number { fetch_set.insert(n); }
+        for &n in desired_by_number.keys() { fetch_set.insert(n); }
+        for &n in desired_base_by_number.keys() { fetch_set.insert(n); }
         let fetch_list: Vec<u64> = fetch_set.into_iter().collect();
         let bodies_by_number = fetch_pr_bodies_graphql(&fetch_list)?;
         // Combine updates per PR: (id, maybe_body, maybe_base)
@@ -224,7 +224,7 @@ pub fn build_from_tags(
                 } else {
                     let current = info.body.clone();
                     let base_current = re_stack.replace(&current, "").trim().to_string();
-                    let reconstructed_current = if base_current.trim().is_empty() { desired.clone() } else { format!("{}", current.trim()) };
+                    let reconstructed_current = if base_current.trim().is_empty() { desired.clone() } else { current.trim().to_string() };
                     desired.trim() != reconstructed_current.trim()
                 };
                 if needs_body {
@@ -242,15 +242,13 @@ pub fn build_from_tags(
         }
         if !update_specs.is_empty() {
             let mut m = String::from("mutation {");
-            let mut i = 0;
-            for (_num, spec) in update_specs {
+            for (i, (_num, spec)) in update_specs.into_iter().enumerate() {
                 let mut fields: Vec<String> = vec![format!("pullRequestId:\"{}\"", spec.id)];
                 if let Some(b) = spec.body { fields.push(format!("body:\"{}\"", graphql_escape(&b))); }
                 if let Some(base_ref) = spec.base { fields.push(format!("baseRefName:\"{}\"", graphql_escape(&base_ref))); }
                 m.push_str(&format!("m{}: updatePullRequest(input:{{{}}}){{ clientMutationId }} ", i, fields.join(", ")));
-                i += 1;
             }
-            m.push_str("}");
+            m.push('}');
             gh_rw(dry, ["api", "graphql", "-f", &format!("query={}", m)].as_slice())?;
         } else {
             info!("All PR descriptions/base refs up-to-date; no edits needed");

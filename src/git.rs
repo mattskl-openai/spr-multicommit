@@ -29,7 +29,7 @@ pub fn git_rw(dry: bool, args: &[&str]) -> Result<String> {
         // Allow executing safe local ops in dry-run to mimic real flow closely
         let mut idx = 0;
         let mut in_tmp = false;
-        if let Some(first) = args.get(0) {
+        if let Some(first) = args.first() {
             if *first == "-C" && args.len() >= 2 {
                 idx = 2;
                 in_tmp = args[1].starts_with("/tmp/spr-");
@@ -124,51 +124,10 @@ pub fn normalize_branch_name(name: &str) -> String {
     out.to_string()
 }
 
-pub fn safe_checkout_reset(dry: bool, branch: &str, start_point: &str) -> Result<()> {
-    // If branch exists, back it up to avoid losing local commits
-    let exists = git_ro(["rev-parse", "--verify", branch].as_slice()).is_ok();
-    if exists {
-        let sha = git_ro(["rev-parse", branch].as_slice())?.trim().to_string();
-        let backup = format!(
-            "spr-backup/{}-{}",
-            branch.replace('/', "_"),
-            &sha[..8.min(sha.len())]
-        );
-        info!("Backing up existing branch {} to {}", branch, backup);
-        if !dry {
-            git_ro(["branch", &backup, branch].as_slice())?;
-        }
-    }
-    git_rw(dry, ["checkout", "-B", branch, start_point].as_slice())?;
-    Ok(())
-}
-
 pub fn verbose_log_cmd(tool: &str, args: &[&str]) {
     if std::env::var_os("SPR_VERBOSE").is_some() {
         info!("{} {}", tool, shellish(args));
     }
-}
-
-pub fn git_rw_in(dry: bool, dir: &str, args: &[&str]) -> Result<String> {
-    let mut v: Vec<String> = Vec::with_capacity(args.len() + 2);
-    v.push("-C".to_string());
-    v.push(dir.to_string());
-    for a in args {
-        v.push((*a).to_string());
-    }
-    let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
-    git_rw(dry, &refs)
-}
-
-pub fn git_ro_in(dir: &str, args: &[&str]) -> Result<String> {
-    let mut v: Vec<String> = Vec::with_capacity(args.len() + 2);
-    v.push("-C".to_string());
-    v.push(dir.to_string());
-    for a in args {
-        v.push((*a).to_string());
-    }
-    let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
-    git_ro(&refs)
 }
 
 pub fn to_remote_ref(name: &str) -> String {
@@ -177,17 +136,7 @@ pub fn to_remote_ref(name: &str) -> String {
     format!("origin/{}", name)
 }
 
-pub fn get_remote_branch_sha(branch: &str) -> Result<Option<String>> {
-    let out = git_ro(["ls-remote", "--heads", "origin", branch].as_slice())?;
-    let sha = out.split_whitespace().next().unwrap_or("").trim();
-    if sha.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(sha.to_string()))
-    }
-}
-
-pub fn get_remote_branches_sha(branches: &Vec<String>) -> Result<HashMap<String, String>> {
+pub fn get_remote_branches_sha(branches: &[String]) -> Result<HashMap<String, String>> {
     let mut out_map: HashMap<String, String> = HashMap::new();
     if branches.is_empty() {
         return Ok(out_map);
@@ -208,21 +157,6 @@ pub fn get_remote_branches_sha(branches: &Vec<String>) -> Result<HashMap<String,
         out_map.insert(name, sha.to_string());
     }
     Ok(out_map)
-}
-
-pub fn git_is_ancestor_in(dir: &str, ancestor: &str, descendant: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .args([
-            "-C",
-            dir,
-            "merge-base",
-            "--is-ancestor",
-            ancestor,
-            descendant,
-        ])
-        .status()
-        .with_context(|| format!("failed to run git -C {} merge-base --is-ancestor", dir))?;
-    Ok(status.success())
 }
 
 pub fn git_is_ancestor(ancestor: &str, descendant: &str) -> Result<bool> {

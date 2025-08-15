@@ -94,11 +94,7 @@ pub fn restack_existing(
 
         // Collect for the visual pass (bottom→top order)
         for pr in &order {
-            overall_stack.push(PrRef {
-                number: pr.number,
-                head: pr.head.clone(),
-                base: pr.base.clone(),
-            });
+            overall_stack.push(PrRef { number: pr.number });
         }
     }
 

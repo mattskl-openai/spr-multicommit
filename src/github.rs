@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::{info, warn};
 
-use crate::git::{gh_ro, gh_rw, git_ro, sanitize_gh_base_ref};
+use crate::git::{gh_ro, gh_rw, git_ro};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PrInfo {
@@ -16,8 +16,6 @@ pub struct PrInfo {
 #[derive(Debug, Clone)]
 pub struct PrRef {
     pub number: u64,
-    pub head: String,
-    pub base: String,
 }
 
 #[derive(Clone)]
@@ -26,7 +24,7 @@ pub struct PrBodyInfo {
     pub body: String,
 }
 
-pub fn fetch_pr_bodies_graphql(numbers: &Vec<u64>) -> Result<HashMap<u64, PrBodyInfo>> {
+pub fn fetch_pr_bodies_graphql(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInfo>> {
     let mut out = HashMap::new();
     if numbers.is_empty() {
         return Ok(out);
@@ -129,18 +127,18 @@ pub fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
     struct Raw {
         number: u64,
         #[serde(rename = "headRefName")]
-        headRefName: String,
+        head_ref_name: String,
         #[serde(rename = "baseRefName")]
-        baseRefName: String,
+        base_ref_name: String,
     }
     let raws: Vec<Raw> = serde_json::from_str(&json)?;
     let mut out = vec![];
     for r in raws {
-        if r.headRefName.starts_with(prefix) {
+        if r.head_ref_name.starts_with(prefix) {
             out.push(PrInfo {
                 number: r.number,
-                head: r.headRefName,
-                base: r.baseRefName,
+                head: r.head_ref_name,
+                base: r.base_ref_name,
             });
         }
     }
@@ -150,96 +148,6 @@ pub fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
     Ok(out)
 }
 
-pub fn upsert_pr(branch: &str, parent: &str, title: &str, body: &str, dry: bool) -> Result<u64> {
-    if dry {
-        if std::env::var_os("SPR_DRY_ASSUME_EXISTING").is_some() {
-            let n = fake_pr_number(branch);
-            gh_rw(
-                dry,
-                [
-                    "pr",
-                    "edit",
-                    &format!("#{}", n),
-                    "--title",
-                    title,
-                    "--base",
-                    &sanitize_gh_base_ref(parent),
-                    "--body",
-                    body,
-                ]
-                .as_slice(),
-            )?;
-            return Ok(n);
-        } else {
-            // In dry-run default, pretend PR does not exist and show create command
-            gh_rw(
-                dry,
-                [
-                    "pr",
-                    "create",
-                    "--head",
-                    branch,
-                    "--base",
-                    &sanitize_gh_base_ref(parent),
-                    "--title",
-                    title,
-                    "--body",
-                    body,
-                ]
-                .as_slice(),
-            )?;
-            return Ok(0);
-        }
-    }
-    // Check for existing open PR by head
-    let json = gh_ro(
-        [
-            "pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number",
-        ]
-        .as_slice(),
-    )?;
-    #[derive(Deserialize)]
-    struct V {
-        number: u64,
-    }
-    let existing: Vec<V> = serde_json::from_str(&json)?;
-    if let Some(v) = existing.get(0) {
-        // Defer edits (title/body) to final update pass; just return the number
-        return Ok(v.number);
-    }
-
-    // Create new PR
-    gh_rw(
-        dry,
-        [
-            "pr",
-            "create",
-            "--head",
-            branch,
-            "--base",
-            &sanitize_gh_base_ref(parent),
-            "--title",
-            title,
-            "--body",
-            body,
-        ]
-        .as_slice(),
-    )?;
-
-    // Fetch created PR number
-    let json2 = gh_ro(
-        [
-            "pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number",
-        ]
-        .as_slice(),
-    )?;
-    let created: Vec<V> = serde_json::from_str(&json2)?;
-    let num = created
-        .get(0)
-        .map(|v| v.number)
-        .ok_or_else(|| anyhow!("Failed to determine PR number for {}", branch))?;
-    Ok(num)
-}
 
 pub fn upsert_pr_cached(
     branch: &str,
@@ -272,14 +180,14 @@ pub fn upsert_pr_cached(
     }
     let arr: Vec<V> = serde_json::from_str(&json)?;
     let num = arr
-        .get(0)
+        .first()
         .map(|v| v.number)
         .ok_or_else(|| anyhow!("Failed to determine PR number for {}", branch))?;
     prs_by_head.insert(branch.to_string(), num);
     Ok(num)
 }
 
-pub fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
+pub fn update_stack_bodies(stack: &[PrRef], dry: bool) -> Result<()> {
     if stack.is_empty() {
         return Ok(());
     }
@@ -289,7 +197,7 @@ pub fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
     let bodies_by_number = fetch_pr_bodies_graphql(&numbers)?;
     let mut to_update: Vec<(u64, String, String)> = vec![]; // (number, id, new_body)
 
-    for (_idx, pr) in stack.iter().enumerate() {
+    for pr in stack.iter() {
         let mut body = bodies_by_number
             .get(&pr.number)
             .map(|x| x.body.clone())
@@ -339,7 +247,7 @@ pub fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
         for (i, (_num, id, body)) in to_update.iter().enumerate() {
             m.push_str(&format!("m{}: updatePullRequest(input:{{pullRequestId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ", i, id, graphql_escape(body)));
         }
-        m.push_str("}");
+        m.push('}');
         gh_rw(
             dry,
             ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
@@ -351,17 +259,10 @@ pub fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn fake_pr_number(head: &str) -> u64 {
-    let mut sum: u64 = 0;
-    for b in head.bytes() {
-        sum = sum.wrapping_add(b as u64);
-    }
-    1000 + (sum % 900_000)
-}
 
 /// Append a warning line to a specific PR body (idempotent). Returns Ok(()) whether updated or skipped.
 pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()> {
-    let bodies = fetch_pr_bodies_graphql(&vec![number])?;
+    let bodies = fetch_pr_bodies_graphql(&[number])?;
     if let Some(info) = bodies.get(&number) {
         let body = info.body.clone();
         if body.contains(warning) {
@@ -375,7 +276,7 @@ pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()>
             info.id,
             graphql_escape(&new_body)
         ));
-        m.push_str("}");
+        m.push('}');
         gh_rw(dry, ["api", "graphql", "-f", &format!("query={}", m)].as_slice())?;
         info!("Appended warning to PR #{}", number);
     }
