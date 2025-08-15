@@ -188,12 +188,15 @@ pub fn upsert_pr_cached(
         // Fallback: query the number if jq parse failed for some reason
         let json = gh_ro(
             [
-                "pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number",
+                "pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json",
+                "number",
             ]
             .as_slice(),
         )?;
         #[derive(Deserialize)]
-        struct V { number: u64 }
+        struct V {
+            number: u64,
+        }
         let arr: Vec<V> = serde_json::from_str(&json)?;
         num = arr.first().map(|v| v.number).unwrap_or(0);
     }
