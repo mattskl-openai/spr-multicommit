@@ -124,6 +124,13 @@ pub fn normalize_branch_name(name: &str) -> String {
     out.to_string()
 }
 
+pub fn repo_root() -> Result<Option<String>> {
+    match git_ro(["rev-parse", "--show-toplevel"].as_slice()) {
+        Ok(path) => Ok(Some(path.trim().to_string())),
+        Err(_) => Ok(None),
+    }
+}
+
 pub fn verbose_log_cmd(tool: &str, args: &[&str]) {
     if std::env::var_os("SPR_VERBOSE").is_some() {
         info!("{} {}", tool, shellish(args));
