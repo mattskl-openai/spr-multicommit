@@ -150,6 +150,11 @@ fn main() -> Result<()> {
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::fix_stack(&base, &prefix, cli.dry_run)?;
         }
+        crate::cli::Cmd::Restack { base, prefix, after, dry_run } => {
+            set_dry_run_env(dry_run, false);
+            let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
+            crate::commands::restack_after(&base, &prefix, after, dry_run)?;
+        }
     }
     Ok(())
 }

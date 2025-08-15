@@ -1,7 +1,7 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use tracing::{info, warn};
 
-use crate::git::{gh_rw, git_ro, git_rw, normalize_branch_name, sanitize_gh_base_ref};
+ use crate::git::{gh_rw, git_ro, git_rw, normalize_branch_name, sanitize_gh_base_ref, to_remote_ref};
 use crate::github::{list_spr_prs, PrInfo, PrRef};
 use crate::limit::{apply_limit_prs_for_restack, Limit};
 
@@ -106,6 +106,77 @@ pub fn restack_existing(
             overall_stack.len()
         );
     }
+
+    Ok(())
+}
+
+/// Restack commits after PR N onto the base branch via cherry-pick on a temp branch.
+pub fn restack_after(base: &str, prefix: &str, after_n: usize, dry: bool) -> Result<()> {
+    let base_n = normalize_branch_name(base);
+    // Discover ordered chain of PRs bottom→top
+    let prs = list_spr_prs(prefix)?;
+    if prs.is_empty() {
+        bail!("No open PRs with head starting with `{prefix}`.");
+    }
+    let root = prs
+        .iter()
+        .find(|p| p.base == base_n)
+        .ok_or_else(|| anyhow!("No root PR with base `{}`", base_n))?;
+    let mut ordered: Vec<&PrInfo> = vec![];
+    let mut cur = root;
+    loop {
+        ordered.push(cur);
+        if let Some(next) = prs.iter().find(|p| p.base == cur.head) {
+            cur = next;
+        } else {
+            break;
+        }
+    }
+    if ordered.is_empty() {
+        bail!("No PR chain found");
+    }
+
+    // Determine K = total commits after PR N (1-based). N==0 means all.
+    let start_idx = if after_n == 0 { 0 } else { after_n.min(ordered.len()) };
+    // Compute per-PR commit counts relative to parent
+    git_rw(dry, ["fetch", "origin"].as_slice())?;
+    let mut total_after: usize = 0;
+    for i in start_idx..ordered.len() {
+        let parent_ref = if i == 0 {
+            to_remote_ref(&base_n)
+        } else {
+            to_remote_ref(&ordered[i - 1].head)
+        };
+        let child_ref = to_remote_ref(&ordered[i].head);
+        let cnt_s = git_ro([
+            "rev-list",
+            "--count",
+            &format!("{}..{}", parent_ref, child_ref),
+        ]
+        .as_slice())?;
+        let cnt: usize = cnt_s.trim().parse().unwrap_or(0);
+        total_after = total_after.saturating_add(cnt);
+    }
+    if total_after == 0 {
+        info!("No commits to restack after N={}", after_n);
+        return Ok(());
+    }
+
+    // Create/reset temp branch at base
+    let temp_branch = "spr-temp";
+    let base_ref = to_remote_ref(&base_n);
+    info!("Switching to temp branch {} at {}", temp_branch, base_ref);
+    git_rw(dry, ["switch", "-C", temp_branch, &base_ref].as_slice())?;
+
+    // Cherry-pick the last K commits from top branch
+    let top_head = ordered.last().unwrap().head.clone();
+    let top_ref = to_remote_ref(&top_head);
+    let range = format!("{}~{}..{}", top_ref, total_after, top_ref);
+    info!(
+        "Cherry-picking {} commits from {} onto {}",
+        total_after, top_head, temp_branch
+    );
+    git_rw(dry, ["cherry-pick", &range].as_slice())?;
 
     Ok(())
 }

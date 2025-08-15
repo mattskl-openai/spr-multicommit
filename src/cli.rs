@@ -68,6 +68,25 @@ pub enum Cmd {
         which: Option<LandCmd>,
     },
 
+    /// Restack commits after PR N onto base via cherry-pick on a temp branch
+    Restack {
+        /// Base branch to locate the root of the stack
+        #[arg(short = 'b', long)]
+        base: Option<String>,
+
+        /// Branch prefix for per-PR branches
+        #[arg(long)]
+        prefix: Option<String>,
+
+        /// PR index after which to restack (1-based). 0 means all
+        #[arg(long, value_name = "N")]
+        after: usize,
+
+        /// Print state-changing commands instead of executing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Fix PR stack connectivity to match local commit stack
     FixStack {
         // dry-run is provided via global --dry-run
