@@ -4,7 +4,7 @@ use tracing::warn;
 use crate::git::{
     gh_rw, git_ro, git_rw, normalize_branch_name, sanitize_gh_base_ref, to_remote_ref,
 };
-use crate::github::{list_spr_prs, fetch_pr_bodies_graphql, graphql_escape};
+use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs};
 
 pub fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
     if n == 0 {
@@ -77,10 +77,17 @@ pub fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<
     // Batch: set base of Nth PR, merge it (rebase), and close others with a comment via GraphQL
     let nth = segment[take_n - 1];
     let mut nums: Vec<u64> = vec![nth.number];
-    for pr in &segment[..take_n - 1] { nums.push(pr.number); }
+    for pr in &segment[..take_n - 1] {
+        nums.push(pr.number);
+    }
     let bodies = fetch_pr_bodies_graphql(&nums)?;
-    let nth_id = bodies.get(&nth.number).map(|x| x.id.clone()).unwrap_or_default();
-    if nth_id.is_empty() { bail!("Failed to fetch GraphQL id for PR #{}", nth.number); }
+    let nth_id = bodies
+        .get(&nth.number)
+        .map(|x| x.id.clone())
+        .unwrap_or_default();
+    if nth_id.is_empty() {
+        bail!("Failed to fetch GraphQL id for PR #{}", nth.number);
+    }
 
     let mut m = String::from("mutation {");
     // Ensure base for nth
@@ -96,8 +103,13 @@ pub fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<
     ));
     // Close others with a comment
     for (i, pr) in segment[..take_n - 1].iter().enumerate() {
-        let id = bodies.get(&pr.number).map(|x| x.id.clone()).unwrap_or_default();
-        if id.is_empty() { continue; }
+        let id = bodies
+            .get(&pr.number)
+            .map(|x| x.id.clone())
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
         let idx = i + 1;
         let comment = format!("Merged as part of PR #{}", nth.number);
         m.push_str(&format!(
@@ -108,12 +120,14 @@ pub fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<
         ));
         m.push_str(&format!(
             "x{}: closePullRequest(input:{{pullRequestId:\"{}\"}}){{ clientMutationId }} ",
-            idx,
-            id
+            idx, id
         ));
     }
     m.push('}');
-    gh_rw(dry, ["api", "graphql", "-f", &format!("query={}", m)].as_slice())?;
+    gh_rw(
+        dry,
+        ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
+    )?;
 
     Ok(())
 }

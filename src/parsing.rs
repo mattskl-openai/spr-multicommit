@@ -80,7 +80,11 @@ impl Group {
             String::new()
         };
         let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
-        Ok(re.replace_all(&base_body, "").to_string().trim().to_string())
+        Ok(re
+            .replace_all(&base_body, "")
+            .to_string()
+            .trim()
+            .to_string())
     }
 }
 

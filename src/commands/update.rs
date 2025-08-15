@@ -1,10 +1,14 @@
 use anyhow::{anyhow, Result};
+use regex::Regex;
 use std::collections::HashMap;
 use tracing::info;
-use regex::Regex;
 
-use crate::git::{get_remote_branches_sha, git_is_ancestor, git_ro, git_rw, sanitize_gh_base_ref, gh_rw};
-use crate::github::{list_spr_prs, upsert_pr_cached, PrRef, fetch_pr_bodies_graphql, graphql_escape};
+use crate::git::{
+    get_remote_branches_sha, gh_rw, git_is_ancestor, git_ro, git_rw, sanitize_gh_base_ref,
+};
+use crate::github::{
+    fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached, PrRef,
+};
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{parse_groups, Group};
 
@@ -52,7 +56,6 @@ pub fn build_from_tags(
     );
 
     // Build bottom→top and collect PR refs for the visual update pass.
-    // removed unused variable `parent_branch`
     let mut stack: Vec<PrRef> = vec![];
     let mut just_created_numbers: Vec<u64> = vec![];
     // Prefetch open PRs to reduce per-branch lookups
@@ -104,7 +107,12 @@ pub fn build_from_tags(
             PushKind::Skip
         } else if let Some(ref remote_sha) = remote_head {
             let ff_ok = git_is_ancestor(remote_sha, &target_sha)?;
-            if ff_ok { PushKind::FastForward } else { info!("Diverged: forcing update for {}", branch); PushKind::Force }
+            if ff_ok {
+                PushKind::FastForward
+            } else {
+                info!("Diverged: forcing update for {}", branch);
+                PushKind::Force
+            }
         } else {
             // No remote exists; create the branch
             PushKind::FastForward
@@ -114,8 +122,6 @@ pub fn build_from_tags(
             target_sha: target_sha.clone(),
             kind,
         });
-
-        // removed unused assignment to `parent_branch`
     }
 
     // Execute batched pushes: first fast-forward, then force-with-lease
@@ -138,7 +144,8 @@ pub fn build_from_tags(
         .map(|p| format!("{}:refs/heads/{}", p.target_sha, p.branch))
         .collect();
     if !force_refspecs.is_empty() {
-        let mut argv: Vec<String> = vec!["push".into(), "--force-with-lease".into(), "origin".into()];
+        let mut argv: Vec<String> =
+            vec!["push".into(), "--force-with-lease".into(), "origin".into()];
         argv.extend(force_refspecs.clone());
         let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         git_rw(dry, &args)?;
@@ -158,7 +165,9 @@ pub fn build_from_tags(
                 dry,
                 &mut prs_by_head,
             )?;
-            if !was_known { just_created_numbers.push(num); }
+            if !was_known {
+                just_created_numbers.push(num);
+            }
             stack.push(PrRef { number: num });
         }
         parent_branch = branch;
@@ -169,7 +178,9 @@ pub fn build_from_tags(
         let mut numbers_full: Vec<u64> = vec![];
         for g in &groups {
             let head_branch = format!("{}{}", prefix, g.tag);
-            if let Some(&n) = prs_by_head.get(&head_branch) { numbers_full.push(n); }
+            if let Some(&n) = prs_by_head.get(&head_branch) {
+                numbers_full.push(n);
+            }
         }
         let numbers_rev: Vec<u64> = numbers_full.iter().cloned().rev().collect();
         // Build desired bodies and base refs from local commits
@@ -178,7 +189,11 @@ pub fn build_from_tags(
         let mut want_base_ref = sanitize_gh_base_ref(base);
         for (idx, g) in groups.iter().enumerate() {
             let head_branch = format!("{}{}", prefix, g.tag);
-            let include = update_pr_body || planned.get(idx).map(|p| p.kind != PushKind::Skip).unwrap_or(false);
+            let include = update_pr_body
+                || planned
+                    .get(idx)
+                    .map(|p| p.kind != PushKind::Skip)
+                    .unwrap_or(false);
             if let Some(&num) = prs_by_head.get(&head_branch) {
                 // Stack visual (optional rewrite)
                 if include {
@@ -193,7 +208,11 @@ pub fn build_from_tags(
                         "<!-- spr-stack:start -->\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n<!-- spr-stack:end -->",
                         lines.trim_end(),
                     );
-                    let body = if base.trim().is_empty() { stack_block.clone() } else { format!("{}\n\n{}", base, stack_block) };
+                    let body = if base.trim().is_empty() {
+                        stack_block.clone()
+                    } else {
+                        format!("{}\n\n{}", base, stack_block)
+                    };
                     desired_by_number.insert(num, body);
                 }
                 // Base linkage (always set according to local stack)
@@ -204,12 +223,20 @@ pub fn build_from_tags(
 
         // Fetch PR ids/bodies for union of all PRs in local stack (for base) and those we may rewrite bodies for
         let mut fetch_set: std::collections::HashSet<u64> = numbers_full.iter().cloned().collect();
-        for &n in desired_by_number.keys() { fetch_set.insert(n); }
-        for &n in desired_base_by_number.keys() { fetch_set.insert(n); }
+        for &n in desired_by_number.keys() {
+            fetch_set.insert(n);
+        }
+        for &n in desired_base_by_number.keys() {
+            fetch_set.insert(n);
+        }
         let fetch_list: Vec<u64> = fetch_set.into_iter().collect();
         let bodies_by_number = fetch_pr_bodies_graphql(&fetch_list)?;
         // Combine updates per PR: (id, maybe_body, maybe_base)
-        struct UpdateSpec { id: String, body: Option<String>, base: Option<String> }
+        struct UpdateSpec {
+            id: String,
+            body: Option<String>,
+            base: Option<String>,
+        }
         let mut update_specs: HashMap<u64, UpdateSpec> = HashMap::new();
         let re_stack = Regex::new(&format!(
             r"(?s){}.*?{}",
@@ -224,11 +251,19 @@ pub fn build_from_tags(
                 } else {
                     let current = info.body.clone();
                     let base_current = re_stack.replace(&current, "").trim().to_string();
-                    let reconstructed_current = if base_current.trim().is_empty() { desired.clone() } else { current.trim().to_string() };
+                    let reconstructed_current = if base_current.trim().is_empty() {
+                        desired.clone()
+                    } else {
+                        current.trim().to_string()
+                    };
                     desired.trim() != reconstructed_current.trim()
                 };
                 if needs_body {
-                    let entry = update_specs.entry(num).or_insert(UpdateSpec { id: info.id.clone(), body: None, base: None });
+                    let entry = update_specs.entry(num).or_insert(UpdateSpec {
+                        id: info.id.clone(),
+                        body: None,
+                        base: None,
+                    });
                     entry.body = Some(desired.clone());
                 }
             }
@@ -236,7 +271,11 @@ pub fn build_from_tags(
         // Bases
         for (&num, want_base) in &desired_base_by_number {
             if let Some(info) = bodies_by_number.get(&num) {
-                let entry = update_specs.entry(num).or_insert(UpdateSpec { id: info.id.clone(), body: None, base: None });
+                let entry = update_specs.entry(num).or_insert(UpdateSpec {
+                    id: info.id.clone(),
+                    body: None,
+                    base: None,
+                });
                 entry.base = Some(sanitize_gh_base_ref(want_base));
             }
         }
@@ -244,12 +283,23 @@ pub fn build_from_tags(
             let mut m = String::from("mutation {");
             for (i, (_num, spec)) in update_specs.into_iter().enumerate() {
                 let mut fields: Vec<String> = vec![format!("pullRequestId:\"{}\"", spec.id)];
-                if let Some(b) = spec.body { fields.push(format!("body:\"{}\"", graphql_escape(&b))); }
-                if let Some(base_ref) = spec.base { fields.push(format!("baseRefName:\"{}\"", graphql_escape(&base_ref))); }
-                m.push_str(&format!("m{}: updatePullRequest(input:{{{}}}){{ clientMutationId }} ", i, fields.join(", ")));
+                if let Some(b) = spec.body {
+                    fields.push(format!("body:\"{}\"", graphql_escape(&b)));
+                }
+                if let Some(base_ref) = spec.base {
+                    fields.push(format!("baseRefName:\"{}\"", graphql_escape(&base_ref)));
+                }
+                m.push_str(&format!(
+                    "m{}: updatePullRequest(input:{{{}}}){{ clientMutationId }} ",
+                    i,
+                    fields.join(", ")
+                ));
             }
             m.push('}');
-            gh_rw(dry, ["api", "graphql", "-f", &format!("query={}", m)].as_slice())?;
+            gh_rw(
+                dry,
+                ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
+            )?;
         } else {
             info!("All PR descriptions/base refs up-to-date; no edits needed");
         }
