@@ -75,7 +75,7 @@ fn main() -> Result<()> {
                 }
             } else if let Some(i) = exact {
                 crate::cli::PrepSelection::Exact(i)
-            } else {
+                } else {
                 crate::cli::PrepSelection::All
             };
             crate::commands::prep_squash(&base, &prefix, selection, dry_run)?;
