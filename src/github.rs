@@ -358,3 +358,26 @@ pub fn fake_pr_number(head: &str) -> u64 {
     }
     1000 + (sum % 900_000)
 }
+
+/// Append a warning line to a specific PR body (idempotent). Returns Ok(()) whether updated or skipped.
+pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()> {
+    let bodies = fetch_pr_bodies_graphql(&vec![number])?;
+    if let Some(info) = bodies.get(&number) {
+        let body = info.body.clone();
+        if body.contains(warning) {
+            info!("Warning already present in PR #{}; skipping", number);
+            return Ok(());
+        }
+        let new_body = if body.trim().is_empty() { warning.to_string() } else { format!("{}\n\n{}", warning, body) };
+        let mut m = String::from("mutation {");
+        m.push_str(&format!(
+            "u: updatePullRequest(input:{{pullRequestId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ",
+            info.id,
+            graphql_escape(&new_body)
+        ));
+        m.push_str("}");
+        gh_rw(dry, ["api", "graphql", "-f", &format!("query={}", m)].as_slice())?;
+        info!("Appended warning to PR #{}", number);
+    }
+    Ok(())
+}

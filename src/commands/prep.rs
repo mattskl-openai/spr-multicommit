@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use tracing::info;
 
 use crate::git::{git_ro, git_rw};
+use crate::github::{append_warning_to_pr, list_spr_prs};
 use crate::limit::Limit;
 use crate::parsing::parse_groups;
 
@@ -31,79 +32,69 @@ pub fn prep_squash(
         return Ok(());
     }
 
-    let total_groups = groups.len();
-    let num_to_prep = match selection {
-        crate::cli::PrepSelection::All => total_groups,
-        crate::cli::PrepSelection::Until(n) => n.min(total_groups),
-        crate::cli::PrepSelection::Exact(i) => {
-            if i == 0 || i > total_groups {
-                bail!("--exact out of range (1..={})", total_groups);
-            }
-            1
-        }
-    };
-    let to_prep = match selection {
-        crate::cli::PrepSelection::Exact(i) => groups
+    // Decide which index to operate on, honoring selection
+    let k_opt: Option<usize> = match selection {
+        crate::cli::PrepSelection::All => groups
             .iter()
-            .skip(i - 1)
-            .take(1)
-            .cloned()
-            .collect::<Vec<_>>(),
-        _ => groups.iter().take(num_to_prep).cloned().collect::<Vec<_>>(),
-    };
-    info!("Locally squashing {} group(s)", to_prep.len());
-    for (i, g) in to_prep.iter().enumerate() {
-        info!("Group {}: tag = {}", i + 1, g.tag);
-        for (j, sha) in g.commits.iter().enumerate() {
-            info!("  Commit {}: {}", j + 1, sha);
+            .enumerate()
+            .find(|(_i, g)| g.commits.len() > 1)
+            .map(|(i, _)| i),
+        crate::cli::PrepSelection::Until(n) => {
+            let upper = n.min(groups.len());
+            groups
+                .iter()
+                .take(upper)
+                .enumerate()
+                .find(|(_i, g)| g.commits.len() > 1)
+                .map(|(i, _)| i)
         }
-    }
-
-    // Build a new chain: starting parent depends on selection
-    let mut parent_sha = match selection {
         crate::cli::PrepSelection::Exact(i) => {
-            if i == 1 {
-                merge_base.clone()
-            } else {
-                groups[i - 2].commits.last().unwrap().clone()
-            }
+            if i == 0 || i > groups.len() { bail!("--exact out of range (1..={})", groups.len()); }
+            let idx = i - 1;
+            if groups[idx].commits.len() > 1 { Some(idx) } else { None }
         }
-        _ => merge_base.clone(),
     };
-    // Batch tip trees
-    if !to_prep.is_empty() {
-        let mut args: Vec<String> = vec!["rev-parse".into()];
-        for g in &to_prep {
-            let tip = g
-                .commits
-                .last()
-                .ok_or_else(|| anyhow!("Empty group {}", g.tag))?;
-            args.push(format!("{}^{{tree}}", tip));
-        }
-        let ref_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let trees_out = git_ro(&ref_args)?;
-        let trees: Vec<&str> = trees_out.lines().collect();
-        for (idx, g) in to_prep.iter().enumerate() {
-            let tree = trees.get(idx).copied().unwrap_or("");
-            let msg = g.squash_commit_message()?;
-            let new_commit = git_rw(
-                dry,
-                ["commit-tree", tree, "-p", &parent_sha, "-m", &msg].as_slice(),
-            )?
-            .trim()
-            .to_string();
-            parent_sha = new_commit;
-        }
-    }
 
-    // Replay the remaining commits (not prepped) on top to preserve the rest of the stack
-    let skip_after = match selection {
-        crate::cli::PrepSelection::Exact(i) => i,
-        _ => num_to_prep,
+    // If no multi-commit group in range, nothing to do
+    let Some(k) = k_opt else {
+        info!("No multi-commit PR found in the selected range; nothing to squash");
+        return Ok(());
     };
+
+    // Start rebuilding history from just before the first multi-commit group
+    let mut parent_sha = if k == 0 {
+        merge_base.clone()
+    } else {
+        groups[k - 1]
+            .commits
+            .last()
+            .cloned()
+            .expect("group has at least one commit")
+    };
+
+    // Squash the first multi-commit group into a single commit
+    let tip = groups[k]
+        .commits
+        .last()
+        .ok_or_else(|| anyhow!("Empty group {}", groups[k].tag))?;
+    let tip_tree = git_ro(["rev-parse", &format!("{}^{{tree}}", tip)].as_slice())?
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let msg = groups[k].squash_commit_message()?;
+    let new_commit = git_rw(
+        dry,
+        ["commit-tree", &tip_tree, "-p", &parent_sha, "-m", &msg].as_slice(),
+    )?
+    .trim()
+    .to_string();
+    parent_sha = new_commit;
+
+    // Replay the remaining commits (above k) as-is on top to preserve their messages
     let remainder: Vec<String> = groups
         .iter()
-        .skip(skip_after)
+        .skip(k + 1)
         .flat_map(|g| g.commits.iter().cloned())
         .collect();
     if !remainder.is_empty() {
@@ -138,7 +129,7 @@ pub fn prep_squash(
         }
     }
 
-    // Move current branch to new head (includes squashed N groups + unchanged remainder)
+    // Move current branch to new head (includes squashed group + unchanged remainder reparented)
     let cur_branch = git_ro(["symbolic-ref", "--quiet", "--short", "HEAD"].as_slice())?
         .trim()
         .to_string();
@@ -152,11 +143,32 @@ pub fn prep_squash(
         .as_slice(),
     )?;
 
-    // Immediately run update for affected groups
-    let limit = match selection {
-        crate::cli::PrepSelection::All => None,
-        crate::cli::PrepSelection::Until(_) => Some(Limit::ByPr(num_to_prep)),
-        crate::cli::PrepSelection::Exact(_) => None,
+    // Decide limit for pushing and whether to warn the next PR
+    let (limit, next_idx_opt) = match selection {
+        crate::cli::PrepSelection::All => (None, None),
+        crate::cli::PrepSelection::Until(n) => {
+            if n == 0 { (None, None) } else { (Some(Limit::ByPr(n)), Some(n)) }
+        }
+        crate::cli::PrepSelection::Exact(i) => (Some(Limit::ByPr(i)), Some(i)),
     };
-    crate::commands::update::build_from_tags(base, "HEAD", prefix, false, dry, limit)
+
+    // Push updates for the selected scope
+    crate::commands::update::build_from_tags(base, "HEAD", prefix, false, dry, limit)?;
+
+    // Add a warning to the first PR not included in the push
+    if let Some(next_idx) = next_idx_opt {
+        if next_idx < groups.len() {
+            let next_branch = format!("{}{}", prefix, groups[next_idx].tag);
+            let prs = list_spr_prs(prefix)?;
+            if let Some(pr) = prs.iter().find(|p| p.head == next_branch) {
+                append_warning_to_pr(
+                    pr.number,
+                    "🚨🚨 parent PRs have changed, this PR may show extra diffs from parent PR 🚨🚨",
+                    dry,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
 }
