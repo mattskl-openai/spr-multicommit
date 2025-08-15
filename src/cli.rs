@@ -64,7 +64,6 @@ pub enum Cmd {
     /// Land PRs (merge variants)
     Land {
         // Target PR index is provided via global --until. For `flatten`, 0 means the top PR. For `per-pr`, 0 means all
-
         #[command(subcommand)]
         which: Option<LandCmd>,
     },

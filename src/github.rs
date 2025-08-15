@@ -148,6 +148,10 @@ pub fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
     Ok(out)
 }
 
+/// Creates a new pull request for the given branch and parent if one does not already exist,
+/// and returns the PR number. If a PR for the branch already exists (as tracked in `prs_by_head`),
+/// returns its number without making any changes. The function updates the `prs_by_head` map as needed.
+/// If `dry` is true, no actual changes are made on GitHub.
 pub fn upsert_pr_cached(
     branch: &str,
     parent: &str,
@@ -188,12 +192,15 @@ pub fn upsert_pr_cached(
         // Fallback: query the number if jq parse failed for some reason
         let json = gh_ro(
             [
-                "pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number",
+                "pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json",
+                "number",
             ]
             .as_slice(),
         )?;
         #[derive(Deserialize)]
-        struct V { number: u64 }
+        struct V {
+            number: u64,
+        }
         let arr: Vec<V> = serde_json::from_str(&json)?;
         num = arr.first().map(|v| v.number).unwrap_or(0);
     }

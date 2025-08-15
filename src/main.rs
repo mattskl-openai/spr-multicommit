@@ -99,7 +99,7 @@ fn main() -> Result<()> {
                 crate::commands::restack_existing(&base, &prefix, no_pr, cli.dry_run, limit)?;
             }
         }
-        crate::cli::Cmd::Prep { } => {
+        crate::cli::Cmd::Prep {} => {
             set_dry_run_env(cli.dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             if cli.until.is_some() && cli.exact.is_some() {
@@ -145,7 +145,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        crate::cli::Cmd::FixStack { } => {
+        crate::cli::Cmd::FixStack {} => {
             set_dry_run_env(cli.dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::fix_stack(&base, &prefix, cli.dry_run)?;
