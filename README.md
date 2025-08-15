@@ -49,8 +49,12 @@ Precedence for defaults:
 Global flags
 ------------
 
-- `--verbose` (global): enable verbose logging of underlying git/gh commands
-- Without `--verbose`, logs are compact and without timestamps; long GitHub operations show progress messages
+ - `--base, -b <BRANCH>`: root base branch (default from config)
+- `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
+- `--dry-run`: print state-changing commands instead of executing
+- `--until <N>`: target range used by `prep` and `land` (0 means all)
+- `--exact <I>`: used by `prep` to select exactly the I-th PR (1-based)
+- `--verbose`: enable verbose logging of underlying git/gh commands
 
 Commands
 --------
@@ -61,9 +65,9 @@ Build/refresh the stack from commit markers, or restack existing branches.
 
 Key options:
 
-- `--base, -b <BRANCH>`: root base branch (default from config)
-- `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
-- `--dry-run`: print state-changing commands instead of executing
+- `--from <REF>`: commit range upper bound when parsing tags (default `HEAD`) (untested)
+- `--no-pr`: only (re)create branches; skip PR creation/updates (untested)
+- `--restack`: restack existing `spr/*` branches instead of parsing tags (untested)
 - Extent (optional subcommand):
   - `pr --n <N>`: limit to first N PRs from the bottom
   - `commits --n <N>`: limit to first N commits (untested)
@@ -78,20 +82,13 @@ Behavior:
 
 Lists PRs in the current stack (bottom → top) for the configured prefix.
 
-- `--base, -b <BRANCH>`
-- `--prefix <PREFIX>`
-
 ### spr land
 
 Land PRs using either flatten or per-pr strategy.
 
-Shared options:
+Shared options (global):
 
-- `--base, -b <BRANCH>`
-- `--prefix <PREFIX>`
-- `--dry-run`
-- `--until <N>`: target range
-  - land first N PRs bottom-up (0 means all)
+- `--until <N>`: land first N PRs bottom-up (0 means all)
 
 Mode selection:
 
@@ -118,11 +115,7 @@ Mode selection:
 
 Prepare PRs for landing per-PR - squashes each PR's commits into a single commit.
 
-- `--base, -b <BRANCH>`
-- `--prefix <PREFIX>`
-- `--until <N>`: prep first N PRs (0 for all)
-- `--exact <I>`: prep exactly the I-th PR from the bottom (1-based)
-- `--dry-run`
+- Uses global `--until` / `--exact`
 
 Behavior:
 
@@ -133,10 +126,6 @@ Behavior:
 ### spr fix-stack
 
 Fix PR stack connectivity to match the local commit stack.
-
-- `--base, -b <BRANCH>`
-- `--prefix <PREFIX>`
-- `--dry-run`
 
 Dry run behavior
 ----------------

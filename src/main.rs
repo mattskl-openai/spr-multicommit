@@ -66,31 +66,28 @@ fn main() -> Result<()> {
     let cfg = crate::config::load_config()?;
     match cli.cmd {
         crate::cli::Cmd::Update {
-            base,
-            prefix,
             from,
             no_pr,
             restack,
-            dry_run,
             assume_existing_prs,
             update_pr_body,
             extent,
         } => {
-            set_dry_run_env(dry_run, assume_existing_prs);
-            let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
+            set_dry_run_env(cli.dry_run, assume_existing_prs);
+            let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             let limit = extent.map(|e| match e {
                 crate::cli::Extent::Pr { n } => crate::limit::Limit::ByPr(n),
                 crate::cli::Extent::Commits { n } => crate::limit::Limit::ByCommits(n),
             });
             if restack {
-                crate::commands::restack_existing(&base, &prefix, no_pr, dry_run, limit)?;
+                crate::commands::restack_existing(&base, &prefix, no_pr, cli.dry_run, limit)?;
             } else if crate::parsing::has_tagged_commits(&base, &from)? {
                 crate::commands::build_from_tags(
                     &base,
                     &from,
                     &prefix,
                     no_pr,
-                    dry_run,
+                    cli.dry_run,
                     update_pr_body,
                     limit,
                 )?;
@@ -99,46 +96,37 @@ fn main() -> Result<()> {
                     "No pr:<tag> markers found between {} and {}. Falling back to --restack.",
                     base, from
                 );
-                crate::commands::restack_existing(&base, &prefix, no_pr, dry_run, limit)?;
+                crate::commands::restack_existing(&base, &prefix, no_pr, cli.dry_run, limit)?;
             }
         }
-        crate::cli::Cmd::Prep {
-            base,
-            prefix,
-            until,
-            exact,
-            dry_run,
-        } => {
-            set_dry_run_env(dry_run, false);
-            let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
-            let selection = if let Some(n) = until {
+        crate::cli::Cmd::Prep { } => {
+            set_dry_run_env(cli.dry_run, false);
+            let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
+            if cli.until.is_some() && cli.exact.is_some() {
+                return Err(anyhow::anyhow!("--until conflicts with --exact"));
+            }
+            let selection = if let Some(n) = cli.until {
                 if n == 0 {
                     crate::cli::PrepSelection::All
                 } else {
                     crate::cli::PrepSelection::Until(n)
                 }
-            } else if let Some(i) = exact {
+            } else if let Some(i) = cli.exact {
                 crate::cli::PrepSelection::Exact(i)
             } else {
                 crate::cli::PrepSelection::All
             };
-            crate::commands::prep_squash(&base, &prefix, selection, dry_run)?;
+            crate::commands::prep_squash(&base, &prefix, selection, cli.dry_run)?;
         }
-        crate::cli::Cmd::List { what, base, prefix } => {
-            let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
+        crate::cli::Cmd::List { what } => {
+            let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             match what {
                 crate::cli::ListWhat::Pr => crate::commands::list_prs_display(&base, &prefix)?,
             }
         }
-        crate::cli::Cmd::Land {
-            base,
-            prefix,
-            dry_run,
-            until,
-            which,
-        } => {
-            set_dry_run_env(dry_run, false);
-            let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
+        crate::cli::Cmd::Land { which } => {
+            set_dry_run_env(cli.dry_run, false);
+            let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             let mode = which
                 .or(match cfg.land.as_deref() {
                     Some("per-pr") | Some("perpr") | Some("per_pr") => {
@@ -147,23 +135,20 @@ fn main() -> Result<()> {
                     _ => Some(crate::cli::LandCmd::Flatten),
                 })
                 .unwrap_or(crate::cli::LandCmd::Flatten);
+            let until = cli.until.unwrap_or(0);
             match mode {
                 crate::cli::LandCmd::Flatten => {
-                    crate::commands::land_flatten_until(&base, &prefix, until, dry_run)?
+                    crate::commands::land_flatten_until(&base, &prefix, until, cli.dry_run)?
                 }
                 crate::cli::LandCmd::PerPr => {
-                    crate::commands::land_per_pr_until(&base, &prefix, until, dry_run)?
+                    crate::commands::land_per_pr_until(&base, &prefix, until, cli.dry_run)?
                 }
             }
         }
-        crate::cli::Cmd::FixStack {
-            base,
-            prefix,
-            dry_run,
-        } => {
-            set_dry_run_env(dry_run, false);
-            let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
-            crate::commands::fix_stack(&base, &prefix, dry_run)?;
+        crate::cli::Cmd::FixStack { } => {
+            set_dry_run_env(cli.dry_run, false);
+            let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
+            crate::commands::fix_stack(&base, &prefix, cli.dry_run)?;
         }
     }
     Ok(())
