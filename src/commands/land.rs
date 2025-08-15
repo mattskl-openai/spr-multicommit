@@ -5,8 +5,9 @@ use crate::git::{
     gh_rw, git_ro, git_rw, normalize_branch_name, sanitize_gh_base_ref, to_remote_ref,
 };
 use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs};
+use crate::cli::LandCmd;
 
-pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, per_pr: bool) -> Result<()> {
+pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) -> Result<()> {
     let base_n = normalize_branch_name(base);
     let prs = list_spr_prs(prefix)?;
     if prs.is_empty() {
@@ -39,7 +40,7 @@ pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, per_pr: bool) -
     };
     let segment = &ordered[..take_n];
 
-    if per_pr {
+    if let LandCmd::PerPr = mode {
         // Verify each has exactly one unique commit over its parent
         git_rw(dry, ["fetch", "origin"].as_slice())?; // ensure remotes up to date
         let mut offenders: Vec<u64> = vec![];
@@ -99,7 +100,7 @@ pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, per_pr: bool) -
         nth_id,
         graphql_escape(&sanitize_gh_base_ref(base))
     ));
-    if per_pr {
+    if let LandCmd::PerPr = mode {
         // Merge nth with REBASE
         m.push_str(&format!(
             "m0: mergePullRequest(input:{{pullRequestId:\"{}\", mergeMethod:REBASE}}){{ clientMutationId }} ",
@@ -151,10 +152,10 @@ pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, per_pr: bool) -
 /// Per-PR: land N PRs bottom-up, each PR as its own commit using rebase merge.
 /// Each PR must have exactly one commit over its parent.
 pub fn land_per_pr_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
-    land_until(base, prefix, n, dry, true)
+    land_until(base, prefix, n, dry, LandCmd::PerPr)
 }
 
 /// Flatten: behave like per-pr landing but squash-merge the Nth PR and set its base to the actual base.
 pub fn land_flatten_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
-    land_until(base, prefix, n, dry, false)
+    land_until(base, prefix, n, dry, LandCmd::Flatten)
 }
