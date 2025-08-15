@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub struct FileConfig {
     pub base: Option<String>,
     pub prefix: Option<String>,
+    pub land: Option<String>,
 }
 
 fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
@@ -31,6 +32,9 @@ pub fn load_config() -> Result<FileConfig> {
             if let Some(pfx) = home_cfg.prefix {
                 merged.prefix = Some(pfx);
             }
+            if let Some(mode) = home_cfg.land {
+                merged.land = Some(mode);
+            }
         }
     }
 
@@ -44,6 +48,9 @@ pub fn load_config() -> Result<FileConfig> {
             }
             if repo_cfg.prefix.is_some() {
                 merged.prefix = repo_cfg.prefix;
+            }
+            if repo_cfg.land.is_some() {
+                merged.land = repo_cfg.land;
             }
         }
     }

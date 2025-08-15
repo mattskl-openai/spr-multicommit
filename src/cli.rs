@@ -99,7 +99,7 @@ pub enum Cmd {
         prefix: Option<String>,
     },
 
-    /// Land PRs from the bottom of the stack
+    /// Land PRs (merge variants)
     Land {
         /// Base branch to locate the root of the stack
         #[arg(short = 'b', long)]
@@ -109,17 +109,20 @@ pub enum Cmd {
         #[arg(long)]
         prefix: Option<String>,
 
-        /// Land the first N PRs (bottom-up). Use 0 for all
-        #[arg(long, value_name = "N")]
-        until: usize,
-
         /// Print state-changing commands instead of executing
         #[arg(long)]
         dry_run: bool,
+
+        /// Target PR index. For `flatten`, 0 means the top PR. For `per-pr`, 0 means all
+        #[arg(long, value_name = "N")]
+        until: usize,
+
+        #[command(subcommand)]
+        which: Option<LandCmd>,
     },
 
-    /// Fix PR base connectivity to match local commit stack
-    FixChain {
+    /// Fix PR stack connectivity to match local commit stack
+    FixStack {
         /// Base branch to locate the root of the stack
         #[arg(short = 'b', long)]
         base: Option<String>,
@@ -132,6 +135,14 @@ pub enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub enum LandCmd {
+    /// Flatten PRs from the bottom up to N (0 means all): set base to actual base then squash-merge each
+    Flatten,
+    /// Prior behavior: rebase-merge Nth and close previous with comments
+    PerPr,
 }
 
 #[derive(Parser, Debug)]

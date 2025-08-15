@@ -133,21 +133,37 @@ fn main() -> Result<()> {
         crate::cli::Cmd::Land {
             base,
             prefix,
-            until,
             dry_run,
+            until,
+            which,
         } => {
             set_dry_run_env(dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
-            crate::commands::land_prs_until(&base, &prefix, until, dry_run)?;
+            let mode = which
+                .or(match cfg.land.as_deref() {
+                    Some("per-pr") | Some("perpr") | Some("per_pr") => {
+                        Some(crate::cli::LandCmd::PerPr)
+                    }
+                    _ => Some(crate::cli::LandCmd::Flatten),
+                })
+                .unwrap_or(crate::cli::LandCmd::Flatten);
+            match mode {
+                crate::cli::LandCmd::Flatten => {
+                    crate::commands::land_flatten_until(&base, &prefix, until, dry_run)?
+                }
+                crate::cli::LandCmd::PerPr => {
+                    crate::commands::land_per_pr_until(&base, &prefix, until, dry_run)?
+                }
+            }
         }
-        crate::cli::Cmd::FixChain {
+        crate::cli::Cmd::FixStack {
             base,
             prefix,
             dry_run,
         } => {
             set_dry_run_env(dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
-            crate::commands::fix_chain(&base, &prefix, dry_run)?;
+            crate::commands::fix_stack(&base, &prefix, dry_run)?;
         }
     }
     Ok(())
