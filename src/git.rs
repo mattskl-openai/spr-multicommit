@@ -1,11 +1,13 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tracing::{error, info};
 
 pub fn ensure_tool(name: &str) -> Result<()> {
     let status = Command::new(name)
         .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .with_context(|| format!("{} not found in PATH", name))?;
     if !status.success() {

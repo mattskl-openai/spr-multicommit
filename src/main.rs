@@ -30,7 +30,9 @@ fn resolve_base_prefix(
     base: Option<String>,
     prefix: Option<String>,
 ) -> (String, String) {
-    let base = base.or(cfg.base.clone()).unwrap_or_else(|| "origin/oai-main".to_string());
+    let base = base
+        .or(cfg.base.clone())
+        .unwrap_or_else(|| "origin/oai-main".to_string());
     let user = std::env::var("USER").unwrap_or_else(|_| "".to_string());
     let mut prefix = prefix
         .or(cfg.prefix.clone())
@@ -42,13 +44,21 @@ fn resolve_base_prefix(
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .with_target(false)
-        .compact()
-        .init();
-
     let cli = crate::cli::Cli::parse();
+    if cli.verbose {
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_target(false)
+            .compact()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_target(false)
+            .without_time()
+            .compact()
+            .init();
+    }
     if cli.verbose {
         std::env::set_var("SPR_VERBOSE", "1");
     }

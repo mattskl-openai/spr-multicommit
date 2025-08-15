@@ -25,8 +25,12 @@ pub fn load_config() -> Result<FileConfig> {
         let mut p = PathBuf::from(home);
         p.push(".spr_multicommit_cfg.yml");
         if let Some(home_cfg) = read_config_file(&p)? {
-            if let Some(b) = home_cfg.base { merged.base = Some(b); }
-            if let Some(pfx) = home_cfg.prefix { merged.prefix = Some(pfx); }
+            if let Some(b) = home_cfg.base {
+                merged.base = Some(b);
+            }
+            if let Some(pfx) = home_cfg.prefix {
+                merged.prefix = Some(pfx);
+            }
         }
     }
 
@@ -46,5 +50,3 @@ pub fn load_config() -> Result<FileConfig> {
 
     Ok(merged)
 }
-
-
