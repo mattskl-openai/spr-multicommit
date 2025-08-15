@@ -667,13 +667,16 @@ fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-fn fetch_pr_bodies_graphql(numbers: &Vec<u64>) -> Result<HashMap<u64, String>> {
+#[derive(Clone)]
+struct PrBodyInfo { id: String, body: String }
+
+fn fetch_pr_bodies_graphql(numbers: &Vec<u64>) -> Result<HashMap<u64, PrBodyInfo>> {
     let mut out = HashMap::new();
     if numbers.is_empty() { return Ok(out); }
     let (owner, name) = get_repo_owner_name()?;
     let mut q = String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
     for (i, n) in numbers.iter().enumerate() {
-        q.push_str(&format!("pr{}: pullRequest(number: {}) {{ body }} ", i, n));
+        q.push_str(&format!("pr{}: pullRequest(number: {}) {{ id body }} ", i, n));
     }
     q.push_str("} }");
     let json = gh_ro(&["api", "graphql", "-f", &format!("query={}", q), "-F", &format!("owner={}", owner), "-F", &format!("name={}", name)])?;
@@ -681,8 +684,9 @@ fn fetch_pr_bodies_graphql(numbers: &Vec<u64>) -> Result<HashMap<u64, String>> {
     let repo = &v["data"]["repository"];
     for (i, n) in numbers.iter().enumerate() {
         let key = format!("pr{}", i);
+        let id = repo[&key]["id"].as_str().unwrap_or("").to_string();
         let body = repo[&key]["body"].as_str().unwrap_or("").to_string();
-        out.insert(*n, body);
+        out.insert(*n, PrBodyInfo { id, body });
     }
     Ok(out)
 }
@@ -710,6 +714,21 @@ fn get_repo_owner_name() -> Result<(String, String)> {
         }
     }
     bail!("Unable to parse remote.origin.url: {}", url)
+}
+
+fn graphql_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
@@ -1247,11 +1266,12 @@ fn upsert_pr_cached(
         return Ok(num);
     }
     gh_rw(dry, &["pr", "create", "--head", branch, "--base", parent, "--title", title, "--body", body])?;
-    let json = gh_ro(&["pr", "view", "-H", branch, "--json", "number"])?;
+    let json = gh_ro(&["pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "number"])?;
     #[derive(Deserialize)] struct V { number: u64 }
-    let v: V = serde_json::from_str(&json)?;
-    prs_by_head.insert(branch.to_string(), v.number);
-    Ok(v.number)
+    let arr: Vec<V> = serde_json::from_str(&json)?;
+    let num = arr.get(0).map(|v| v.number).ok_or_else(|| anyhow!("Failed to determine PR number for {}", branch))?;
+    prs_by_head.insert(branch.to_string(), num);
+    Ok(num)
 }
 
 /// Update the stack visual in each PR body (only for the set we touched).
@@ -1263,9 +1283,10 @@ fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
     let numbers: Vec<u64> = stack.iter().map(|p| p.number).collect();
     let numbers_rev: Vec<u64> = numbers.iter().cloned().rev().collect();
     let bodies_by_number = fetch_pr_bodies_graphql(&numbers)?;
+    let mut to_update: Vec<(u64, String, String)> = vec![]; // (number, id, new_body)
 
     for (idx, pr) in stack.iter().enumerate() {
-        let mut body = bodies_by_number.get(&pr.number).cloned().unwrap_or_default();
+        let mut body = bodies_by_number.get(&pr.number).map(|x| x.body.clone()).unwrap_or_default();
 
         let start = "<!-- spr-stack:start -->";
         let end = "<!-- spr-stack:end -->";
@@ -1288,23 +1309,23 @@ fn update_stack_bodies(stack: &Vec<PrRef>, dry: bool) -> Result<()> {
             lines.trim_end(),
             end,
         );
-        let new_body = if body.is_empty() {
-            block.clone()
-        } else {
-            format!("{}\n\n{}", body, block)
-        };
+        let new_body = if body.is_empty() { block.clone() } else { format!("{}\n\n{}", body, block) };
 
-        gh_rw(
-            dry,
-            &[
-                "pr",
-                "edit",
-                &format!("#{}", pr.number),
-                "--body",
-                &new_body,
-            ],
-        )?;
-        info!("Updated stack visual in PR #{}", pr.number);
+        if new_body.trim() == body.trim() {
+            info!("PR #{} body unchanged; skipping edit", pr.number);
+        } else {
+            let id = bodies_by_number.get(&pr.number).map(|x| x.id.clone()).unwrap_or_default();
+            if !id.is_empty() { to_update.push((pr.number, id, new_body)); }
+        }
+    }
+    if !to_update.is_empty() {
+        let mut m = String::from("mutation {");
+        for (i, (_num, id, body)) in to_update.iter().enumerate() {
+            m.push_str(&format!("m{}: updatePullRequest(input:{{pullRequestId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ", i, id, graphql_escape(body)));
+        }
+        m.push_str("}");
+        gh_rw(dry, &["api", "graphql", "-f", &format!("query={}", m)])?;
+        for (num, _, _) in to_update { info!("Updated stack visual in PR #{}", num); }
     }
     Ok(())
 }
