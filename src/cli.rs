@@ -25,14 +25,6 @@ pub enum ListWhat {
 pub enum Cmd {
     /// Build/refresh stacked PRs
     Update {
-        /// Base branch to stack onto (root PR bases on this)
-        #[arg(short = 'b', long)]
-        base: Option<String>,
-
-        /// Branch prefix for per-PR branches
-        #[arg(long)]
-        prefix: Option<String>,
-
         /// Source ref to read commits from (if building from tags)
         #[arg(long, default_value = "HEAD")]
         from: String,
@@ -44,10 +36,6 @@ pub enum Cmd {
         /// If set, always restack existing spr/* PR branches (skip tag parsing)
         #[arg(long)]
         restack: bool,
-
-        /// Print all state-changing git/gh commands instead of executing them
-        #[arg(long)]
-        dry_run: bool,
 
         /// In --dry-run, assume PRs already exist for branches (so we print 'edit' instead of 'create')
         #[arg(long)]
@@ -64,58 +52,18 @@ pub enum Cmd {
 
     /// Prepare PRs for landing (e.g., squash)
     Prep {
-        /// Base branch to locate the root of the stack
-        #[arg(short = 'b', long)]
-        base: Option<String>,
-
-        /// Branch prefix for per-PR branches
-        #[arg(long)]
-        prefix: Option<String>,
-
-        /// Prep N PRs from bottom of stack (use 0 for all)
-        #[arg(long, conflicts_with = "exact")]
-        until: Option<usize>,
-
-        /// Prep exactly this PR index (1-based from bottom)
-        #[arg(long, conflicts_with = "until")]
-        exact: Option<usize>,
-
-        /// Print state-changing commands instead of executing
-        #[arg(long)]
-        dry_run: bool,
+        // selection is provided via global --until/--exact flags
     },
 
     /// List entities
     List {
         #[command(subcommand)]
         what: ListWhat,
-
-        /// Base branch to locate the root of the stack
-        #[arg(short = 'b', long)]
-        base: Option<String>,
-
-        /// Branch prefix for per-PR branches
-        #[arg(long)]
-        prefix: Option<String>,
     },
 
     /// Land PRs (merge variants)
     Land {
-        /// Base branch to locate the root of the stack
-        #[arg(short = 'b', long)]
-        base: Option<String>,
-
-        /// Branch prefix for per-PR branches
-        #[arg(long)]
-        prefix: Option<String>,
-
-        /// Print state-changing commands instead of executing
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Target PR index. For `flatten`, 0 means the top PR. For `per-pr`, 0 means all
-        #[arg(long, value_name = "N")]
-        until: usize,
+        // Target PR index is provided via global --until. For `flatten`, 0 means the top PR. For `per-pr`, 0 means all
 
         #[command(subcommand)]
         which: Option<LandCmd>,
@@ -123,17 +71,7 @@ pub enum Cmd {
 
     /// Fix PR stack connectivity to match local commit stack
     FixStack {
-        /// Base branch to locate the root of the stack
-        #[arg(short = 'b', long)]
-        base: Option<String>,
-
-        /// Branch prefix for per-PR branches
-        #[arg(long)]
-        prefix: Option<String>,
-
-        /// Print state-changing commands instead of executing
-        #[arg(long)]
-        dry_run: bool,
+        // dry-run is provided via global --dry-run
     },
 }
 
@@ -155,6 +93,21 @@ pub struct Cli {
     /// Verbose output for underlying git/gh commands
     #[arg(long, global = true)]
     pub verbose: bool,
+    /// Global base branch (root of stack)
+    #[arg(short = 'b', long, global = true)]
+    pub base: Option<String>,
+    /// Global branch prefix for per-PR branches
+    #[arg(long, global = true)]
+    pub prefix: Option<String>,
+    /// Global dry-run flag (applies to all subcommands)
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+    /// Global until (used by prep/land). 0 means all
+    #[arg(long, global = true)]
+    pub until: Option<usize>,
+    /// Global exact (used by prep)
+    #[arg(long, global = true)]
+    pub exact: Option<usize>,
     #[command(subcommand)]
     pub cmd: Cmd,
 }
