@@ -100,10 +100,10 @@ fn main() -> Result<()> {
                 ));
             }
         }
-        crate::cli::Cmd::Restack { after } => {
+        crate::cli::Cmd::Restack { after, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
-            crate::commands::restack_after(&base, &prefix, after, cli.dry_run)?;
+            let (base, _) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
+            crate::commands::restack_after(&base, after, safe, cli.dry_run)?;
         }
         crate::cli::Cmd::Prep {} => {
             set_dry_run_env(cli.dry_run, false);

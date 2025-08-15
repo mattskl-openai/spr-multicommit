@@ -13,7 +13,7 @@ use crate::parsing::parse_groups;
 /// - Run: `git rebase --onto <base> <upstream> <current-branch>`.
 ///
 /// This moves the entire range starting at the first commit of group N+1 onto `base`, leaving the first N PRs untouched.
-pub fn restack_after(base: &str, _prefix: &str, after: usize, dry: bool) -> Result<()> {
+pub fn restack_after(base: &str, after: usize, safe: bool, dry: bool) -> Result<()> {
     // Ensure we operate against the latest remote state
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
@@ -59,6 +59,15 @@ pub fn restack_after(base: &str, _prefix: &str, after: usize, dry: bool) -> Resu
     let cur_branch = git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
         .trim()
         .to_string();
+    if safe {
+        // Create a local backup branch pointing to current HEAD before rebasing
+        let short = git_ro(["rev-parse", "--short", "HEAD"].as_slice())?
+            .trim()
+            .to_string();
+        let backup = format!("backup/restack/{}-{}", cur_branch, short);
+        info!("Creating backup branch at HEAD: {}", backup);
+        let _ = git_rw(dry, ["branch", &backup, "HEAD"].as_slice())?;
+    }
     info!(
         "Rebasing commits after first {} PR(s) of {} onto {} (upstream = {})",
         after, cur_branch, base, upstream

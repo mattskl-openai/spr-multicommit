@@ -55,6 +55,10 @@ pub enum Cmd {
         /// Ignore the bottom N PRs; rebase the remaining commits onto base
         #[arg(long, value_name = "N")]
         after: usize,
+
+        /// Create a local backup branch at current HEAD before rebasing
+        #[arg(long)]
+        safe: bool,
     },
 
     /// Prepare PRs for landing (e.g., squash)
