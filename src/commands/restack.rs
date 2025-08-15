@@ -46,7 +46,10 @@ pub fn restack_after(base: &str, _prefix: &str, after: usize, dry: bool) -> Resu
     }
     let k = first_commits.len();
     if k == 0 {
-        info!("First {} PR(s) contain zero commits; rebasing entire stack onto {}", after, base);
+        info!(
+            "First {} PR(s) contain zero commits; rebasing entire stack onto {}",
+            after, base
+        );
     } else {
         info!("K = {} commits in the first {} PR(s)", k, after);
     }
@@ -67,14 +70,7 @@ pub fn restack_after(base: &str, _prefix: &str, after: usize, dry: bool) -> Resu
     );
     git_rw(
         dry,
-        [
-            "rebase",
-            "--onto",
-            base,
-            &upstream,
-            &cur_branch,
-        ]
-        .as_slice(),
+        ["rebase", "--onto", base, &upstream, &cur_branch].as_slice(),
     )?;
 
     Ok(())

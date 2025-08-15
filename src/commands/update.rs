@@ -5,9 +5,7 @@ use tracing::info;
 use crate::git::{
     get_remote_branches_sha, gh_rw, git_is_ancestor, git_ro, git_rw, sanitize_gh_base_ref,
 };
-use crate::github::{
-    fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached,
-};
+use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached};
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{parse_groups, Group};
 

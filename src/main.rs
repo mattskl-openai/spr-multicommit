@@ -95,7 +95,8 @@ fn main() -> Result<()> {
             } else {
                 return Err(anyhow::anyhow!(
                     "No pr:<tag> markers found between {} and {}. Use `spr restack --after N`.",
-                    base, from
+                    base,
+                    from
                 ));
             }
         }
