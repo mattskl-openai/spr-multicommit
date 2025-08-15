@@ -163,7 +163,7 @@ fn main() -> Result<()> {
         } => {
             set_dry_run_env(dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, base, prefix);
-            crate::commands::fix_chain(&base, &prefix, dry_run)?;
+            crate::commands::fix_stack(&base, &prefix, dry_run)?;
         }
     }
     Ok(())
