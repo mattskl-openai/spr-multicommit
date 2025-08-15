@@ -156,7 +156,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        crate::cli::Cmd::FixChain {
+        crate::cli::Cmd::FixStack {
             base,
             prefix,
             dry_run,

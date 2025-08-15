@@ -121,8 +121,8 @@ pub enum Cmd {
         which: Option<LandCmd>,
     },
 
-    /// Fix PR base connectivity to match local commit stack
-    FixChain {
+    /// Fix PR stack connectivity to match local commit stack
+    FixStack {
         /// Base branch to locate the root of the stack
         #[arg(short = 'b', long)]
         base: Option<String>,
