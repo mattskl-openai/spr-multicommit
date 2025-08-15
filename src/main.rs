@@ -47,7 +47,15 @@ fn main() -> Result<()> {
             if restack {
                 crate::commands::restack_existing(&base, &prefix, no_pr, dry_run, limit)?;
             } else if crate::parsing::has_tagged_commits(&base, &from)? {
-                crate::commands::build_from_tags(&base, &from, &prefix, no_pr, dry_run, update_pr_body, limit)?;
+                crate::commands::build_from_tags(
+                    &base,
+                    &from,
+                    &prefix,
+                    no_pr,
+                    dry_run,
+                    update_pr_body,
+                    limit,
+                )?;
             } else {
                 info!(
                     "No pr:<tag> markers found between {} and {}. Falling back to --restack.",
@@ -76,7 +84,7 @@ fn main() -> Result<()> {
                 }
             } else if let Some(i) = exact {
                 crate::cli::PrepSelection::Exact(i)
-                } else {
+            } else {
                 crate::cli::PrepSelection::All
             };
             crate::commands::prep_squash(&base, &prefix, selection, dry_run)?;

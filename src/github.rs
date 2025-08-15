@@ -148,7 +148,6 @@ pub fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
     Ok(out)
 }
 
-
 pub fn upsert_pr_cached(
     branch: &str,
     parent: &str,
@@ -259,7 +258,6 @@ pub fn update_stack_bodies(stack: &[PrRef], dry: bool) -> Result<()> {
     Ok(())
 }
 
-
 /// Append a warning line to a specific PR body (idempotent). Returns Ok(()) whether updated or skipped.
 pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()> {
     let bodies = fetch_pr_bodies_graphql(&[number])?;
@@ -269,7 +267,11 @@ pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()>
             info!("Warning already present in PR #{}; skipping", number);
             return Ok(());
         }
-        let new_body = if body.trim().is_empty() { warning.to_string() } else { format!("{}\n\n{}", warning, body) };
+        let new_body = if body.trim().is_empty() {
+            warning.to_string()
+        } else {
+            format!("{}\n\n{}", warning, body)
+        };
         let mut m = String::from("mutation {");
         m.push_str(&format!(
             "u: updatePullRequest(input:{{pullRequestId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ",
@@ -277,7 +279,10 @@ pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()>
             graphql_escape(&new_body)
         ));
         m.push('}');
-        gh_rw(dry, ["api", "graphql", "-f", &format!("query={}", m)].as_slice())?;
+        gh_rw(
+            dry,
+            ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
+        )?;
         info!("Appended warning to PR #{}", number);
     }
     Ok(())

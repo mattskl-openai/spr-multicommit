@@ -37,7 +37,9 @@ pub fn prep_squash(
         crate::cli::PrepSelection::All => (0usize, groups.len()),
         crate::cli::PrepSelection::Until(n) => (0usize, n.min(groups.len())),
         crate::cli::PrepSelection::Exact(i) => {
-            if i == 0 || i > groups.len() { bail!("--exact out of range (1..={})", groups.len()); }
+            if i == 0 || i > groups.len() {
+                bail!("--exact out of range (1..={})", groups.len());
+            }
             (i - 1, (i - 1) + 1)
         }
     };
@@ -57,7 +59,10 @@ pub fn prep_squash(
     if start_idx < end_idx_exclusive {
         let mut args: Vec<String> = vec!["rev-parse".into()];
         for g in &groups[start_idx..end_idx_exclusive] {
-            let tip = g.commits.last().ok_or_else(|| anyhow!("Empty group {}", g.tag))?;
+            let tip = g
+                .commits
+                .last()
+                .ok_or_else(|| anyhow!("Empty group {}", g.tag))?;
             args.push(format!("{}^{{tree}}", tip));
         }
         let ref_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -75,8 +80,19 @@ pub fn prep_squash(
         if !tip_shas.is_empty() {
             msg_args.extend(tip_shas.clone());
         }
-        let single_msgs_raw = if tip_shas.is_empty() { String::new() } else { git_ro(&msg_args)? };
-        let single_msgs: Vec<&str> = if tip_shas.is_empty() { vec![] } else { single_msgs_raw.split('\u{001e}').map(|s| s.trim_end_matches('\n')).collect() };
+        let single_msgs_raw = if tip_shas.is_empty() {
+            String::new()
+        } else {
+            git_ro(&msg_args)?
+        };
+        let single_msgs: Vec<&str> = if tip_shas.is_empty() {
+            vec![]
+        } else {
+            single_msgs_raw
+                .split('\u{001e}')
+                .map(|s| s.trim_end_matches('\n'))
+                .collect()
+        };
         let mut single_idx = 0usize;
 
         for (offset, g) in groups[start_idx..end_idx_exclusive].iter().enumerate() {
@@ -90,16 +106,25 @@ pub fn prep_squash(
                 m.to_string()
             };
             // Skip creating a commit if tree equals parent's tree (no changes)
-            let parent_tree = git_ro(["rev-parse", &format!("{}^{{tree}}", parent_sha)].as_slice())?
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string();
+            let parent_tree =
+                git_ro(["rev-parse", &format!("{}^{{tree}}", parent_sha)].as_slice())?
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
             if tree != parent_tree {
-                let new_commit = git_rw(dry, ["commit-tree", tree, "-p", &parent_sha, "-m", &msg].as_slice())?.trim().to_string();
+                let new_commit = git_rw(
+                    dry,
+                    ["commit-tree", tree, "-p", &parent_sha, "-m", &msg].as_slice(),
+                )?
+                .trim()
+                .to_string();
                 parent_sha = new_commit;
             } else {
-                info!("Skipping empty commit for group {} (no tree changes)", g.tag);
+                info!(
+                    "Skipping empty commit for group {} (no tree changes)",
+                    g.tag
+                );
             }
         }
     }
@@ -132,13 +157,18 @@ pub fn prep_squash(
             let tree = trees.get(i).copied().unwrap_or("");
             let msg = bodies.get(i).copied().unwrap_or("");
             // Skip creating a commit if this commit's tree equals parent's tree
-            let parent_tree = git_ro(["rev-parse", &format!("{}^{{tree}}", parent_sha)].as_slice())?
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string();
+            let parent_tree =
+                git_ro(["rev-parse", &format!("{}^{{tree}}", parent_sha)].as_slice())?
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
             if tree == parent_tree {
-                info!("Skipping empty replay commit {} of {} (no changes)", i + 1, remainder.len());
+                info!(
+                    "Skipping empty replay commit {} of {} (no changes)",
+                    i + 1,
+                    remainder.len()
+                );
                 continue;
             }
             let new_commit = git_rw(
@@ -169,7 +199,11 @@ pub fn prep_squash(
     let (limit, next_idx_opt) = match selection {
         crate::cli::PrepSelection::All => (None, None),
         crate::cli::PrepSelection::Until(n) => {
-            if n == 0 { (None, None) } else { (Some(Limit::ByPr(n)), Some(n)) }
+            if n == 0 {
+                (None, None)
+            } else {
+                (Some(Limit::ByPr(n)), Some(n))
+            }
         }
         crate::cli::PrepSelection::Exact(i) => (Some(Limit::ByPr(i)), Some(i)),
     };
