@@ -112,7 +112,7 @@ pub fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<
             id
         ));
     }
-    m.push_str("}");
+    m.push('}');
     gh_rw(dry, ["api", "graphql", "-f", &format!("query={}", m)].as_slice())?;
 
     Ok(())
