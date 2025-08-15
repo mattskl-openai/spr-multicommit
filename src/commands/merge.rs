@@ -7,9 +7,6 @@ use crate::git::{
 use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs};
 
 pub fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
-    if n == 0 {
-        bail!("--until must be >= 1");
-    }
     let base_n = normalize_branch_name(base);
     let prs = list_spr_prs(prefix)?;
     if prs.is_empty() {
@@ -35,7 +32,11 @@ pub fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<
         bail!("No PR chain found");
     }
 
-    let take_n = n.min(ordered.len());
+    let take_n = if n == 0 {
+        ordered.len()
+    } else {
+        n.min(ordered.len())
+    };
     let segment = &ordered[..take_n];
 
     // Verify each has exactly one unique commit over its parent
