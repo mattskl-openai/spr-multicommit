@@ -32,10 +32,22 @@ pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
         let head_branch = format!("{}{}", prefix, g.tag);
         let num = prs.iter().find(|p| p.head == head_branch).map(|p| p.number);
         let count = g.commits.len();
-        match num {
-            Some(n) => info!("{}: {} (#{}) - {} commit(s)", i + 1, head_branch, n, count),
-            None => info!("{}: {} - {} commit(s)", i + 1, head_branch, count),
-        }
+        let plural = if count == 1 { "commit" } else { "commits" };
+        let tip_sha = g.commits.last().map(|s| s.as_str()).unwrap_or("");
+        let short = if tip_sha.len() >= 8 { &tip_sha[..8] } else { tip_sha };
+        let remote_pr_num_str = match num {
+          Some(n) => format!(" (#{})", n),
+          None => "".to_string(),
+        };
+        info!(
+            "Local PR #{} - {} : {}{} - {} {}",
+            i + 1,
+            short,
+            head_branch,
+            remote_pr_num_str,
+            count,
+            plural
+        );
     }
     Ok(())
 }
