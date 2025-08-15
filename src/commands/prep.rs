@@ -171,8 +171,8 @@ pub fn prep_squash(
         crate::cli::PrepSelection::Exact(i) => (Some(Limit::ByPr(i)), Some(i)),
     };
 
-    // Push updates for the selected scope
-    crate::commands::update::build_from_tags(base, "HEAD", prefix, false, dry, limit)?;
+    // Push updates for the selected scope (do not force PR body rewrite by default)
+    crate::commands::update::build_from_tags(base, "HEAD", prefix, false, dry, false, limit)?;
 
     // Add a warning to the first PR not included in the push
     if let Some(next_idx) = next_idx_opt {
