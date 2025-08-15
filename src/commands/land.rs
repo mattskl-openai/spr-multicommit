@@ -6,7 +6,7 @@ use crate::git::{
 };
 use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs};
 
-pub fn merge_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
+pub fn land_prs_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
     let base_n = normalize_branch_name(base);
     let prs = list_spr_prs(prefix)?;
     if prs.is_empty() {
