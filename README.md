@@ -159,6 +159,7 @@ Notes
 
 Examples
 --------
+![demo](./demo.gif)
 
 ```bash
 # Build/refresh using defaults from config
