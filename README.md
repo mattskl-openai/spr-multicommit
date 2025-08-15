@@ -3,9 +3,10 @@ spr-multicommit
 
 Stack-friendly CLI to manage, update, and land stacked GitHub pull requests.
 
-- Builds a stack of PRs from commit markers or from existing `spr/*` branches
+- Builds a stack of PRs from commit markers
+- PRs in the stack can have multiple commits, to better show diffs while being reviewed
 - Keeps PR bases and bodies in sync with your local stack
-- Supports two landing strategies: flatten (squash) and per-pr (rebase/close)
+- Supports two landing strategies: flatten (squash) and per-pr (rebase)
 
 Installation
 ------------
@@ -65,7 +66,7 @@ Key options:
 - `--dry-run`: print state-changing commands instead of executing
 - Extent (optional subcommand):
   - `pr --n <N>`: limit to first N PRs from the bottom
-  - `commits --n <N>`: limit to first N commits
+  - `commits --n <N>`: limit to first N commits (untested)
 
 Behavior:
 
@@ -90,8 +91,7 @@ Shared options:
 - `--prefix <PREFIX>`
 - `--dry-run`
 - `--until <N>`: target range
-  - For `flatten`: land first N PRs bottom-up (0 means all)
-  - For `per-pr`: land first N PRs bottom-up (0 means all)
+  - land first N PRs bottom-up (0 means all)
 
 Mode selection:
 
