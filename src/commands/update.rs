@@ -1,14 +1,11 @@
 use anyhow::{anyhow, Result};
-use regex::Regex;
 use std::collections::HashMap;
 use tracing::info;
 
 use crate::git::{
     get_remote_branches_sha, gh_rw, git_is_ancestor, git_ro, git_rw, sanitize_gh_base_ref,
 };
-use crate::github::{
-    fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached, PrRef,
-};
+use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached};
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{parse_groups, Group};
 
@@ -19,7 +16,7 @@ pub fn build_from_tags(
     prefix: &str,
     no_pr: bool,
     dry: bool,
-    update_pr_body: bool,
+    _update_pr_body: bool,
     limit: Option<Limit>,
 ) -> Result<()> {
     let merge_base = git_ro(["merge-base", base, from].as_slice())?
@@ -56,7 +53,6 @@ pub fn build_from_tags(
     );
 
     // Build bottom→top and collect PR refs for the visual update pass.
-    let mut stack: Vec<PrRef> = vec![];
     let mut just_created_numbers: Vec<u64> = vec![];
     // Prefetch open PRs to reduce per-branch lookups
     let mut prs_by_head: HashMap<String, u64> = list_spr_prs(prefix)?
@@ -168,7 +164,6 @@ pub fn build_from_tags(
             if !was_known {
                 just_created_numbers.push(num);
             }
-            stack.push(PrRef { number: num });
         }
         parent_branch = branch;
     }
@@ -187,34 +182,27 @@ pub fn build_from_tags(
         let mut desired_by_number: HashMap<u64, String> = HashMap::new();
         let mut desired_base_by_number: HashMap<u64, String> = HashMap::new();
         let mut want_base_ref = sanitize_gh_base_ref(base);
-        for (idx, g) in groups.iter().enumerate() {
+        for g in groups.iter() {
             let head_branch = format!("{}{}", prefix, g.tag);
-            let include = update_pr_body
-                || planned
-                    .get(idx)
-                    .map(|p| p.kind != PushKind::Skip)
-                    .unwrap_or(false);
             if let Some(&num) = prs_by_head.get(&head_branch) {
                 // Stack visual (optional rewrite)
-                if include {
-                    let base = g.pr_body_base()?;
-                    let mut lines = String::new();
-                    let em_space = "\u{2003}"; // U+2003 EM SPACE for indentation
-                    for n in &numbers_rev {
-                        let marker = if *n == num { "➡" } else { em_space };
-                        lines.push_str(&format!("- {} #{}\n", marker, n));
-                    }
-                    let stack_block = format!(
-                        "<!-- spr-stack:start -->\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n<!-- spr-stack:end -->",
-                        lines.trim_end(),
-                    );
-                    let body = if base.trim().is_empty() {
-                        stack_block.clone()
-                    } else {
-                        format!("{}\n\n{}", base, stack_block)
-                    };
-                    desired_by_number.insert(num, body);
+                let base = g.pr_body_base()?;
+                let mut lines = String::new();
+                let em_space = "\u{2003}"; // U+2003 EM SPACE for indentation
+                for n in &numbers_rev {
+                    let marker = if *n == num { "➡" } else { em_space };
+                    lines.push_str(&format!("- {} #{}\n", marker, n));
                 }
+                let stack_block = format!(
+                    "<!-- spr-stack:start -->\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n<!-- spr-stack:end -->",
+                    lines.trim_end(),
+                );
+                let body = if base.trim().is_empty() {
+                    stack_block.clone()
+                } else {
+                    format!("{}\n\n{}", base, stack_block)
+                };
+                desired_by_number.insert(num, body);
                 // Base linkage (always set according to local stack)
                 desired_base_by_number.insert(num, want_base_ref.clone());
                 want_base_ref = head_branch;
@@ -238,34 +226,15 @@ pub fn build_from_tags(
             base: Option<String>,
         }
         let mut update_specs: HashMap<u64, UpdateSpec> = HashMap::new();
-        let re_stack = Regex::new(&format!(
-            r"(?s){}.*?{}",
-            regex::escape("<!-- spr-stack:start -->"),
-            regex::escape("<!-- spr-stack:end -->")
-        ))?;
-        // Bodies
+        // Bodies: always update
         for (&num, desired) in &desired_by_number {
             if let Some(info) = bodies_by_number.get(&num) {
-                let needs_body = if update_pr_body || just_created_numbers.contains(&num) {
-                    true
-                } else {
-                    let current = info.body.clone();
-                    let base_current = re_stack.replace(&current, "").trim().to_string();
-                    let reconstructed_current = if base_current.trim().is_empty() {
-                        desired.clone()
-                    } else {
-                        current.trim().to_string()
-                    };
-                    desired.trim() != reconstructed_current.trim()
-                };
-                if needs_body {
-                    let entry = update_specs.entry(num).or_insert(UpdateSpec {
-                        id: info.id.clone(),
-                        body: None,
-                        base: None,
-                    });
-                    entry.body = Some(desired.clone());
-                }
+                let entry = update_specs.entry(num).or_insert(UpdateSpec {
+                    id: info.id.clone(),
+                    body: None,
+                    base: None,
+                });
+                entry.body = Some(desired.clone());
             }
         }
         // Bases

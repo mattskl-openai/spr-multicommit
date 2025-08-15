@@ -1,111 +1,81 @@
-use anyhow::{bail, Result};
-use tracing::{info, warn};
+use anyhow::Result;
+use tracing::info;
 
-use crate::git::{gh_rw, git_ro, git_rw, normalize_branch_name, sanitize_gh_base_ref};
-use crate::github::{list_spr_prs, PrInfo, PrRef};
-use crate::limit::{apply_limit_prs_for_restack, Limit};
+use crate::git::{git_ro, git_rw};
+use crate::parsing::parse_groups;
 
-/// Restack existing spr/* PRs by rebase --onto Parent → Child, bottom→top.
-pub fn restack_existing(
-    base: &str,
-    prefix: &str,
-    no_pr: bool,
-    dry: bool,
-    limit: Option<Limit>,
-) -> Result<()> {
-    let base_n = normalize_branch_name(base);
-    let prs = list_spr_prs(prefix)?;
-    if prs.is_empty() {
-        bail!("No open PRs with head starting with `{prefix}`.");
+/// Restack the local stack by rebasing all commits after the first `after` PRs onto `base`.
+///
+/// How it works:
+/// - Compute PR groups from `base..HEAD` (via `pr:<tag>` markers), bottom→top.
+/// - If `after == 0`: set `upstream = merge-base(base, HEAD)`.
+/// - Else: set `upstream = <first_commit_of_group_{after+1}>^` (parent of the first commit after the first N groups).
+/// - Run: `git rebase --onto <base> <upstream> <current-branch>`.
+///
+/// This moves the entire range starting at the first commit of group N+1 onto `base`, leaving the first N PRs untouched.
+pub fn restack_after(base: &str, after: usize, safe: bool, dry: bool) -> Result<()> {
+    // Ensure we operate against the latest remote state
+    git_rw(dry, ["fetch", "origin"].as_slice())?;
+
+    let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
+        .trim()
+        .to_string();
+    let lines = git_ro(
+        [
+            "log",
+            "--format=%H%x00%B%x1e",
+            "--reverse",
+            &format!("{}..HEAD", merge_base),
+        ]
+        .as_slice(),
+    )?;
+    let groups = parse_groups(&lines)?;
+    if groups.is_empty() {
+        info!("No local PR groups found; nothing to restack.");
+        return Ok(());
     }
-
-    // Build linear chains for each root (baseRefName == base)
-    let roots: Vec<&PrInfo> = prs.iter().filter(|p| p.base == base_n).collect();
-    if roots.is_empty() {
-        bail!(
-            "Could not find a root PR basing on `{}`. Ensure one PR has base `{}`.",
-            base_n,
-            base_n
-        );
-    }
-    if roots.len() > 1 {
-        warn!(
-            "Found {} roots basing on `{}`; processing each chain independently.",
-            roots.len(),
-            base_n
-        );
-    }
-
-    let mut overall_stack: Vec<PrRef> = vec![];
-
-    for root in roots {
-        let mut order: Vec<&PrInfo> = vec![];
-        let mut cur = root;
-        loop {
-            order.push(cur);
-            if let Some(next) = prs.iter().find(|p| p.base == cur.head) {
-                cur = next;
-            } else {
-                break;
-            }
-        }
-
-        // Apply extent limits for restack
-        let order = apply_limit_prs_for_restack(&base_n, &order, limit)?;
-
+    if after >= groups.len() {
         info!(
-            "Restacking {} PR(s): {}",
-            order.len(),
-            order
-                .iter()
-                .map(|p| p.head.as_str())
-                .collect::<Vec<_>>()
-                .join(" → ")
+            "after={} >= {} group(s); nothing to restack.",
+            after,
+            groups.len()
         );
-
-        // Ensure we only fetch once per chain
-        git_rw(dry, ["fetch", "origin"].as_slice())?;
-        for win in order.windows(2) {
-            let parent = &win[0].head;
-            let child = &win[1].head;
-
-            info!("Rebasing {child} onto {parent}");
-            git_ro(["checkout", child].as_slice())?;
-            git_rw(
-                dry,
-                [
-                    "merge",
-                    "--no-ff",
-                    parent,
-                    "-m",
-                    &format!("spr: merge {} into {}", parent, child),
-                ]
-                .as_slice(),
-            )?;
-            git_rw(dry, ["push", "origin", child].as_slice())?;
-
-            if !no_pr {
-                gh_rw(
-                    dry,
-                    ["pr", "edit", child, "--base", &sanitize_gh_base_ref(parent)].as_slice(),
-                )?;
-            }
-        }
-
-        // Collect for the visual pass (bottom→top order)
-        for pr in &order {
-            overall_stack.push(PrRef { number: pr.number });
-        }
+        return Ok(());
     }
 
-    if !no_pr && !dry {
-        crate::github::update_stack_bodies(&overall_stack, dry)?;
-    } else if !no_pr && dry {
-        info!(
-            "DRY-RUN: would update PR descriptions with stack visual for {} PRs",
-            overall_stack.len()
-        );
+    // Determine upstream for rebase. To include the first commit of group N+1 in the rebase,
+    // set upstream to the parent of that commit (i.e., `<first>^`). For N == 0, use merge-base.
+    let upstream: String = if after == 0 {
+        merge_base
+    } else {
+        let next = &groups[after];
+        if let Some(first) = next.commits.first() {
+            format!("{}^", first)
+        } else {
+            merge_base
+        }
+    };
+
+    let cur_branch = git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
+        .trim()
+        .to_string();
+    if safe {
+        // Create a local backup branch pointing to current HEAD before rebasing
+        let short = git_ro(["rev-parse", "--short", "HEAD"].as_slice())?
+            .trim()
+            .to_string();
+        let backup = format!("backup/restack/{}-{}", cur_branch, short);
+        info!("Creating backup branch at HEAD: {}", backup);
+        let _ = git_rw(dry, ["branch", &backup, "HEAD"].as_slice())?;
     }
+    info!(
+        "Rebasing commits after first {} PR(s) of {} onto {} (upstream = {})",
+        after, cur_branch, base, upstream
+    );
+    git_rw(
+        dry,
+        ["rebase", "--onto", base, &upstream, &cur_branch].as_slice(),
+    )?;
 
     Ok(())
 }

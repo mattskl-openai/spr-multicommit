@@ -67,7 +67,6 @@ Key options:
 
 - `--from <REF>`: commit range upper bound when parsing tags (default `HEAD`) (untested)
 - `--no-pr`: only (re)create branches; skip PR creation/updates (untested)
-- `--restack`: restack existing `spr/*` branches instead of parsing tags (untested)
 - Extent (optional subcommand):
   - `pr --n <N>`: limit to first N PRs from the bottom
   - `commits --n <N>`: limit to first N commits (untested)
@@ -77,6 +76,23 @@ Behavior:
 - Parses `pr:<tag>` markers from `merge-base(base, from)..from`
 - Creates/updates per-PR branches and GitHub PRs
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
+
+### spr restack
+
+Restack the local stack by rebasing commits after the bottom N PR groups onto the latest base.
+
+Options:
+
+- `--after <N>`: 'drops' the first N PR groups; rebase the remaining commits onto `--base` (0 means restack all groups)
+ - `--safe`: create a local backup branch at current `HEAD` before rebasing
+
+Behavior:
+
+- Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest)
+- For `--after 0`: upstream is `merge-base(base, HEAD)`
+- For `--after N>0`: upstream is the parent of the first commit of group N+1
+- Runs: `git rebase --onto <base> <upstream> <current-branch>`
+ - With `--safe`, a backup branch named like `backup/restack/<current-branch>-<short-sha>` is created first
 
 ### spr list pr
 
@@ -150,6 +166,15 @@ spr update
 
 # Prep the first 3 PRs from the bottom
 spr prep --until 3
+
+# Restack everything onto the latest base
+spr restack --after 0
+
+# Restack everything above the first 2 PRs ('drops' the first 2 PRs)
+spr restack --after 2
+
+# Restack safely (creates a backup branch before rebase)
+spr restack --after 2 --safe
 
 # Land top PR only using config default mode (flatten by default)
 spr land --until 1
