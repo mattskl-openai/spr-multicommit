@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use regex::Regex;
 use std::collections::HashMap;
 use tracing::info;
 
