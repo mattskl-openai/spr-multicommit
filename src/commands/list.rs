@@ -34,7 +34,11 @@ pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
         let count = g.commits.len();
         let plural = if count == 1 { "commit" } else { "commits" };
         let first_sha = g.commits.first().map(|s| s.as_str()).unwrap_or("");
-        let short = if first_sha.len() >= 8 { &first_sha[..8] } else { first_sha };
+        let short = if first_sha.len() >= 8 {
+            &first_sha[..8]
+        } else {
+            first_sha
+        };
         let remote_pr_num_str = match num {
             Some(n) => format!(" (#{})", n),
             None => "".to_string(),
