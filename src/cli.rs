@@ -85,8 +85,8 @@ pub enum Cmd {
         which: Option<LandCmd>,
     },
 
-    /// Fix PR stack connectivity to match local commit stack
-    FixStack {
+    /// Relink PR stack connectivity to match local commit stack
+    Relink {
         // dry-run is provided via global --dry-run
     },
 
