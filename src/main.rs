@@ -48,12 +48,14 @@ fn main() -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter("info")
             .with_target(false)
+            .with_level(false)
             .compact()
             .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter("info")
             .with_target(false)
+            .with_level(false)
             .without_time()
             .compact()
             .init();
