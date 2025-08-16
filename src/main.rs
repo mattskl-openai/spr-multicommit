@@ -48,12 +48,14 @@ fn main() -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter("info")
             .with_target(false)
+            .with_level(false)
             .compact()
             .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter("info")
             .with_target(false)
+            .with_level(false)
             .without_time()
             .compact()
             .init();
@@ -128,6 +130,9 @@ fn main() -> Result<()> {
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             match what {
                 crate::cli::ListWhat::Pr => crate::commands::list_prs_display(&base, &prefix)?,
+                crate::cli::ListWhat::Commit => {
+                    crate::commands::list_commits_display(&base, &prefix)?
+                }
             }
         }
         crate::cli::Cmd::Land { which } => {
@@ -155,6 +160,11 @@ fn main() -> Result<()> {
             set_dry_run_env(cli.dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::fix_stack(&base, &prefix, cli.dry_run)?;
+        }
+        crate::cli::Cmd::Move { range, after, safe } => {
+            set_dry_run_env(cli.dry_run, false);
+            let (base, _) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
+            crate::commands::move_groups_after(&base, &range, &after, safe, cli.dry_run)?;
         }
     }
     Ok(())

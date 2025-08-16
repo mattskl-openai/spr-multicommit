@@ -18,12 +18,17 @@ pub enum PrepSelection {
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub enum ListWhat {
     /// List PRs in the stack (bottom-up)
+    #[command(alias = "p")]
     Pr,
+    /// List commits in the stack (bottom-up)
+    #[command(alias = "c")]
+    Commit,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Build/refresh stacked PRs
+    #[command(alias = "u")]
     Update {
         /// Source ref to read commits from (if building from tags)
         #[arg(long, default_value = "HEAD")]
@@ -67,6 +72,7 @@ pub enum Cmd {
     },
 
     /// List entities
+    #[command(alias = "ls")]
     List {
         #[command(subcommand)]
         what: ListWhat,
@@ -82,6 +88,19 @@ pub enum Cmd {
     /// Fix PR stack connectivity to match local commit stack
     FixStack {
         // dry-run is provided via global --dry-run
+    },
+
+    /// Reorder local PR groups by moving one or a range to come after a target PR
+    #[command(alias = "mv")]
+    Move {
+        /// Position or range to move: either `A` or `A..B` (1-based, bottom→top)
+        range: String,
+        /// Target PR position to come after: number (0..=N), or one of: bottom, top. Must not be in [A..B]
+        #[arg(long, value_name = "C|bottom|top")]
+        after: String,
+        /// Create a local backup branch at current HEAD before rewriting
+        #[arg(long)]
+        safe: bool,
     },
 }
 
@@ -110,7 +129,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub prefix: Option<String>,
     /// Global dry-run flag (applies to all subcommands)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, visible_alias = "dr")]
     pub dry_run: bool,
     /// Global until (used by prep/land). 0 means all
     #[arg(long, global = true)]

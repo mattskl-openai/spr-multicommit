@@ -51,7 +51,7 @@ Global flags
 
  - `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
-- `--dry-run`: print state-changing commands instead of executing
+- `--dry-run` (alias: `--dr`): print state-changing commands instead of executing
 - `--until <N>`: target range used by `prep` and `land` (0 means all)
 - `--exact <I>`: used by `prep` to select exactly the I-th PR (1-based)
 - `--verbose`: enable verbose logging of underlying git/gh commands
@@ -97,6 +97,22 @@ Behavior:
 ### spr list pr
 
 Lists PRs in the current stack (bottom → top) for the configured prefix.
+
+### spr list commit (alias: c)
+
+Lists commits in the current stack (bottom → top), grouped by local PR. Each group header shows the local PR number and branch (and remote PR number when available). Within each group, each line shows the bottom-up commit index (1-based) and the short SHA.
+
+### spr move
+
+Reorder local PR groups by moving one or a range to come after a target PR.
+
+- `spr move A --after C`: move PR at position A to come after PR C (C ∈ [0..N])
+- `spr move A..B --after C`: move PRs A..B to come after PR C (requires A < B and C ∉ [A..B]; C ∈ [0..N])
+  - `--after bottom` is the same as `--after 0`
+  - `--after top` is the same as `--after N`
+- `--safe`: create a local backup branch at current `HEAD` before rewriting
+
+Prints an explicit plan, e.g.: `2..3→4: [1,2,3,4,5,6] → [1,4,2,3,5,6]`.
 
 ### spr land
 
