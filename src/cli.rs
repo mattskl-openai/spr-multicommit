@@ -19,6 +19,9 @@ pub enum PrepSelection {
 pub enum ListWhat {
     /// List PRs in the stack (bottom-up)
     Pr,
+    /// List commits in the stack (bottom-up)
+    #[command(alias = "c")]
+    Commit,
 }
 
 #[derive(Subcommand, Debug)]

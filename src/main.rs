@@ -128,6 +128,9 @@ fn main() -> Result<()> {
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             match what {
                 crate::cli::ListWhat::Pr => crate::commands::list_prs_display(&base, &prefix)?,
+                crate::cli::ListWhat::Commit => {
+                    crate::commands::list_commits_display(&base, &prefix)?
+                }
             }
         }
         crate::cli::Cmd::Land { which } => {

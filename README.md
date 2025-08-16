@@ -98,6 +98,10 @@ Behavior:
 
 Lists PRs in the current stack (bottom → top) for the configured prefix.
 
+### spr list commit (alias: c)
+
+Lists commits in the current stack (bottom → top), grouped by local PR. Each group header shows the local PR number and branch (and remote PR number when available). Within each group, each line shows the bottom-up commit index (1-based) and the short SHA.
+
 ### spr land
 
 Land PRs using either flatten or per-pr strategy.
