@@ -2,12 +2,10 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tracing::info;
 
-use crate::git::{
-    get_remote_branches_sha, gh_rw, git_is_ancestor, git_ro, git_rw, sanitize_gh_base_ref,
-};
+use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached};
 use crate::limit::{apply_limit_groups, Limit};
-use crate::parsing::{parse_groups, Group};
+use crate::parsing::{derive_groups_between, Group};
 
 /// Bootstrap/refresh stack from pr:<tag> markers on `from` vs merge-base(base, from).
 pub fn build_from_tags(
@@ -19,19 +17,7 @@ pub fn build_from_tags(
     _update_pr_body: bool,
     limit: Option<Limit>,
 ) -> Result<()> {
-    let merge_base = git_ro(["merge-base", base, from].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{merge_base}..{from}"),
-        ]
-        .as_slice(),
-    )?;
-    let mut groups: Vec<Group> = parse_groups(&lines)?;
+    let (_merge_base, mut groups): (String, Vec<Group>) = derive_groups_between(base, from)?;
 
     if groups.is_empty() {
         info!("No groups discovered; nothing to do.");

@@ -1,25 +1,12 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::git::git_ro;
 use crate::github::list_spr_prs;
-use crate::parsing::parse_groups;
+use crate::parsing::derive_local_groups;
 
 pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
     // Derive stack from local commits (source of truth)
-    let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{}..HEAD", merge_base),
-        ]
-        .as_slice(),
-    )?;
-    let groups = parse_groups(&lines)?;
+    let (_merge_base, groups) = derive_local_groups(base)?;
     if groups.is_empty() {
         info!("No groups discovered; nothing to list.");
         return Ok(());
@@ -60,19 +47,7 @@ pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
 
 pub fn list_commits_display(base: &str, prefix: &str) -> Result<()> {
     // Derive stack from local commits (source of truth)
-    let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{}..HEAD", merge_base),
-        ]
-        .as_slice(),
-    )?;
-    let groups = parse_groups(&lines)?;
+    let (_merge_base, groups) = derive_local_groups(base)?;
     if groups.is_empty() {
         info!("No groups discovered; nothing to list.");
         return Ok(());

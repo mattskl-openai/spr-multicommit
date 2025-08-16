@@ -1,38 +1,34 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use tracing::warn;
 
 use crate::cli::LandCmd;
-use crate::git::{
-    gh_rw, git_ro, git_rw, normalize_branch_name, sanitize_gh_base_ref, to_remote_ref,
-};
+use crate::git::{gh_rw, git_ro, git_rw, sanitize_gh_base_ref, to_remote_ref};
 use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs};
+use crate::parsing::derive_local_groups;
 
 pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) -> Result<()> {
-    let base_n = normalize_branch_name(base);
+    // Local stack is the source of truth: derive order from local groups
+    let (_merge_base, groups) = derive_local_groups(base)?;
+    if groups.is_empty() {
+        bail!("No local groups found; nothing to land.");
+    }
     let prs = list_spr_prs(prefix)?;
     if prs.is_empty() {
         bail!("No open PRs with head starting with `{prefix}`.");
     }
-    let root = prs
-        .iter()
-        .find(|p| p.base == base_n)
-        .ok_or_else(|| anyhow!("No root PR with base `{}`", base_n))?;
-
-    // Build ordered chain bottom-up
     let mut ordered: Vec<&crate::github::PrInfo> = vec![];
-    let mut cur = root;
-    loop {
-        ordered.push(cur);
-        if let Some(next) = prs.iter().find(|p| p.base == cur.head) {
-            cur = next;
+    for g in &groups {
+        let head_branch = format!("{}{}", prefix, g.tag);
+        if let Some(pr) = prs.iter().find(|p| p.head == head_branch) {
+            ordered.push(pr);
         } else {
-            break;
+            bail!(
+                "No open PR found for local group '{}' (branch '{}')",
+                g.tag,
+                head_branch
+            );
         }
     }
-    if ordered.is_empty() {
-        bail!("No PR chain found");
-    }
-
     let take_n = if n == 0 {
         ordered.len()
     } else {
@@ -46,7 +42,7 @@ pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) 
         let mut offenders: Vec<u64> = vec![];
         for (i, pr) in segment.iter().enumerate() {
             let parent = if i == 0 {
-                base_n.clone()
+                base.to_string()
             } else {
                 segment[i - 1].head.clone()
             };

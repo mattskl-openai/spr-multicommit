@@ -1,26 +1,14 @@
 use anyhow::{bail, Result};
 use tracing::{info, warn};
 
-use crate::git::{gh_rw, git_ro, normalize_branch_name, sanitize_gh_base_ref};
+use crate::git::{gh_rw, normalize_branch_name, sanitize_gh_base_ref};
 use crate::github::list_spr_prs;
-use crate::parsing::parse_groups;
+use crate::parsing::derive_local_groups;
 
 pub fn fix_stack(base: &str, prefix: &str, dry: bool) -> Result<()> {
     let base_n = normalize_branch_name(base);
     // Build local expected stack from base..HEAD
-    let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{}..HEAD", merge_base),
-        ]
-        .as_slice(),
-    )?;
-    let groups = parse_groups(&lines)?;
+    let (_merge_base, groups) = derive_local_groups(base)?;
     if groups.is_empty() {
         info!("No local groups found; nothing to fix.");
         return Ok(());

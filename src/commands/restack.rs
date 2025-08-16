@@ -2,7 +2,7 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::git::{git_ro, git_rw};
-use crate::parsing::parse_groups;
+use crate::parsing::derive_local_groups;
 
 /// Restack the local stack by rebasing all commits after the first `after` PRs onto `base`.
 ///
@@ -17,19 +17,7 @@ pub fn restack_after(base: &str, after: usize, safe: bool, dry: bool) -> Result<
     // Ensure we operate against the latest remote state
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
-    let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{}..HEAD", merge_base),
-        ]
-        .as_slice(),
-    )?;
-    let groups = parse_groups(&lines)?;
+    let (merge_base, groups) = derive_local_groups(base)?;
     if groups.is_empty() {
         info!("No local PR groups found; nothing to restack.");
         return Ok(());
