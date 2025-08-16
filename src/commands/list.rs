@@ -40,7 +40,7 @@ pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
             None => "".to_string(),
         };
         info!(
-            "Local PR #{} - {} : {}{} - {} {}",
+            "LPR #{} - {} : {}{} - {} {}",
             i + 1,
             short,
             head_branch,
@@ -48,6 +48,8 @@ pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
             count,
             plural
         );
+        let first_subject = g.subjects.first().map(|s| s.as_str()).unwrap_or("");
+        info!("  {}", first_subject);
     }
     Ok(())
 }
@@ -92,10 +94,11 @@ pub fn list_commits_display(base: &str, prefix: &str) -> Result<()> {
             head_branch
         );
 
-        for sha in &g.commits {
+        for (j, sha) in g.commits.iter().enumerate() {
             commit_counter += 1;
             let short = if sha.len() >= 8 { &sha[..8] } else { sha };
-            info!("{:>4}  {}", commit_counter, short);
+            let subject = g.subjects.get(j).map(|s| s.as_str()).unwrap_or("");
+            info!("{:>4}  {} - {}", commit_counter, short, subject);
         }
         // Blank line between groups for readability
         info!("");
