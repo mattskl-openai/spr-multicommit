@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::info;
 
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
@@ -28,15 +30,7 @@ pub fn build_from_tags(
     groups = apply_limit_groups(groups, limit)?;
     let total_groups = groups.len();
 
-    info!(
-        "Preparing {} group(s): {}",
-        groups.len(),
-        groups
-            .iter()
-            .map(|g| g.tag.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    info!("Preparing {} group(s)…", groups.len());
 
     // Build bottom→top and collect PR refs for the visual update pass.
     let mut just_created_numbers: Vec<u64> = vec![];
@@ -85,14 +79,12 @@ pub fn build_from_tags(
             .cloned()
             .ok_or_else(|| anyhow!("Group {} has no commits", g.tag))?;
         let kind = if remote_head.as_deref() == Some(target_sha.as_str()) {
-            info!("No changes for {}; skipping push", branch);
             PushKind::Skip
         } else if let Some(ref remote_sha) = remote_head {
             let ff_ok = git_is_ancestor(remote_sha, &target_sha)?;
             if ff_ok {
                 PushKind::FastForward
             } else {
-                info!("Diverged: forcing update for {}", branch);
                 PushKind::Force
             }
         } else {
@@ -117,7 +109,17 @@ pub fn build_from_tags(
         let mut argv: Vec<String> = vec!["push".into(), "origin".into()];
         argv.extend(ff_refspecs.clone());
         let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        git_rw(dry, &args)?;
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner} Pushing {pos} branch(es) (-ff)…")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        pb.set_position(ff_refspecs.len() as u64);
+        pb.enable_steady_tick(Duration::from_millis(120));
+        let res = git_rw(dry, &args);
+        pb.finish_and_clear();
+        res?;
     }
     // Perform force-with-lease for diverged branches in scope
     let force_refspecs: Vec<String> = planned
@@ -130,7 +132,17 @@ pub fn build_from_tags(
             vec!["push".into(), "--force-with-lease".into(), "origin".into()];
         argv.extend(force_refspecs.clone());
         let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        git_rw(dry, &args)?;
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner} Pushing {pos} branch(es) (-force-with-lease)…")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        pb.set_position(force_refspecs.len() as u64);
+        pb.enable_steady_tick(Duration::from_millis(120));
+        let res = git_rw(dry, &args);
+        pb.finish_and_clear();
+        res?;
     }
 
     // After pushes, (create or) update PRs
@@ -235,11 +247,8 @@ pub fn build_from_tags(
             }
         }
         if !update_specs.is_empty() {
-            info!(
-                "Updating {} PR(s) on GitHub (bodies and/or base refs)... this might take a few seconds.",
-                update_specs.len()
-            );
             let mut m = String::from("mutation {");
+            let total_updates = update_specs.len();
             for (i, (_num, spec)) in update_specs.into_iter().enumerate() {
                 let mut fields: Vec<String> = vec![format!("pullRequestId:\"{}\"", spec.id)];
                 if let Some(b) = spec.body {
@@ -255,10 +264,20 @@ pub fn build_from_tags(
                 ));
             }
             m.push('}');
-            gh_rw(
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template("{spinner} Updating {pos} PR(s)…")
+                    .unwrap()
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            pb.set_position(total_updates as u64);
+            pb.enable_steady_tick(Duration::from_millis(120));
+            let res = gh_rw(
                 dry,
                 ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
-            )?;
+            );
+            pb.finish_and_clear();
+            res?;
         } else {
             info!("All PR descriptions/base refs up-to-date; no edits needed");
         }
