@@ -18,6 +18,7 @@ pub enum PrepSelection {
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub enum ListWhat {
     /// List PRs in the stack (bottom-up)
+    #[command(alias = "p")]
     Pr,
     /// List commits in the stack (bottom-up)
     #[command(alias = "c")]
@@ -27,6 +28,7 @@ pub enum ListWhat {
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Build/refresh stacked PRs
+    #[command(alias = "u")]
     Update {
         /// Source ref to read commits from (if building from tags)
         #[arg(long, default_value = "HEAD")]
@@ -70,6 +72,7 @@ pub enum Cmd {
     },
 
     /// List entities
+    #[command(alias = "ls")]
     List {
         #[command(subcommand)]
         what: ListWhat,
@@ -113,7 +116,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub prefix: Option<String>,
     /// Global dry-run flag (applies to all subcommands)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, visible_alias = "dr")]
     pub dry_run: bool,
     /// Global until (used by prep/land). 0 means all
     #[arg(long, global = true)]

@@ -51,7 +51,7 @@ Global flags
 
  - `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
-- `--dry-run`: print state-changing commands instead of executing
+- `--dry-run` (alias: `--dr`): print state-changing commands instead of executing
 - `--until <N>`: target range used by `prep` and `land` (0 means all)
 - `--exact <I>`: used by `prep` to select exactly the I-th PR (1-based)
 - `--verbose`: enable verbose logging of underlying git/gh commands
