@@ -102,6 +102,16 @@ Lists PRs in the current stack (bottom → top) for the configured prefix.
 
 Lists commits in the current stack (bottom → top), grouped by local PR. Each group header shows the local PR number and branch (and remote PR number when available). Within each group, each line shows the bottom-up commit index (1-based) and the short SHA.
 
+### spr move
+
+Reorder local PR groups by moving one or a range to come after a target PR.
+
+- `spr move A --after C`: move PR at position A to come after PR C (1-based)
+- `spr move A..B --after C`: move PRs A..B to come after PR C (requires A < B and C ∉ [A..B])
+- `--safe`: create a local backup branch at current `HEAD` before rewriting
+
+Prints an explicit plan, e.g.: `2..3→4: [1,2,3,4,5,6] → [1,4,2,3,5,6]`.
+
 ### spr land
 
 Land PRs using either flatten or per-pr strategy.

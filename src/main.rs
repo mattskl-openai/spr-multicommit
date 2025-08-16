@@ -161,6 +161,11 @@ fn main() -> Result<()> {
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::fix_stack(&base, &prefix, cli.dry_run)?;
         }
+        crate::cli::Cmd::Move { range, after, safe } => {
+            set_dry_run_env(cli.dry_run, false);
+            let (base, _) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
+            crate::commands::move_groups_to(&base, &range, after, safe, cli.dry_run)?;
+        }
     }
     Ok(())
 }

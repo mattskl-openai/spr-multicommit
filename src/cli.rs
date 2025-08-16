@@ -89,6 +89,19 @@ pub enum Cmd {
     FixStack {
         // dry-run is provided via global --dry-run
     },
+
+    /// Reorder local PR groups by moving one or a range to come after a target PR
+    #[command(alias = "mv")]
+    Move {
+        /// Position or range to move: either `A` or `A..B` (1-based, bottom→top)
+        range: String,
+        /// Target PR position to come after (1..=N). Must not be in [A..B]
+        #[arg(long, value_name = "C")]
+        after: usize,
+        /// Create a local backup branch at current HEAD before rewriting
+        #[arg(long)]
+        safe: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
