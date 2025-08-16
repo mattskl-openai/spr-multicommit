@@ -156,10 +156,10 @@ fn main() -> Result<()> {
                 }
             }
         }
-        crate::cli::Cmd::FixStack {} => {
+        crate::cli::Cmd::Relink {} => {
             set_dry_run_env(cli.dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
-            crate::commands::fix_stack(&base, &prefix, cli.dry_run)?;
+            crate::commands::relink_stack(&base, &prefix, cli.dry_run)?;
         }
         crate::cli::Cmd::Move { range, after, safe } => {
             set_dry_run_env(cli.dry_run, false);

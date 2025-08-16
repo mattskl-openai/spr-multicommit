@@ -155,7 +155,7 @@ Behavior:
 - Pushes branches (respects `--dry-run`)
 - Adds a warning to the next PR not included in the push
 
-### spr fix-stack
+### spr relink
 
 Fix PR stack connectivity to match the local commit stack.
 
