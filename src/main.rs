@@ -164,7 +164,7 @@ fn main() -> Result<()> {
         crate::cli::Cmd::Move { range, after, safe } => {
             set_dry_run_env(cli.dry_run, false);
             let (base, _) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
-            crate::commands::move_groups_to(&base, &range, after, safe, cli.dry_run)?;
+            crate::commands::move_groups_after(&base, &range, &after, safe, cli.dry_run)?;
         }
     }
     Ok(())

@@ -38,7 +38,13 @@ fn format_simple_plan(old: &[usize], new: &[usize], a: usize, b: usize, c: usize
     )
 }
 
-pub fn move_groups_to(base: &str, range: &str, after: usize, safe: bool, dry: bool) -> Result<()> {
+pub fn move_groups_after(
+    base: &str,
+    range: &str,
+    after: &str,
+    safe: bool,
+    dry: bool,
+) -> Result<()> {
     // Discover groups from local commits bottom→top
     let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
         .trim()
@@ -68,10 +74,20 @@ pub fn move_groups_to(base: &str, range: &str, after: usize, safe: bool, dry: bo
             n
         ));
     }
-    if after == 0 || after > n {
-        return Err(anyhow!("--after must be in 1..={} (got {})", n, after));
+    let c: usize = match after.trim().to_lowercase().as_str() {
+        "bottom" => 0,
+        "top" => n,
+        s => s.parse::<usize>().map_err(|_| {
+            anyhow!(
+                "--after must be a number in 0..={} or one of: bottom, top (got '{}')",
+                n,
+                after
+            )
+        })?,
+    };
+    if c > n {
+        return Err(anyhow!("--after must be in 0..={} (got {})", n, c));
     }
-    let c = after; // 1..=n, not in [a..b]
 
     if a == b {
         if a == c {
@@ -81,7 +97,7 @@ pub fn move_groups_to(base: &str, range: &str, after: usize, safe: bool, dry: bo
     } else if !(a < b) {
         return Err(anyhow!("Invalid range: require A<B (got {}..{})", a, b));
     }
-    if c >= a && c <= b {
+    if c != 0 && c >= a && c <= b {
         return Err(anyhow!(
             "--after target C={} must not be within [{}..{}]",
             c,
@@ -96,7 +112,12 @@ pub fn move_groups_to(base: &str, range: &str, after: usize, safe: bool, dry: bo
     let mut new_order: Vec<usize> = Vec::with_capacity(n);
     // Determine insertion point in remaining list
     let len_removed = b - a + 1;
-    let insert_pos = if c < a { c } else { c - len_removed }; // after C → index = C in remaining
+    // after C: insert index is C in remaining (0 means bottom)
+    let insert_pos = if c < a {
+        c
+    } else {
+        c.saturating_sub(len_removed)
+    };
     let mut i = 0usize;
     while i < old_order.len() && i < insert_pos {
         new_order.push(old_order[i]);

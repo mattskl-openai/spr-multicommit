@@ -106,8 +106,10 @@ Lists commits in the current stack (bottom → top), grouped by local PR. Each g
 
 Reorder local PR groups by moving one or a range to come after a target PR.
 
-- `spr move A --after C`: move PR at position A to come after PR C (1-based)
-- `spr move A..B --after C`: move PRs A..B to come after PR C (requires A < B and C ∉ [A..B])
+- `spr move A --after C`: move PR at position A to come after PR C (C ∈ [0..N])
+- `spr move A..B --after C`: move PRs A..B to come after PR C (requires A < B and C ∉ [A..B]; C ∈ [0..N])
+  - `--after bottom` is the same as `--after 0`
+  - `--after top` is the same as `--after N`
 - `--safe`: create a local backup branch at current `HEAD` before rewriting
 
 Prints an explicit plan, e.g.: `2..3→4: [1,2,3,4,5,6] → [1,4,2,3,5,6]`.

@@ -95,9 +95,9 @@ pub enum Cmd {
     Move {
         /// Position or range to move: either `A` or `A..B` (1-based, bottom→top)
         range: String,
-        /// Target PR position to come after (1..=N). Must not be in [A..B]
-        #[arg(long, value_name = "C")]
-        after: usize,
+        /// Target PR position to come after: number (0..=N), or one of: bottom, top. Must not be in [A..B]
+        #[arg(long, value_name = "C|bottom|top")]
+        after: String,
         /// Create a local backup branch at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
