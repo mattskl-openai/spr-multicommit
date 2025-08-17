@@ -93,6 +93,12 @@ pub enum Cmd {
         // dry-run is provided via global --dry-run
     },
 
+    /// Delete remote branches with the configured prefix whose PRs are all closed
+    #[command(alias = "clean")]
+    Cleanup {
+        // dry-run is provided via global --dry-run
+    },
+
     /// Reorder local PR groups by moving one or a range to come after a target PR
     #[command(alias = "mv")]
     Move {
