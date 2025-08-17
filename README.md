@@ -18,6 +18,28 @@ Installation
 cargo install --path .
 ```
 
+Quick start
+-----------
+
+1. Create commits with `pr:<tag>` markers to define PR groups, bottom → top. Example:
+
+```bash
+git commit -m "feat: parser groundwork pr:alpha"
+git commit -m "feat: alpha follow-ups"
+git commit -m "feat: new API pr:beta" -m "Body explaining the change"
+```
+
+2. Configure defaults (optional) in `.spr_multicommit_cfg.yml` (see below), then:
+
+```bash
+# Build/refresh the stack (creates/updates branches and PRs)
+spr update
+
+# Inspect the stack
+spr list pr
+spr list commit
+```
+
 Configuration
 -------------
 
@@ -67,6 +89,7 @@ Key options:
 
 - `--from <REF>`: commit range upper bound when parsing tags (default `HEAD`) (untested)
 - `--no-pr`: only (re)create branches; skip PR creation/updates (untested)
+- `--update-pr-body`: rewrite PR bodies even if content is unchanged
 - Extent (optional subcommand):
   - `pr --n <N>`: limit to first N PRs from the bottom
   - `commits --n <N>`: limit to first N commits (untested)
@@ -76,6 +99,7 @@ Behavior:
 - Parses `pr:<tag>` markers from `merge-base(base, from)..from`
 - Creates/updates per-PR branches and GitHub PRs
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
+  - May temporarily set existing PR bases to the repo base while pushing, then re-chain them to match the local stack
 
 ### spr restack
 
@@ -99,6 +123,12 @@ Behavior:
 ### spr list pr
 
 Lists PRs in the current stack (bottom → top) for the configured prefix.
+
+Legend: CI ✓/✗/◐ and Review ✓/✗/◐ indicate passing/failing/pending states when available.
+
+### spr status (alias: stat)
+
+Alias for `spr list pr`.
 
 ### spr list commit (alias: c)
 
@@ -124,6 +154,11 @@ Shared options (global):
 
 - `--until <N>`: land first N PRs bottom-up (0 means all)
 
+Safety checks:
+
+- Requires CI status SUCCESS and review APPROVED for PRs being landed.
+- Override with `--unsafe` (aliases: `--force`, `-f`).
+
 Mode selection:
 
 - If `spr land <mode>` is specified, that mode is used
@@ -132,14 +167,13 @@ Mode selection:
 #### Mode: flatten
 
 - For PRs 1..=N (or all when N==0):
-  - Sets each PR’s `baseRefName` to the actual base
-  - Squash-merges each PR
-  - Does not close other PRs explicitly (they’ll be closed by GitHub on merge)
+  - Sets the N-th PR’s `baseRefName` to the actual base and squash-merges it
+  - Adds a comment to and closes the previous PRs in the landed set
 
 #### Mode: per-pr
 
 - Validates that each PR in 1..=N has exactly one unique commit over its parent (abort if not)
-- Use in conjuction with `spr prep`
+- Use in conjunction with `spr prep`
 - For the N-th PR:
   - Sets `baseRefName` to the actual base and rebase-merges it
 - For PRs 1..=N-1:
@@ -181,6 +215,11 @@ spr cleanup
 ### spr fix-stack
 
 Fix PR stack connectivity to match the local commit stack.
+
+Behavior:
+
+- Computes the expected bottom → top chain from local commits and updates each PR’s base to match.
+- Skips PRs that are already correct; warns for missing PRs.
 
 Dry run behavior
 ----------------
@@ -224,4 +263,16 @@ spr land flatten --until 2
 
 # Explicitly land first 2 PRs via per-pr
 spr land per-pr --until 2
+
+# Reorder local PR groups 2..3 to come after PR 4 (creates a backup if desired)
+spr move 2..3 --after 4 --safe
+
+# Fix PR base chain on GitHub to reflect local stack
+spr fix-stack
 ```
+
+Aliases
+-------
+
+- `spr update` (`u`), `spr list` (`ls`), `spr move` (`mv`), `spr cleanup` (`clean`)
+- `spr list pr` (`p`), `spr list commit` (`c`), `spr status` (`stat`) (same as `spr list pr`)

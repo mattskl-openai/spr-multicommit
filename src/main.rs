@@ -146,6 +146,11 @@ fn main() -> Result<()> {
                 }
             }
         }
+        crate::cli::Cmd::Status {} => {
+            // alias for `spr list pr`
+            let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
+            crate::commands::list_prs_display(&base, &prefix)?
+        }
         crate::cli::Cmd::Land { which, r#unsafe } => {
             set_dry_run_env(cli.dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
