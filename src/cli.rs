@@ -84,7 +84,7 @@ pub enum Cmd {
         #[command(subcommand)]
         which: Option<LandCmd>,
         /// Allow bypassing safety validations (CI/review checks)
-        #[arg(long = "unsafe")]
+        #[arg(long = "unsafe", visible_alias = "force", visible_short_alias = 'f')]
         r#unsafe: bool,
     },
 
