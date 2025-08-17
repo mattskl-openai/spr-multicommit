@@ -3,10 +3,19 @@ use tracing::warn;
 
 use crate::cli::LandCmd;
 use crate::git::{gh_rw, git_ro, git_rw, sanitize_gh_base_ref, to_remote_ref};
-use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs};
+use crate::github::{
+    fetch_pr_bodies_graphql, fetch_pr_ci_review_status, graphql_escape, list_spr_prs,
+};
 use crate::parsing::derive_local_groups;
 
-pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) -> Result<()> {
+pub fn land_until(
+    base: &str,
+    prefix: &str,
+    n: usize,
+    dry: bool,
+    mode: LandCmd,
+    bypass_safety: bool,
+) -> Result<()> {
     // Local stack is the source of truth: derive order from local groups
     let (_merge_base, groups) = derive_local_groups(base)?;
     if groups.is_empty() {
@@ -35,6 +44,60 @@ pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) 
         n.min(ordered.len())
     };
     let segment = &ordered[..take_n];
+
+    // Safety validation: CI and Reviews must be passing/approved for all PRs being landed
+    let numbers: Vec<u64> = segment.iter().map(|p| p.number).collect();
+    if !numbers.is_empty() {
+        if let Ok(status_map) = fetch_pr_ci_review_status(&numbers) {
+            let mut ci_bad: Vec<u64> = vec![];
+            let mut rv_bad: Vec<u64> = vec![];
+            for n in &numbers {
+                if let Some(st) = status_map.get(n) {
+                    if st.ci_state.as_str() != "SUCCESS" {
+                        ci_bad.push(*n);
+                    }
+                    if st.review_decision.as_str() != "APPROVED" {
+                        rv_bad.push(*n);
+                    }
+                } else {
+                    // Unknown status → treat as failing both
+                    ci_bad.push(*n);
+                    rv_bad.push(*n);
+                }
+            }
+            if !ci_bad.is_empty() || !rv_bad.is_empty() {
+                let ci_str = if ci_bad.is_empty() {
+                    String::from("none")
+                } else {
+                    ci_bad
+                        .iter()
+                        .map(|x| format!("#{}", x))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let rv_str = if rv_bad.is_empty() {
+                    String::from("none")
+                } else {
+                    rv_bad
+                        .iter()
+                        .map(|x| format!("#{}", x))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if bypass_safety {
+                    warn!(
+                        "Bypassing safety checks (--unsafe). CI not passing: {}; Reviews not approved: {}",
+                        ci_str, rv_str
+                    );
+                } else {
+                    bail!(
+                        "Refusing to land: CI not passing: {}; Reviews not approved: {}. Use --unsafe to override.",
+                        ci_str, rv_str
+                    );
+                }
+            }
+        }
+    }
 
     if let LandCmd::PerPr = mode {
         // Verify each has exactly one unique commit over its parent
@@ -147,11 +210,23 @@ pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) 
 
 /// Per-PR: land N PRs bottom-up, each PR as its own commit using rebase merge.
 /// Each PR must have exactly one commit over its parent.
-pub fn land_per_pr_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
-    land_until(base, prefix, n, dry, LandCmd::PerPr)
+pub fn land_per_pr_until(
+    base: &str,
+    prefix: &str,
+    n: usize,
+    dry: bool,
+    bypass_safety: bool,
+) -> Result<()> {
+    land_until(base, prefix, n, dry, LandCmd::PerPr, bypass_safety)
 }
 
 /// Flatten: behave like per-pr landing but squash-merge the Nth PR and set its base to the actual base.
-pub fn land_flatten_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
-    land_until(base, prefix, n, dry, LandCmd::Flatten)
+pub fn land_flatten_until(
+    base: &str,
+    prefix: &str,
+    n: usize,
+    dry: bool,
+    bypass_safety: bool,
+) -> Result<()> {
+    land_until(base, prefix, n, dry, LandCmd::Flatten, bypass_safety)
 }
