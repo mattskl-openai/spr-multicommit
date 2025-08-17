@@ -4,6 +4,25 @@ use tracing::info;
 use crate::git::{git_ro, git_rw};
 use crate::parsing::derive_local_groups;
 
+fn get_current_branch() -> Result<String> {
+    Ok(git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
+        .trim()
+        .to_string())
+}
+
+fn create_backup_if_safe(safe: bool, dry: bool, current_branch: &str) -> Result<()> {
+    if !safe {
+        return Ok(());
+    }
+    let short = git_ro(["rev-parse", "--short", "HEAD"].as_slice())?
+        .trim()
+        .to_string();
+    let backup = format!("backup/restack/{}-{}", current_branch, short);
+    info!("Creating backup branch at HEAD: {}", backup);
+    let _ = git_rw(dry, ["branch", &backup, "HEAD"].as_slice())?;
+    Ok(())
+}
+
 /// Restack the local stack by rebasing all commits after the first `after` PRs onto `base`.
 ///
 /// How it works:
@@ -22,12 +41,19 @@ pub fn restack_after(base: &str, after: usize, safe: bool, dry: bool) -> Result<
         info!("No local PR groups found; nothing to restack.");
         return Ok(());
     }
-    if after >= groups.len() {
+    let cur_branch = get_current_branch()?;
+    // Clamp 'after' to the number of groups; if equal, there is nothing to move
+    let after = std::cmp::min(after, groups.len());
+    if after == groups.len() {
+        // Nothing to move; sync current branch to base
+        create_backup_if_safe(safe, dry, &cur_branch)?;
         info!(
-            "after={} >= {} group(s); nothing to restack.",
-            after,
-            groups.len()
+            "Skipping all {} PR(s); syncing current branch {} to {}",
+            groups.len(),
+            cur_branch,
+            base
         );
+        let _ = git_rw(dry, ["reset", "--hard", base].as_slice())?;
         return Ok(());
     }
 
@@ -44,18 +70,8 @@ pub fn restack_after(base: &str, after: usize, safe: bool, dry: bool) -> Result<
         }
     };
 
-    let cur_branch = git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    if safe {
-        // Create a local backup branch pointing to current HEAD before rebasing
-        let short = git_ro(["rev-parse", "--short", "HEAD"].as_slice())?
-            .trim()
-            .to_string();
-        let backup = format!("backup/restack/{}-{}", cur_branch, short);
-        info!("Creating backup branch at HEAD: {}", backup);
-        let _ = git_rw(dry, ["branch", &backup, "HEAD"].as_slice())?;
-    }
+    // Create a local backup branch pointing to current HEAD before rebasing
+    create_backup_if_safe(safe, dry, &cur_branch)?;
     info!(
         "Rebasing commits after first {} PR(s) of {} onto {} (upstream = {})",
         after, cur_branch, base, upstream
