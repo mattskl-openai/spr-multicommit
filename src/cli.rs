@@ -57,9 +57,9 @@ pub enum Cmd {
 
     /// Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base
     Restack {
-        /// Ignore the bottom N PRs; rebase the remaining commits onto base
-        #[arg(long, value_name = "N")]
-        after: usize,
+        /// Ignore the bottom N PRs; rebase the remaining commits onto base. Accepts a number, or keywords: bottom|top|last
+        #[arg(long, value_name = "N|bottom|top|last")]
+        after: String,
 
         /// Create a local backup branch at current HEAD before rebasing
         #[arg(long)]
