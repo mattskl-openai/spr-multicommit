@@ -73,7 +73,7 @@ pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiRev
         String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
     for (i, n) in numbers.iter().enumerate() {
         q.push_str(&format!(
-            "pr{}: pullRequest(number: {}) {{ reviewDecision commits(last:1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} ",
+            "pr{}: pullRequest(number: {}) {{ reviewDecision isDraft reviewRequests(first:1){{ totalCount }} reviews(last:50, states:[APPROVED,CHANGES_REQUESTED]){{ nodes {{ state }} }} commits(last:1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} ",
             i, n
         ));
     }
@@ -95,9 +95,9 @@ pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiRev
     let repo = &v["data"]["repository"];
     for (i, n) in numbers.iter().enumerate() {
         let key = format!("pr{}", i);
-        let review = repo[&key]["reviewDecision"]
+        let mut review = repo[&key]["reviewDecision"]
             .as_str()
-            .unwrap_or("UNKNOWN")
+            .unwrap_or("")
             .to_string();
         // Default when missing
         let mut ci = String::from("UNKNOWN");
@@ -108,6 +108,36 @@ pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiRev
                 }
             }
         }
+        if review.is_empty() {
+            // Fallback heuristic when reviewDecision is not available (e.g., no protected branch rules)
+            let mut has_changes_requested = false;
+            let mut has_approved = false;
+            if let Some(nodes) = repo[&key]["reviews"]["nodes"].as_array() {
+                for node in nodes {
+                    match node["state"].as_str().unwrap_or("") {
+                        "CHANGES_REQUESTED" => has_changes_requested = true,
+                        "APPROVED" => has_approved = true,
+                        _ => {}
+                    }
+                }
+            }
+            if has_changes_requested {
+                review = "CHANGES_REQUESTED".to_string();
+            } else if has_approved {
+                review = "APPROVED".to_string();
+            } else {
+                let is_draft = repo[&key]["isDraft"].as_bool().unwrap_or(false);
+                let req_cnt = repo[&key]["reviewRequests"]["totalCount"]
+                    .as_u64()
+                    .unwrap_or(0);
+                if is_draft || req_cnt > 0 {
+                    review = "REVIEW_REQUIRED".to_string();
+                } else {
+                    review = "REVIEW_REQUIRED".to_string();
+                }
+            }
+        }
+
         out.insert(
             *n,
             PrCiReviewStatus {
