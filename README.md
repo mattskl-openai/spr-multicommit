@@ -155,6 +155,27 @@ Behavior:
 - Pushes branches (respects `--dry-run`)
 - Adds a warning to the next PR not included in the push
 
+### spr cleanup (alias: clean)
+
+Delete remote branches that match your configured `--prefix` and have no open PRs.
+
+Behavior:
+
+- Lists remote branches once and filters by `prefix`
+- Batches GitHub lookups for open PRs
+- Deletes all eligible branches in a single `git push --delete` call
+- Respects `--dry-run`
+
+Examples:
+
+```bash
+# Preview what would be deleted
+spr cleanup --dry-run
+
+# Delete branches safely (no open PRs on any of them)
+spr cleanup
+```
+
 ### spr fix-stack
 
 Fix PR stack connectivity to match the local commit stack.

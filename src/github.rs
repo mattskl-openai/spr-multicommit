@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
 use crate::git::{gh_ro, gh_rw, git_ro};
@@ -232,6 +232,35 @@ pub fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
         warn!("No open PRs with head starting with `{}` found.", prefix);
     }
     Ok(out)
+}
+
+/// List PRs for a given head branch across all states
+/// Return the set of branch names (head refs) that currently have an OPEN PR
+pub fn list_open_pr_heads() -> Result<HashSet<String>> {
+    let json = gh_ro(
+        [
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "200",
+            "--json",
+            "headRefName",
+        ]
+        .as_slice(),
+    )?;
+    #[derive(Deserialize)]
+    struct Raw {
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+    }
+    let raws: Vec<Raw> = serde_json::from_str(&json)?;
+    let mut set = HashSet::new();
+    for r in raws {
+        set.insert(r.head_ref_name);
+    }
+    Ok(set)
 }
 
 /// Creates a new pull request for the given branch and parent if one does not already exist,

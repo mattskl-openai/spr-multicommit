@@ -175,3 +175,22 @@ pub fn git_is_ancestor(ancestor: &str, descendant: &str) -> Result<bool> {
         .with_context(|| "failed to run git merge-base --is-ancestor")?;
     Ok(status.success())
 }
+
+pub fn list_remote_branches_with_prefix(prefix: &str) -> Result<Vec<String>> {
+    // List all remote heads and filter by prefix
+    let out = git_ro(["ls-remote", "--heads", "origin"].as_slice())?;
+    let mut names: Vec<String> = vec![];
+    for line in out.lines() {
+        let mut parts = line.split_whitespace();
+        let _sha = parts.next().unwrap_or("").trim();
+        let r = parts.next().unwrap_or("").trim();
+        if r.is_empty() {
+            continue;
+        }
+        let name = r.strip_prefix("refs/heads/").unwrap_or(r).to_string();
+        if name.starts_with(prefix) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
