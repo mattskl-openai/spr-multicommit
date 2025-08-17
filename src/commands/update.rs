@@ -1,13 +1,15 @@
 use anyhow::{anyhow, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::info;
 
-use crate::git::{
-    get_remote_branches_sha, gh_rw, git_is_ancestor, git_ro, git_rw, sanitize_gh_base_ref,
+use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
+use crate::github::{
+    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_spr_prs, upsert_pr_cached,
 };
-use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached};
 use crate::limit::{apply_limit_groups, Limit};
-use crate::parsing::{parse_groups, Group};
+use crate::parsing::{derive_groups_between, Group};
 
 /// Bootstrap/refresh stack from pr:<tag> markers on `from` vs merge-base(base, from).
 pub fn build_from_tags(
@@ -19,19 +21,7 @@ pub fn build_from_tags(
     _update_pr_body: bool,
     limit: Option<Limit>,
 ) -> Result<()> {
-    let merge_base = git_ro(["merge-base", base, from].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{merge_base}..{from}"),
-        ]
-        .as_slice(),
-    )?;
-    let mut groups: Vec<Group> = parse_groups(&lines)?;
+    let (_merge_base, mut groups): (String, Vec<Group>) = derive_groups_between(base, from)?;
 
     if groups.is_empty() {
         info!("No groups discovered; nothing to do.");
@@ -42,30 +32,30 @@ pub fn build_from_tags(
     groups = apply_limit_groups(groups, limit)?;
     let total_groups = groups.len();
 
-    info!(
-        "Preparing {} group(s): {}",
-        groups.len(),
-        groups
-            .iter()
-            .map(|g| g.tag.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    info!("Preparing {} group(s)…", groups.len());
 
     // Build bottom→top and collect PR refs for the visual update pass.
     let mut just_created_numbers: Vec<u64> = vec![];
     // Prefetch open PRs to reduce per-branch lookups
-    let mut prs_by_head: HashMap<String, u64> = list_spr_prs(prefix)?
-        .into_iter()
-        .map(|p| (p.head, p.number))
-        .collect();
+    let pr_list = list_spr_prs(prefix)?;
+    let mut prs_by_head: HashMap<String, u64> = HashMap::new();
+    let mut current_base_by_number: HashMap<u64, String> = HashMap::new();
+    for p in pr_list {
+        prs_by_head.insert(p.head.clone(), p.number);
+        current_base_by_number.insert(p.number, p.base);
+    }
     // Allow force-push within the selected scope when branch diverged from remote
 
     // Batch fetch remote SHAs for all target branches
-    let branch_names: Vec<String> = groups
+    let mut branch_names: Vec<String> = groups
         .iter()
         .map(|g| format!("{}{}", prefix, g.tag))
         .collect();
+    // Ensure we also include the repository base branch for remote SHA comparisons
+    let base_ref_for_remote = sanitize_gh_base_ref(base);
+    if !branch_names.contains(&base_ref_for_remote) {
+        branch_names.push(base_ref_for_remote);
+    }
     let remote_map = get_remote_branches_sha(&branch_names)?; // branch -> sha
 
     // Stage push actions to batch git push calls
@@ -99,14 +89,12 @@ pub fn build_from_tags(
             .cloned()
             .ok_or_else(|| anyhow!("Group {} has no commits", g.tag))?;
         let kind = if remote_head.as_deref() == Some(target_sha.as_str()) {
-            info!("No changes for {}; skipping push", branch);
             PushKind::Skip
         } else if let Some(ref remote_sha) = remote_head {
             let ff_ok = git_is_ancestor(remote_sha, &target_sha)?;
             if ff_ok {
                 PushKind::FastForward
             } else {
-                info!("Diverged: forcing update for {}", branch);
                 PushKind::Force
             }
         } else {
@@ -120,6 +108,107 @@ pub fn build_from_tags(
         });
     }
 
+    // Before pushing: If not all PRs are already chained correctly, temporarily set all existing PRs to the repo base
+    if !no_pr {
+        // Gather existing PR numbers and head branches in the local stack order (bottom→top)
+        let mut numbers_full_pre: Vec<u64> = vec![];
+        let mut head_by_number_pre: HashMap<u64, String> = HashMap::new();
+        for g in &groups {
+            let head_branch = format!("{}{}", prefix, g.tag);
+            if let Some(&n) = prs_by_head.get(&head_branch) {
+                numbers_full_pre.push(n);
+                head_by_number_pre.insert(n, head_branch.clone());
+            }
+        }
+        if !numbers_full_pre.is_empty() {
+            // Compute desired chained base per existing PR
+            let mut desired_base_by_number_pre: HashMap<u64, String> = HashMap::new();
+            let mut want_base_ref_pre = sanitize_gh_base_ref(base);
+            for g in groups.iter() {
+                let head_branch = format!("{}{}", prefix, g.tag);
+                if let Some(&num) = prs_by_head.get(&head_branch) {
+                    desired_base_by_number_pre.insert(num, want_base_ref_pre.clone());
+                    want_base_ref_pre = head_branch;
+                } else {
+                    want_base_ref_pre = head_branch;
+                }
+            }
+
+            // Check if all existing PRs already point to correct base
+            let mut all_correct = true;
+            for (num, want_base) in &desired_base_by_number_pre {
+                let want_base_s = sanitize_gh_base_ref(want_base);
+                if current_base_by_number
+                    .get(num)
+                    .map(|b| sanitize_gh_base_ref(b) != want_base_s)
+                    .unwrap_or(true)
+                {
+                    all_correct = false;
+                    break;
+                }
+            }
+
+            if !all_correct {
+                // Temporarily set base of all existing PRs to the repo base (e.g., main)
+                let bodies_by_number_pre = fetch_pr_bodies_graphql(&numbers_full_pre)?;
+                let mut m = String::from("mutation {");
+                let mut update_count = 0usize;
+                for (num, info) in bodies_by_number_pre.iter() {
+                    // Skip if already on base
+                    let base_target = sanitize_gh_base_ref(base);
+                    if current_base_by_number
+                        .get(num)
+                        .map(|b| sanitize_gh_base_ref(b) == base_target)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    // Avoid GitHub error when base/head are identical on remote (no new commits)
+                    let mut shas_equal = false;
+                    if let Some(head_branch) = head_by_number_pre.get(num) {
+                        if let (Some(head_sha), Some(base_sha)) =
+                            (remote_map.get(head_branch), remote_map.get(&base_target))
+                        {
+                            if head_sha == base_sha {
+                                shas_equal = true;
+                            }
+                        }
+                    }
+                    if shas_equal {
+                        continue;
+                    }
+                    let fields = vec![
+                        format!("pullRequestId:\"{}\"", info.id),
+                        format!("baseRefName:\"{}\"", graphql_escape(&base_target)),
+                    ];
+                    m.push_str(&format!(
+                        "m{}: updatePullRequest(input:{{{}}}){{ clientMutationId }} ",
+                        update_count,
+                        fields.join(", ")
+                    ));
+                    update_count += 1;
+                }
+                m.push('}');
+                if update_count > 0 {
+                    let pb = ProgressBar::new_spinner();
+                    pb.set_style(
+                        ProgressStyle::with_template("{spinner} Updating {pos} PR(s)…")
+                            .unwrap()
+                            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                    );
+                    pb.set_position(update_count as u64);
+                    pb.enable_steady_tick(Duration::from_millis(120));
+                    let res = gh_rw(
+                        dry,
+                        ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
+                    );
+                    pb.finish_and_clear();
+                    res?;
+                }
+            }
+        }
+    }
+
     // Execute batched pushes: first fast-forward, then force-with-lease
     let ff_refspecs: Vec<String> = planned
         .iter()
@@ -131,7 +220,17 @@ pub fn build_from_tags(
         let mut argv: Vec<String> = vec!["push".into(), "origin".into()];
         argv.extend(ff_refspecs.clone());
         let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        git_rw(dry, &args)?;
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner} Pushing {pos} branch(es) (-ff)…")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        pb.set_position(ff_refspecs.len() as u64);
+        pb.enable_steady_tick(Duration::from_millis(120));
+        let res = git_rw(dry, &args);
+        pb.finish_and_clear();
+        res?;
     }
     // Perform force-with-lease for diverged branches in scope
     let force_refspecs: Vec<String> = planned
@@ -144,7 +243,17 @@ pub fn build_from_tags(
             vec!["push".into(), "--force-with-lease".into(), "origin".into()];
         argv.extend(force_refspecs.clone());
         let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        git_rw(dry, &args)?;
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner} Pushing {pos} branch(es) (-force-with-lease)…")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        pb.set_position(force_refspecs.len() as u64);
+        pb.enable_steady_tick(Duration::from_millis(120));
+        let res = git_rw(dry, &args);
+        pb.finish_and_clear();
+        res?;
     }
 
     // After pushes, (create or) update PRs
@@ -188,9 +297,12 @@ pub fn build_from_tags(
                 // Stack visual (optional rewrite)
                 let base = g.pr_body_base()?;
                 let mut lines = String::new();
-                let em_space = "\u{2003}"; // U+2003 EM SPACE for indentation
                 for n in &numbers_rev {
-                    let marker = if *n == num { "➡" } else { em_space };
+                    let marker = if *n == num {
+                        "➡"
+                    } else {
+                        crate::format::EM_SPACE
+                    };
                     lines.push_str(&format!("- {} #{}\n", marker, n));
                 }
                 let stack_block = format!(
@@ -203,13 +315,12 @@ pub fn build_from_tags(
                     format!("{}\n\n{}", base, stack_block)
                 };
                 desired_by_number.insert(num, body);
-                // Base linkage (always set according to local stack)
                 desired_base_by_number.insert(num, want_base_ref.clone());
                 want_base_ref = head_branch;
             }
         }
 
-        // Fetch PR ids/bodies for union of all PRs in local stack (for base) and those we may rewrite bodies for
+        // Fetch PR ids/bodies for union of all PRs we may rewrite bodies for
         let mut fetch_set: std::collections::HashSet<u64> = numbers_full.iter().cloned().collect();
         for &n in desired_by_number.keys() {
             fetch_set.insert(n);
@@ -237,7 +348,7 @@ pub fn build_from_tags(
                 entry.body = Some(desired.clone());
             }
         }
-        // Bases
+        // Bases: set post-push to ensure final linkage
         for (&num, want_base) in &desired_base_by_number {
             if let Some(info) = bodies_by_number.get(&num) {
                 let entry = update_specs.entry(num).or_insert(UpdateSpec {
@@ -249,11 +360,8 @@ pub fn build_from_tags(
             }
         }
         if !update_specs.is_empty() {
-            info!(
-                "Updating {} PR(s) on GitHub (bodies and/or base refs)... this might take a few seconds.",
-                update_specs.len()
-            );
             let mut m = String::from("mutation {");
+            let total_updates = update_specs.len();
             for (i, (_num, spec)) in update_specs.into_iter().enumerate() {
                 let mut fields: Vec<String> = vec![format!("pullRequestId:\"{}\"", spec.id)];
                 if let Some(b) = spec.body {
@@ -269,12 +377,44 @@ pub fn build_from_tags(
                 ));
             }
             m.push('}');
-            gh_rw(
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template("{spinner} Updating {pos} PR(s)…")
+                    .unwrap()
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            pb.set_position(total_updates as u64);
+            pb.enable_steady_tick(Duration::from_millis(120));
+            let res = gh_rw(
                 dry,
                 ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
-            )?;
+            );
+            pb.finish_and_clear();
+            res?;
         } else {
             info!("All PR descriptions/base refs up-to-date; no edits needed");
+        }
+    }
+
+    // Print full stack PR list in bottom→top order: "- <url> - <title>"
+    if !no_pr {
+        let mut ordered: Vec<(u64, String)> = vec![];
+        for g in &groups {
+            let head_branch = format!("{}{}", prefix, g.tag);
+            if let Some(&n) = prs_by_head.get(&head_branch) {
+                // Use local group title (source of truth for desired title)
+                let title = g.pr_title().unwrap_or_else(|_| String::new());
+                ordered.push((n, title));
+            }
+        }
+        if !ordered.is_empty() {
+            if let Ok((owner, name)) = get_repo_owner_name() {
+                info!("PRs:");
+                for (n, title) in ordered {
+                    let url = format!("https://github.com/{}/{}/pull/{}", owner, name, n);
+                    info!("  {} - {}", url, title);
+                }
+            }
         }
     }
 

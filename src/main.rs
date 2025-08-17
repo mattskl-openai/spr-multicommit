@@ -4,6 +4,7 @@ use clap::Parser;
 mod cli;
 mod commands;
 mod config;
+mod format;
 mod git;
 mod github;
 mod limit;
@@ -135,7 +136,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        crate::cli::Cmd::Land { which } => {
+        crate::cli::Cmd::Land { which, r#unsafe } => {
             set_dry_run_env(cli.dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             let mode = which
@@ -148,12 +149,20 @@ fn main() -> Result<()> {
                 .unwrap_or(crate::cli::LandCmd::Flatten);
             let until = cli.until.unwrap_or(0);
             match mode {
-                crate::cli::LandCmd::Flatten => {
-                    crate::commands::land_flatten_until(&base, &prefix, until, cli.dry_run)?
-                }
-                crate::cli::LandCmd::PerPr => {
-                    crate::commands::land_per_pr_until(&base, &prefix, until, cli.dry_run)?
-                }
+                crate::cli::LandCmd::Flatten => crate::commands::land_flatten_until(
+                    &base,
+                    &prefix,
+                    until,
+                    cli.dry_run,
+                    r#unsafe,
+                )?,
+                crate::cli::LandCmd::PerPr => crate::commands::land_per_pr_until(
+                    &base,
+                    &prefix,
+                    until,
+                    cli.dry_run,
+                    r#unsafe,
+                )?,
             }
         }
         crate::cli::Cmd::FixStack {} => {

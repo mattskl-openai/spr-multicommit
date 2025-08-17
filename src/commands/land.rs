@@ -1,38 +1,43 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use tracing::warn;
 
 use crate::cli::LandCmd;
-use crate::git::{
-    gh_rw, git_ro, git_rw, normalize_branch_name, sanitize_gh_base_ref, to_remote_ref,
+use crate::git::{gh_rw, git_ro, git_rw, sanitize_gh_base_ref, to_remote_ref};
+use crate::github::{
+    fetch_pr_bodies_graphql, fetch_pr_ci_review_status, graphql_escape, list_spr_prs,
 };
-use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs};
+use crate::parsing::derive_local_groups;
 
-pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) -> Result<()> {
-    let base_n = normalize_branch_name(base);
+pub fn land_until(
+    base: &str,
+    prefix: &str,
+    n: usize,
+    dry: bool,
+    mode: LandCmd,
+    bypass_safety: bool,
+) -> Result<()> {
+    // Local stack is the source of truth: derive order from local groups
+    let (_merge_base, groups) = derive_local_groups(base)?;
+    if groups.is_empty() {
+        bail!("No local groups found; nothing to land.");
+    }
     let prs = list_spr_prs(prefix)?;
     if prs.is_empty() {
         bail!("No open PRs with head starting with `{prefix}`.");
     }
-    let root = prs
-        .iter()
-        .find(|p| p.base == base_n)
-        .ok_or_else(|| anyhow!("No root PR with base `{}`", base_n))?;
-
-    // Build ordered chain bottom-up
     let mut ordered: Vec<&crate::github::PrInfo> = vec![];
-    let mut cur = root;
-    loop {
-        ordered.push(cur);
-        if let Some(next) = prs.iter().find(|p| p.base == cur.head) {
-            cur = next;
+    for g in &groups {
+        let head_branch = format!("{}{}", prefix, g.tag);
+        if let Some(pr) = prs.iter().find(|p| p.head == head_branch) {
+            ordered.push(pr);
         } else {
-            break;
+            bail!(
+                "No open PR found for local group '{}' (branch '{}')",
+                g.tag,
+                head_branch
+            );
         }
     }
-    if ordered.is_empty() {
-        bail!("No PR chain found");
-    }
-
     let take_n = if n == 0 {
         ordered.len()
     } else {
@@ -40,13 +45,67 @@ pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) 
     };
     let segment = &ordered[..take_n];
 
+    // Safety validation: CI and Reviews must be passing/approved for all PRs being landed
+    let numbers: Vec<u64> = segment.iter().map(|p| p.number).collect();
+    if !numbers.is_empty() {
+        if let Ok(status_map) = fetch_pr_ci_review_status(&numbers) {
+            let mut ci_bad: Vec<u64> = vec![];
+            let mut rv_bad: Vec<u64> = vec![];
+            for n in &numbers {
+                if let Some(st) = status_map.get(n) {
+                    if st.ci_state.as_str() != "SUCCESS" {
+                        ci_bad.push(*n);
+                    }
+                    if st.review_decision.as_str() != "APPROVED" {
+                        rv_bad.push(*n);
+                    }
+                } else {
+                    // Unknown status → treat as failing both
+                    ci_bad.push(*n);
+                    rv_bad.push(*n);
+                }
+            }
+            if !ci_bad.is_empty() || !rv_bad.is_empty() {
+                let ci_str = if ci_bad.is_empty() {
+                    String::from("none")
+                } else {
+                    ci_bad
+                        .iter()
+                        .map(|x| format!("#{}", x))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let rv_str = if rv_bad.is_empty() {
+                    String::from("none")
+                } else {
+                    rv_bad
+                        .iter()
+                        .map(|x| format!("#{}", x))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if bypass_safety {
+                    warn!(
+                        "Bypassing safety checks (--unsafe). CI not passing: {}; Reviews not approved: {}",
+                        ci_str, rv_str
+                    );
+                } else {
+                    bail!(
+                        "Refusing to land: CI not passing: {}; Reviews not approved: {}. Use --unsafe to override.",
+                        ci_str, rv_str
+                    );
+                }
+            }
+        }
+    }
+
     if let LandCmd::PerPr = mode {
         // Verify each has exactly one unique commit over its parent
         git_rw(dry, ["fetch", "origin"].as_slice())?; // ensure remotes up to date
         let mut offenders: Vec<u64> = vec![];
         for (i, pr) in segment.iter().enumerate() {
             let parent = if i == 0 {
-                base_n.clone()
+                base.to_string()
             } else {
                 segment[i - 1].head.clone()
             };
@@ -151,11 +210,23 @@ pub fn land_until(base: &str, prefix: &str, n: usize, dry: bool, mode: LandCmd) 
 
 /// Per-PR: land N PRs bottom-up, each PR as its own commit using rebase merge.
 /// Each PR must have exactly one commit over its parent.
-pub fn land_per_pr_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
-    land_until(base, prefix, n, dry, LandCmd::PerPr)
+pub fn land_per_pr_until(
+    base: &str,
+    prefix: &str,
+    n: usize,
+    dry: bool,
+    bypass_safety: bool,
+) -> Result<()> {
+    land_until(base, prefix, n, dry, LandCmd::PerPr, bypass_safety)
 }
 
 /// Flatten: behave like per-pr landing but squash-merge the Nth PR and set its base to the actual base.
-pub fn land_flatten_until(base: &str, prefix: &str, n: usize, dry: bool) -> Result<()> {
-    land_until(base, prefix, n, dry, LandCmd::Flatten)
+pub fn land_flatten_until(
+    base: &str,
+    prefix: &str,
+    n: usize,
+    dry: bool,
+    bypass_safety: bool,
+) -> Result<()> {
+    land_until(base, prefix, n, dry, LandCmd::Flatten, bypass_safety)
 }

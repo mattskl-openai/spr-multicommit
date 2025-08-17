@@ -4,7 +4,7 @@ use tracing::info;
 use crate::git::{git_ro, git_rw};
 use crate::github::{append_warning_to_pr, list_spr_prs};
 use crate::limit::Limit;
-use crate::parsing::parse_groups;
+use crate::parsing::derive_local_groups;
 
 /// Squash PRs according to selection; operate locally then run update for the affected groups.
 pub fn prep_squash(
@@ -14,19 +14,7 @@ pub fn prep_squash(
     dry: bool,
 ) -> Result<()> {
     // Work purely on local commit stack: build groups from base..HEAD
-    let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{}..HEAD", merge_base),
-        ]
-        .as_slice(),
-    )?;
-    let groups = parse_groups(&lines)?;
+    let (merge_base, groups) = derive_local_groups(base)?;
     if groups.is_empty() {
         info!("Nothing to prep");
         return Ok(());

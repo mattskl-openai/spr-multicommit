@@ -1,32 +1,31 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::git::git_ro;
-use crate::github::list_spr_prs;
-use crate::parsing::parse_groups;
+use crate::github::{fetch_pr_ci_review_status, list_spr_prs};
+use crate::parsing::derive_local_groups;
 
 pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
     // Derive stack from local commits (source of truth)
-    let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{}..HEAD", merge_base),
-        ]
-        .as_slice(),
-    )?;
-    let groups = parse_groups(&lines)?;
+    let (_merge_base, groups) = derive_local_groups(base)?;
     if groups.is_empty() {
         info!("No groups discovered; nothing to list.");
         return Ok(());
     }
 
-    // Fetch PRs to annotate with numbers when available
+    // Fetch PRs to annotate with numbers and statuses when available
     let prs = list_spr_prs(prefix)?; // may be empty; that's fine
+    let mut status_map: std::collections::HashMap<u64, crate::github::PrCiReviewStatus> =
+        std::collections::HashMap::new();
+    if !prs.is_empty() {
+        let numbers: Vec<u64> = prs.iter().map(|p| p.number).collect();
+        if let Ok(m) = fetch_pr_ci_review_status(&numbers) {
+            status_map = m;
+        }
+    }
+
+    // Header showing columns for CI and Review status
+    info!("┏━━{}CI status", crate::format::EM_SPACE);
+    info!("┃┏━{}review status", crate::format::EM_SPACE);
 
     for (i, g) in groups.iter().enumerate() {
         let head_branch = format!("{}{}", prefix, g.tag);
@@ -43,8 +42,32 @@ pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
             Some(n) => format!(" (#{})", n),
             None => "".to_string(),
         };
+        // Status icons
+        let (ci_icon, rv_icon) = if let Some(n) = num {
+            if let Some(st) = status_map.get(&n) {
+                let ci_icon = match st.ci_state.as_str() {
+                    "SUCCESS" => "✓",
+                    "FAILURE" | "ERROR" => "✗",
+                    "PENDING" | "EXPECTED" => "◐",
+                    _ => "?",
+                };
+                let rv_icon = match st.review_decision.as_str() {
+                    "APPROVED" => "✓",
+                    "CHANGES_REQUESTED" => "✗",
+                    "REVIEW_REQUIRED" => "◐",
+                    _ => "?",
+                };
+                (ci_icon, rv_icon)
+            } else {
+                ("?", "?")
+            }
+        } else {
+            ("?", "?")
+        };
         info!(
-            "LPR #{} - {} : {}{} - {} {}",
+            "{}{} LPR #{} - {} : {}{} - {} {}",
+            ci_icon,
+            rv_icon,
             i + 1,
             short,
             head_branch,
@@ -53,26 +76,18 @@ pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
             plural
         );
         let first_subject = g.subjects.first().map(|s| s.as_str()).unwrap_or("");
-        info!("  {}", first_subject);
+        info!(
+            "{s}{s}{s}{s}{s}{subject}",
+            s = crate::format::EM_SPACE,
+            subject = first_subject
+        );
     }
     Ok(())
 }
 
 pub fn list_commits_display(base: &str, prefix: &str) -> Result<()> {
     // Derive stack from local commits (source of truth)
-    let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{}..HEAD", merge_base),
-        ]
-        .as_slice(),
-    )?;
-    let groups = parse_groups(&lines)?;
+    let (_merge_base, groups) = derive_local_groups(base)?;
     if groups.is_empty() {
         info!("No groups discovered; nothing to list.");
         return Ok(());

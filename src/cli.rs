@@ -83,6 +83,9 @@ pub enum Cmd {
         // Target PR index is provided via global --until. For `flatten`, 0 means the top PR. For `per-pr`, 0 means all
         #[command(subcommand)]
         which: Option<LandCmd>,
+        /// Allow bypassing safety validations (CI/review checks)
+        #[arg(long = "unsafe")]
+        r#unsafe: bool,
     },
 
     /// Fix PR stack connectivity to match local commit stack

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use tracing::info;
 
 use crate::git::{git_ro, git_rw};
-use crate::parsing::parse_groups;
+use crate::parsing::derive_local_groups;
 
 fn parse_range(input: &str) -> Result<(usize, usize)> {
     if let Some(dots) = input.find("..") {
@@ -46,19 +46,7 @@ pub fn move_groups_after(
     dry: bool,
 ) -> Result<()> {
     // Discover groups from local commits bottom→top
-    let merge_base = git_ro(["merge-base", base, "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let lines = git_ro(
-        [
-            "log",
-            "--format=%H%x00%B%x1e",
-            "--reverse",
-            &format!("{}..HEAD", merge_base),
-        ]
-        .as_slice(),
-    )?;
-    let groups = parse_groups(&lines)?;
+    let (merge_base, groups) = derive_local_groups(base)?;
     let n = groups.len();
     if n == 0 {
         info!("No local PR groups found; nothing to move.");
