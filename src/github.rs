@@ -99,8 +99,8 @@ pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiRev
             .as_str()
             .unwrap_or("")
             .to_string();
-        // Default when missing
-        let mut ci = String::from("UNKNOWN");
+        // Default when missing (no CI configured) → treat as passing
+        let mut ci = String::from("SUCCESS");
         if let Some(nodes) = repo[&key]["commits"]["nodes"].as_array() {
             if let Some(node) = nodes.first() {
                 if let Some(state) = node["commit"]["statusCheckRollup"]["state"].as_str() {
