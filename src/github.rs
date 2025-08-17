@@ -57,6 +57,68 @@ pub fn fetch_pr_bodies_graphql(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInf
     Ok(out)
 }
 
+#[derive(Clone)]
+pub struct PrCiReviewStatus {
+    pub ci_state: String, // SUCCESS | FAILURE | ERROR | PENDING | EXPECTED | UNKNOWN
+    pub review_decision: String, // APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | UNKNOWN
+}
+
+pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiReviewStatus>> {
+    let mut out = HashMap::new();
+    if numbers.is_empty() {
+        return Ok(out);
+    }
+    let (owner, name) = get_repo_owner_name()?;
+    let mut q =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (i, n) in numbers.iter().enumerate() {
+        q.push_str(&format!(
+            "pr{}: pullRequest(number: {}) {{ reviewDecision commits(last:1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} ",
+            i, n
+        ));
+    }
+    q.push_str("} }");
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", q),
+            "-F",
+            &format!("owner={}", owner),
+            "-F",
+            &format!("name={}", name),
+        ]
+        .as_slice(),
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &v["data"]["repository"];
+    for (i, n) in numbers.iter().enumerate() {
+        let key = format!("pr{}", i);
+        let review = repo[&key]["reviewDecision"]
+            .as_str()
+            .unwrap_or("UNKNOWN")
+            .to_string();
+        // Default when missing
+        let mut ci = String::from("UNKNOWN");
+        if let Some(nodes) = repo[&key]["commits"]["nodes"].as_array() {
+            if let Some(node) = nodes.first() {
+                if let Some(state) = node["commit"]["statusCheckRollup"]["state"].as_str() {
+                    ci = state.to_string();
+                }
+            }
+        }
+        out.insert(
+            *n,
+            PrCiReviewStatus {
+                ci_state: ci,
+                review_decision: review,
+            },
+        );
+    }
+    Ok(out)
+}
+
 pub fn get_repo_owner_name() -> Result<(String, String)> {
     let url = git_ro(["config", "--get", "remote.origin.url"].as_slice())?
         .trim()

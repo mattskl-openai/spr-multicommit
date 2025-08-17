@@ -297,9 +297,12 @@ pub fn build_from_tags(
                 // Stack visual (optional rewrite)
                 let base = g.pr_body_base()?;
                 let mut lines = String::new();
-                let em_space = "\u{2003}"; // U+2003 EM SPACE for indentation
                 for n in &numbers_rev {
-                    let marker = if *n == num { "➡" } else { em_space };
+                    let marker = if *n == num {
+                        "➡"
+                    } else {
+                        crate::format::EM_SPACE
+                    };
                     lines.push_str(&format!("- {} #{}\n", marker, n));
                 }
                 let stack_block = format!(

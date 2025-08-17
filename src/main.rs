@@ -4,6 +4,7 @@ use clap::Parser;
 mod cli;
 mod commands;
 mod config;
+mod format;
 mod git;
 mod github;
 mod limit;
