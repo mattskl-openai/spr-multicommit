@@ -106,7 +106,17 @@ fn main() -> Result<()> {
         crate::cli::Cmd::Restack { after, safe } => {
             set_dry_run_env(cli.dry_run, false);
             let (base, _) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
-            crate::commands::restack_after(&base, after, safe, cli.dry_run)?;
+            let after_num: usize = match after.to_lowercase().as_str() {
+                "bottom" => 0,
+                "top" | "last" => usize::MAX,
+                s => s.parse::<usize>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid value for --after: {} (expected number or bottom|top|last)",
+                        s
+                    )
+                })?,
+            };
+            crate::commands::restack_after(&base, after_num, safe, cli.dry_run)?;
         }
         crate::cli::Cmd::Prep {} => {
             set_dry_run_env(cli.dry_run, false);

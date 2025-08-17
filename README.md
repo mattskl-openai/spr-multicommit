@@ -83,7 +83,9 @@ Restack the local stack by rebasing commits after the bottom N PR groups onto th
 
 Options:
 
-- `--after <N>`: 'drops' the first N PR groups; rebase the remaining commits onto `--base` (0 means restack all groups)
+- `--after <N|bottom|top|last>`: 'drop' the first N PR groups; rebase the remaining commits onto `--base`
+  - `0` or `bottom`: restack all groups (moves everything after merge-base)
+  - `top` or `last`: skip all PRs
  - `--safe`: create a local backup branch at current `HEAD` before rebasing
 
 Behavior:
