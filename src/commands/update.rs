@@ -5,7 +5,9 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
-use crate::github::{fetch_pr_bodies_graphql, graphql_escape, list_spr_prs, upsert_pr_cached};
+use crate::github::{
+    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_spr_prs, upsert_pr_cached,
+};
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{derive_groups_between, Group};
 
@@ -388,6 +390,28 @@ pub fn build_from_tags(
             res?;
         } else {
             info!("All PR descriptions/base refs up-to-date; no edits needed");
+        }
+    }
+
+    // Print full stack PR list in bottom→top order: "- <url> - <title>"
+    if !no_pr {
+        let mut ordered: Vec<(u64, String)> = vec![];
+        for g in &groups {
+            let head_branch = format!("{}{}", prefix, g.tag);
+            if let Some(&n) = prs_by_head.get(&head_branch) {
+                // Use local group title (source of truth for desired title)
+                let title = g.pr_title().unwrap_or_else(|_| String::new());
+                ordered.push((n, title));
+            }
+        }
+        if !ordered.is_empty() {
+            if let Ok((owner, name)) = get_repo_owner_name() {
+                info!("PRs:");
+                for (n, title) in ordered {
+                    let url = format!("https://github.com/{}/{}/pull/{}", owner, name, n);
+                    info!("  {} - {}", url, title);
+                }
+            }
         }
     }
 
