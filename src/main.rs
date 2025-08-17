@@ -108,7 +108,7 @@ fn main() -> Result<()> {
             let (base, _) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             let after_num: usize = match after.to_lowercase().as_str() {
                 "bottom" => 0,
-                "top" | "last" => usize::MAX,
+                "top" | "last" | "all" => usize::MAX,
                 s => s.parse::<usize>().map_err(|_| {
                     anyhow::anyhow!(
                         "Invalid value for --after: {} (expected number or bottom|top|last)",
