@@ -35,17 +35,25 @@ pub fn build_from_tags(
     // Build bottom→top and collect PR refs for the visual update pass.
     let mut just_created_numbers: Vec<u64> = vec![];
     // Prefetch open PRs to reduce per-branch lookups
-    let mut prs_by_head: HashMap<String, u64> = list_spr_prs(prefix)?
-        .into_iter()
-        .map(|p| (p.head, p.number))
-        .collect();
+    let pr_list = list_spr_prs(prefix)?;
+    let mut prs_by_head: HashMap<String, u64> = HashMap::new();
+    let mut current_base_by_number: HashMap<u64, String> = HashMap::new();
+    for p in pr_list {
+        prs_by_head.insert(p.head.clone(), p.number);
+        current_base_by_number.insert(p.number, p.base);
+    }
     // Allow force-push within the selected scope when branch diverged from remote
 
     // Batch fetch remote SHAs for all target branches
-    let branch_names: Vec<String> = groups
+    let mut branch_names: Vec<String> = groups
         .iter()
         .map(|g| format!("{}{}", prefix, g.tag))
         .collect();
+    // Ensure we also include the repository base branch for remote SHA comparisons
+    let base_ref_for_remote = sanitize_gh_base_ref(base);
+    if !branch_names.contains(&base_ref_for_remote) {
+        branch_names.push(base_ref_for_remote);
+    }
     let remote_map = get_remote_branches_sha(&branch_names)?; // branch -> sha
 
     // Stage push actions to batch git push calls
@@ -96,6 +104,107 @@ pub fn build_from_tags(
             target_sha: target_sha.clone(),
             kind,
         });
+    }
+
+    // Before pushing: If not all PRs are already chained correctly, temporarily set all existing PRs to the repo base
+    if !no_pr {
+        // Gather existing PR numbers and head branches in the local stack order (bottom→top)
+        let mut numbers_full_pre: Vec<u64> = vec![];
+        let mut head_by_number_pre: HashMap<u64, String> = HashMap::new();
+        for g in &groups {
+            let head_branch = format!("{}{}", prefix, g.tag);
+            if let Some(&n) = prs_by_head.get(&head_branch) {
+                numbers_full_pre.push(n);
+                head_by_number_pre.insert(n, head_branch.clone());
+            }
+        }
+        if !numbers_full_pre.is_empty() {
+            // Compute desired chained base per existing PR
+            let mut desired_base_by_number_pre: HashMap<u64, String> = HashMap::new();
+            let mut want_base_ref_pre = sanitize_gh_base_ref(base);
+            for g in groups.iter() {
+                let head_branch = format!("{}{}", prefix, g.tag);
+                if let Some(&num) = prs_by_head.get(&head_branch) {
+                    desired_base_by_number_pre.insert(num, want_base_ref_pre.clone());
+                    want_base_ref_pre = head_branch;
+                } else {
+                    want_base_ref_pre = head_branch;
+                }
+            }
+
+            // Check if all existing PRs already point to correct base
+            let mut all_correct = true;
+            for (num, want_base) in &desired_base_by_number_pre {
+                let want_base_s = sanitize_gh_base_ref(want_base);
+                if current_base_by_number
+                    .get(num)
+                    .map(|b| sanitize_gh_base_ref(b) != want_base_s)
+                    .unwrap_or(true)
+                {
+                    all_correct = false;
+                    break;
+                }
+            }
+
+            if !all_correct {
+                // Temporarily set base of all existing PRs to the repo base (e.g., main)
+                let bodies_by_number_pre = fetch_pr_bodies_graphql(&numbers_full_pre)?;
+                let mut m = String::from("mutation {");
+                let mut update_count = 0usize;
+                for (num, info) in bodies_by_number_pre.iter() {
+                    // Skip if already on base
+                    let base_target = sanitize_gh_base_ref(base);
+                    if current_base_by_number
+                        .get(num)
+                        .map(|b| sanitize_gh_base_ref(b) == base_target)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    // Avoid GitHub error when base/head are identical on remote (no new commits)
+                    let mut shas_equal = false;
+                    if let Some(head_branch) = head_by_number_pre.get(num) {
+                        if let (Some(head_sha), Some(base_sha)) =
+                            (remote_map.get(head_branch), remote_map.get(&base_target))
+                        {
+                            if head_sha == base_sha {
+                                shas_equal = true;
+                            }
+                        }
+                    }
+                    if shas_equal {
+                        continue;
+                    }
+                    let fields = vec![
+                        format!("pullRequestId:\"{}\"", info.id),
+                        format!("baseRefName:\"{}\"", graphql_escape(&base_target)),
+                    ];
+                    m.push_str(&format!(
+                        "m{}: updatePullRequest(input:{{{}}}){{ clientMutationId }} ",
+                        update_count,
+                        fields.join(", ")
+                    ));
+                    update_count += 1;
+                }
+                m.push('}');
+                if update_count > 0 {
+                    let pb = ProgressBar::new_spinner();
+                    pb.set_style(
+                        ProgressStyle::with_template("{spinner} Updating {pos} PR(s)…")
+                            .unwrap()
+                            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                    );
+                    pb.set_position(update_count as u64);
+                    pb.enable_steady_tick(Duration::from_millis(120));
+                    let res = gh_rw(
+                        dry,
+                        ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
+                    );
+                    pb.finish_and_clear();
+                    res?;
+                }
+            }
+        }
     }
 
     // Execute batched pushes: first fast-forward, then force-with-lease
@@ -201,13 +310,12 @@ pub fn build_from_tags(
                     format!("{}\n\n{}", base, stack_block)
                 };
                 desired_by_number.insert(num, body);
-                // Base linkage (always set according to local stack)
                 desired_base_by_number.insert(num, want_base_ref.clone());
                 want_base_ref = head_branch;
             }
         }
 
-        // Fetch PR ids/bodies for union of all PRs in local stack (for base) and those we may rewrite bodies for
+        // Fetch PR ids/bodies for union of all PRs we may rewrite bodies for
         let mut fetch_set: std::collections::HashSet<u64> = numbers_full.iter().cloned().collect();
         for &n in desired_by_number.keys() {
             fetch_set.insert(n);
@@ -235,7 +343,7 @@ pub fn build_from_tags(
                 entry.body = Some(desired.clone());
             }
         }
-        // Bases
+        // Bases: set post-push to ensure final linkage
         for (&num, want_base) in &desired_base_by_number {
             if let Some(info) = bodies_by_number.get(&num) {
                 let entry = update_specs.entry(num).or_insert(UpdateSpec {
