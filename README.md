@@ -85,6 +85,10 @@ Commands
 
 Build/refresh the stack from commit markers, or restack existing branches.
 
+Aliases:
+
+- `u`
+
 Key options:
 
 - `--from <REF>`: commit range upper bound when parsing tags (default `HEAD`) (untested)
@@ -124,19 +128,35 @@ Behavior:
 
 Lists PRs in the current stack (bottom → top) for the configured prefix.
 
+Aliases:
+
+- `p`
+
 Legend: CI ✓/✗/◐ and Review ✓/✗/◐ indicate passing/failing/pending states when available.
 
-### spr status (alias: stat)
+### spr status
+
+Aliases:
+
+- `stat`
 
 Alias for `spr list pr`.
 
-### spr list commit (alias: c)
+### spr list commit
 
 Lists commits in the current stack (bottom → top), grouped by local PR. Each group header shows the local PR number and branch (and remote PR number when available). Within each group, each line shows the bottom-up commit index (1-based) and the short SHA.
+
+Aliases:
+
+- `c`
 
 ### spr move
 
 Reorder local PR groups by moving one or a range to come after a target PR.
+
+Aliases:
+
+- `mv`
 
 - `spr move A --after C`: move PR at position A to come after PR C (C ∈ [0..N])
 - `spr move A..B --after C`: move PRs A..B to come after PR C (requires A < B and C ∉ [A..B]; C ∈ [0..N])
@@ -215,7 +235,11 @@ Behavior:
 - Rewrites local history to move the tail M commits after PR N’s tail commit
 - `--safe`: create a local backup branch at current `HEAD` before executing
 
-### spr cleanup (alias: clean)
+### spr cleanup
+
+Aliases:
+
+- `clean`
 
 Delete remote branches that match your configured `--prefix` and have no open PRs.
 
@@ -294,9 +318,3 @@ spr move 2..3 --after 4 --safe
 # Fix PR base chain on GitHub to reflect local stack
 spr relink-prs
 ```
-
-Aliases
--------
-
-- `spr update` (`u`), `spr list` (`ls`), `spr move` (`mv`), `spr cleanup` (`clean`)
-- `spr list pr` (`p`), `spr list commit` (`c`), `spr status` (`stat`) (same as `spr list pr`)
