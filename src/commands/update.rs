@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::info;
 
-use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::commands::common;
+use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
     fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_spr_prs, upsert_pr_cached,
 };
@@ -290,18 +290,29 @@ pub fn build_from_tags(
         for (head_branch, want_base_ref) in chain {
             if let Some(&num) = prs_by_head.get(&head_branch) {
                 // Stack visual (optional rewrite)
-                if let Some(g) = groups.iter().find(|g| format!("{}{}", prefix, g.tag) == head_branch) {
+                if let Some(g) = groups
+                    .iter()
+                    .find(|g| format!("{}{}", prefix, g.tag) == head_branch)
+                {
                     let base = g.pr_body_base()?;
                     let mut lines = String::new();
                     for n in &numbers_rev {
-                        let marker = if *n == num { "➡" } else { crate::format::EM_SPACE };
+                        let marker = if *n == num {
+                            "➡"
+                        } else {
+                            crate::format::EM_SPACE
+                        };
                         lines.push_str(&format!("- {} #{}\n", marker, n));
                     }
                     let stack_block = format!(
                         "<!-- spr-stack:start -->\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n<!-- spr-stack:end -->",
                         lines.trim_end(),
                     );
-                    let body = if base.trim().is_empty() { stack_block.clone() } else { format!("{}\n\n{}", base, stack_block) };
+                    let body = if base.trim().is_empty() {
+                        stack_block.clone()
+                    } else {
+                        format!("{}\n\n{}", base, stack_block)
+                    };
                     desired_by_number.insert(num, body);
                     desired_base_by_number.insert(num, want_base_ref.clone());
                 }
