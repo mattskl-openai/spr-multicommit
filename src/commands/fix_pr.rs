@@ -2,7 +2,8 @@ use anyhow::{anyhow, bail, Result};
 use regex::Regex;
 use tracing::info;
 
-use crate::git::{git_ro, git_rw};
+use crate::commands::common;
+use crate::git::git_ro;
 use crate::parsing::derive_local_groups;
 
 /// Move the last `tail_count` commits (top-of-stack) to become the tail of PR `n` (1-based, bottom→top).
@@ -82,57 +83,29 @@ pub fn fix_pr_tail(base: &str, n: usize, tail_count: usize, safe: bool, dry: boo
     }
 
     // Optionally create a backup branch at current HEAD (safety)
-    let cur_branch = git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let short = git_ro(["rev-parse", "--short", "HEAD"].as_slice())?
-        .trim()
-        .to_string();
+    let (cur_branch, short) = common::get_current_branch_and_short()?;
     if safe {
-        let backup = format!("backup/fix-pr/{}-{}", cur_branch, short);
-        info!("Creating backup branch at HEAD: {}", backup);
-        let _ = git_rw(dry, ["branch", &backup, "HEAD"].as_slice())?;
+        let _ = common::create_backup_branch(dry, "fix-pr", &cur_branch, &short)?;
     }
 
     // Build the new history in a temporary worktree off merge-base
-    let tmp_branch = format!("spr/tmp-fix-{}", short);
-    let tmp_path = format!("/tmp/spr-fix-{}", short);
-    info!(
-        "Rewriting stack in temp worktree {} on branch {}…",
-        tmp_path, tmp_branch
-    );
-    let _ = git_rw(
-        dry,
-        [
-            "worktree",
-            "add",
-            "-f",
-            "-b",
-            &tmp_branch,
-            &tmp_path,
-            &merge_base,
-        ]
-        .as_slice(),
-    )?;
+    let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "fix", &merge_base, &short)?;
 
     for sha in &new_order {
         // Cherry-pick the commit onto tmp
-        git_rw(dry, ["-C", &tmp_path, "cherry-pick", sha].as_slice())?;
+        common::cherry_pick_commit(dry, &tmp_path, sha)?;
     }
 
     // Point current branch to new tip
-    let new_tip = git_ro(["-C", &tmp_path, "rev-parse", "HEAD"].as_slice())?
-        .trim()
-        .to_string();
+    let new_tip = common::tip_of_tmp(&tmp_path)?;
     info!(
         "Updating current branch {} to new tip {} (fix-pr applied)…",
         cur_branch, new_tip
     );
-    let _ = git_rw(dry, ["reset", "--hard", &new_tip].as_slice())?;
+    common::reset_current_branch_to(dry, &new_tip)?;
 
     // Cleanup temp worktree/branch
-    let _ = git_rw(dry, ["worktree", "remove", "-f", &tmp_path].as_slice())?;
-    let _ = git_rw(dry, ["branch", "-D", &tmp_branch].as_slice())?;
+    common::cleanup_temp_worktree(dry, &tmp_path, &tmp_branch)?;
 
     Ok(())
 }
