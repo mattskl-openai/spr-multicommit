@@ -94,8 +94,8 @@ pub enum Cmd {
         r#unsafe: bool,
     },
 
-    /// Fix PR stack connectivity to match local commit stack
-    FixStack {
+    /// Relink PR stack to match local commit stack
+    RelinkPrs {
         // dry-run is provided via global --dry-run
     },
 
@@ -103,6 +103,19 @@ pub enum Cmd {
     #[command(alias = "clean")]
     Cleanup {
         // dry-run is provided via global --dry-run
+    },
+
+    /// Move the last M commits (top of stack) to the tail of PR N (1-based, bottom→top)
+    #[command(visible_alias = "fix")]
+    FixPr {
+        /// Target PR number (1-based, bottom→top)
+        n: usize,
+        /// Number of top commits to move to PR N's tail
+        #[arg(short = 't', long = "tail", default_value_t = 1)]
+        tail: usize,
+        /// Create a local backup branch at current HEAD before rewriting
+        #[arg(long)]
+        safe: bool,
     },
 
     /// Reorder local PR groups by moving one or a range to come after a target PR

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use tracing::info;
 
-use crate::git::{git_ro, git_rw};
+use crate::commands::common;
 use crate::parsing::derive_local_groups;
 
 fn parse_range(input: &str) -> Result<(usize, usize)> {
@@ -128,63 +128,31 @@ pub fn move_groups_after(
     }
 
     // Optionally create a backup branch at current HEAD
-    let cur_branch = git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
-        .trim()
-        .to_string();
+    let (cur_branch, short) = common::get_current_branch_and_short()?;
     if safe {
-        let short = git_ro(["rev-parse", "--short", "HEAD"].as_slice())?
-            .trim()
-            .to_string();
-        let backup = format!("backup/move/{}-{}", cur_branch, short);
-        info!("Creating backup branch at HEAD: {}", backup);
-        let _ = git_rw(dry, ["branch", &backup, "HEAD"].as_slice())?;
+        let _ = common::create_backup_branch(dry, "move", &cur_branch, &short)?;
     }
 
     // Build the new history in a temporary worktree off merge-base
-    let short = git_ro(["rev-parse", "--short", "HEAD"].as_slice())?
-        .trim()
-        .to_string();
-    let tmp_branch = format!("spr/tmp-move-{}", short);
-    let tmp_path = format!("/tmp/spr-move-{}", short);
-    info!(
-        "Rebuilding stack in temp worktree {} on branch {}…",
-        tmp_path, tmp_branch
-    );
-    let _ = git_rw(
-        dry,
-        [
-            "worktree",
-            "add",
-            "-f",
-            "-b",
-            &tmp_branch,
-            &tmp_path,
-            &merge_base,
-        ]
-        .as_slice(),
-    )?;
+    let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "move", &merge_base, &short)?;
 
     // Cherry-pick commits in the new order, group by group (batched per-group)
     for idx in &new_order {
         let g = &groups[*idx - 1];
         if let (Some(first), Some(last)) = (g.commits.first(), g.commits.last()) {
-            let range = format!("{}^..{}", first, last);
-            git_rw(dry, ["-C", &tmp_path, "cherry-pick", &range].as_slice())?;
+            common::cherry_pick_range(dry, &tmp_path, first, last)?;
         }
     }
 
-    let new_tip = git_ro(["-C", &tmp_path, "rev-parse", "HEAD"].as_slice())?
-        .trim()
-        .to_string();
+    let new_tip = common::tip_of_tmp(&tmp_path)?;
     info!(
         "Updating current branch {} to new tip {} (stack reordered)…",
         cur_branch, new_tip
     );
-    let _ = git_rw(dry, ["reset", "--hard", &new_tip].as_slice())?;
+    common::reset_current_branch_to(dry, &new_tip)?;
 
     // Cleanup temp worktree/branch
-    let _ = git_rw(dry, ["worktree", "remove", "-f", &tmp_path].as_slice())?;
-    let _ = git_rw(dry, ["branch", "-D", &tmp_branch].as_slice())?;
+    common::cleanup_temp_worktree(dry, &tmp_path, &tmp_branch)?;
 
     Ok(())
 }

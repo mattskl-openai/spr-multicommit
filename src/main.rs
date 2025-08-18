@@ -180,15 +180,20 @@ fn main() -> Result<()> {
                 )?,
             }
         }
-        crate::cli::Cmd::FixStack {} => {
+        crate::cli::Cmd::RelinkPrs {} => {
             set_dry_run_env(cli.dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
-            crate::commands::fix_stack(&base, &prefix, cli.dry_run)?;
+            crate::commands::relink_prs(&base, &prefix, cli.dry_run)?;
         }
         crate::cli::Cmd::Cleanup {} => {
             set_dry_run_env(cli.dry_run, false);
             let (_base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::cleanup_remote_branches(&prefix, cli.dry_run)?;
+        }
+        crate::cli::Cmd::FixPr { n, tail, safe } => {
+            set_dry_run_env(cli.dry_run, false);
+            let (base, _prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
+            crate::commands::fix_pr_tail(&base, n, tail, safe, cli.dry_run)?;
         }
         crate::cli::Cmd::Move { range, after, safe } => {
             set_dry_run_env(cli.dry_run, false);

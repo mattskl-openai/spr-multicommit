@@ -85,6 +85,10 @@ Commands
 
 Build/refresh the stack from commit markers, or restack existing branches.
 
+Aliases:
+
+- `u`
+
 Key options:
 
 - `--from <REF>`: commit range upper bound when parsing tags (default `HEAD`) (untested)
@@ -124,19 +128,35 @@ Behavior:
 
 Lists PRs in the current stack (bottom → top) for the configured prefix.
 
+Aliases:
+
+- `p`
+
 Legend: CI ✓/✗/◐ and Review ✓/✗/◐ indicate passing/failing/pending states when available.
 
-### spr status (alias: stat)
+### spr status
+
+Aliases:
+
+- `stat`
 
 Alias for `spr list pr`.
 
-### spr list commit (alias: c)
+### spr list commit
 
 Lists commits in the current stack (bottom → top), grouped by local PR. Each group header shows the local PR number and branch (and remote PR number when available). Within each group, each line shows the bottom-up commit index (1-based) and the short SHA.
+
+Aliases:
+
+- `c`
 
 ### spr move
 
 Reorder local PR groups by moving one or a range to come after a target PR.
+
+Aliases:
+
+- `mv`
 
 - `spr move A --after C`: move PR at position A to come after PR C (C ∈ [0..N])
 - `spr move A..B --after C`: move PRs A..B to come after PR C (requires A < B and C ∉ [A..B]; C ∈ [0..N])
@@ -191,7 +211,35 @@ Behavior:
 - Pushes branches (respects `--dry-run`)
 - Adds a warning to the next PR not included in the push
 
-### spr cleanup (alias: clean)
+### spr fix-pr
+
+Move the tail M commits (top of stack) to the tail of PR N (1-based, bottom→top).
+
+Aliases:
+
+- `spr fix N -t M`
+- `spr fix N` (equivalent to `spr fix N -t 1`)
+
+Usage:
+
+```bash
+# Move the top commit to the tail of PR 3
+spr fix-pr 3
+
+# Move the last 2 commits to the tail of PR 1
+spr fix-pr 1 --tail 2
+```
+
+Behavior:
+
+- Rewrites local history to move the tail M commits after PR N’s tail commit
+- `--safe`: create a local backup branch at current `HEAD` before executing
+
+### spr cleanup
+
+Aliases:
+
+- `clean`
 
 Delete remote branches that match your configured `--prefix` and have no open PRs.
 
@@ -212,9 +260,9 @@ spr cleanup --dry-run
 spr cleanup
 ```
 
-### spr fix-stack
+### spr relink-prs
 
-Fix PR stack connectivity to match the local commit stack.
+Fix (GitHub) PR stack connectivity to match the local commit stack.
 
 Behavior:
 
@@ -268,11 +316,5 @@ spr land per-pr --until 2
 spr move 2..3 --after 4 --safe
 
 # Fix PR base chain on GitHub to reflect local stack
-spr fix-stack
+spr relink-prs
 ```
-
-Aliases
--------
-
-- `spr update` (`u`), `spr list` (`ls`), `spr move` (`mv`), `spr cleanup` (`clean`)
-- `spr list pr` (`p`), `spr list commit` (`c`), `spr status` (`stat`) (same as `spr list pr`)
