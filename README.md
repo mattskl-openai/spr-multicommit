@@ -212,9 +212,9 @@ spr cleanup --dry-run
 spr cleanup
 ```
 
-### spr fix-stack
+### spr relink-prs
 
-Fix PR stack connectivity to match the local commit stack.
+Fix (GitHub) PR stack connectivity to match the local commit stack.
 
 Behavior:
 
@@ -268,7 +268,7 @@ spr land per-pr --until 2
 spr move 2..3 --after 4 --safe
 
 # Fix PR base chain on GitHub to reflect local stack
-spr fix-stack
+spr relink-prs
 ```
 
 Aliases

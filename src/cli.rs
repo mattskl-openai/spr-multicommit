@@ -94,8 +94,8 @@ pub enum Cmd {
         r#unsafe: bool,
     },
 
-    /// Fix PR stack connectivity to match local commit stack
-    FixStack {
+    /// Relink PR stack to match local commit stack
+    RelinkPrs {
         // dry-run is provided via global --dry-run
     },
 

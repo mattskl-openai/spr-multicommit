@@ -5,7 +5,7 @@ use crate::git::{gh_rw, normalize_branch_name, sanitize_gh_base_ref};
 use crate::github::list_spr_prs;
 use crate::parsing::derive_local_groups;
 
-pub fn fix_stack(base: &str, prefix: &str, dry: bool) -> Result<()> {
+pub fn relink_prs(base: &str, prefix: &str, dry: bool) -> Result<()> {
     let base_n = normalize_branch_name(base);
     // Build local expected stack from base..HEAD
     let (_merge_base, groups) = derive_local_groups(base)?;
