@@ -2,6 +2,7 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::git::{git_ro, git_rw};
+use crate::parsing::Group;
 
 pub fn get_current_branch_and_short() -> Result<(String, String)> {
     let cur_branch = git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
@@ -79,4 +80,16 @@ pub fn cleanup_temp_worktree(dry: bool, tmp_path: &str, tmp_branch: &str) -> Res
     let _ = git_rw(dry, ["worktree", "remove", "-f", tmp_path].as_slice())?;
     let _ = git_rw(dry, ["branch", "-D", tmp_branch].as_slice())?;
     Ok(())
+}
+
+/// Build expected (head, base) chain bottom→top from local groups
+pub fn build_head_base_chain(base: &str, groups: &[Group], prefix: &str) -> Vec<(String, String)> {
+    let mut expected: Vec<(String, String)> = vec![];
+    let mut parent = base.to_string();
+    for g in groups {
+        let head = format!("{}{}", prefix, g.tag);
+        expected.push((head.clone(), parent.clone()));
+        parent = head;
+    }
+    expected
 }

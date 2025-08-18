@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use tracing::{info, warn};
 
+use crate::commands::common;
 use crate::git::{gh_rw, normalize_branch_name, sanitize_gh_base_ref};
 use crate::github::list_spr_prs;
 use crate::parsing::derive_local_groups;
@@ -21,13 +22,7 @@ pub fn relink_prs(base: &str, prefix: &str, dry: bool) -> Result<()> {
     }
 
     // Expected connectivity bottom-up
-    let mut expected: Vec<(String, String)> = vec![]; // (head, base)
-    let mut parent = base_n.clone();
-    for g in &groups {
-        let head = format!("{}{}", prefix, g.tag);
-        expected.push((head.clone(), parent.clone()));
-        parent = head;
-    }
+    let expected = common::build_head_base_chain(&base_n, &groups, prefix);
 
     // Apply base edits where needed
     for (head, want_base) in expected {
