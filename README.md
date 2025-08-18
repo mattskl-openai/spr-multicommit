@@ -191,6 +191,30 @@ Behavior:
 - Pushes branches (respects `--dry-run`)
 - Adds a warning to the next PR not included in the push
 
+### spr fix-pr
+
+Move the tail M commits (top of stack) to the tail of PR N (1-based, bottom→top).
+
+Aliases:
+
+- `spr fix N -t M`
+- `spr fix N` (equivalent to `spr fix N -t 1`)
+
+Usage:
+
+```bash
+# Move the top commit to the tail of PR 3
+spr fix-pr 3
+
+# Move the last 2 commits to the tail of PR 1
+spr fix-pr 1 --tail 2
+```
+
+Behavior:
+
+- Rewrites local history to move the tail M commits after PR N’s tail commit
+- `--safe`: create a local backup branch at current `HEAD` before executing
+
 ### spr cleanup (alias: clean)
 
 Delete remote branches that match your configured `--prefix` and have no open PRs.
