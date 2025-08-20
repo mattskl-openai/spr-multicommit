@@ -92,6 +92,9 @@ pub enum Cmd {
         /// Allow bypassing safety validations (CI/review checks)
         #[arg(long = "unsafe", visible_alias = "force", visible_short_alias = 'f')]
         r#unsafe: bool,
+        /// Skip automatic restack after landing (default: restack remaining commits with `--after N`)
+        #[arg(long = "no-restack")]
+        no_restack: bool,
     },
 
     /// Relink PR stack to match local commit stack

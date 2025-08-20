@@ -151,7 +151,11 @@ fn main() -> Result<()> {
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::list_prs_display(&base, &prefix)?
         }
-        crate::cli::Cmd::Land { which, r#unsafe } => {
+        crate::cli::Cmd::Land {
+            which,
+            r#unsafe,
+            no_restack,
+        } => {
             set_dry_run_env(cli.dry_run, false);
             let (base, prefix) = resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             let mode = which
@@ -178,6 +182,10 @@ fn main() -> Result<()> {
                     cli.dry_run,
                     r#unsafe,
                 )?,
+            }
+            if !no_restack {
+                // After landing the first N PRs, restack the remaining commits onto the latest base
+                crate::commands::restack_after(&base, until, false, cli.dry_run)?;
             }
         }
         crate::cli::Cmd::RelinkPrs {} => {
