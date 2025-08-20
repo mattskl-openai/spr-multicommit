@@ -173,6 +173,7 @@ Land PRs using either flatten or per-pr strategy.
 Shared options (global):
 
 - `--until <N>`: land first N PRs bottom-up (0 means all)
+ - `--no-restack`: do not automatically restack after landing
 
 Safety checks:
 
@@ -183,6 +184,10 @@ Mode selection:
 
 - If `spr land <mode>` is specified, that mode is used
 - If no `<mode>` is provided, the mode is read from config `land` (default `flatten`)
+
+Default follow-up behavior:
+
+- After a successful land, `spr` will automatically run `spr restack --after N` (using the same `N` from `--until`) to rebase the remaining commits onto the latest base. Pass `--no-restack` to skip this.
 
 #### Mode: flatten
 
