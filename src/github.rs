@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::git::{gh_ro, gh_rw, git_ro};
 
@@ -193,45 +193,6 @@ pub fn graphql_escape(s: &str) -> String {
         }
     }
     out
-}
-
-pub fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
-    let json = gh_ro(
-        [
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            "200",
-            "--json",
-            "number,headRefName,baseRefName",
-        ]
-        .as_slice(),
-    )?;
-    #[derive(Deserialize)]
-    struct Raw {
-        number: u64,
-        #[serde(rename = "headRefName")]
-        head_ref_name: String,
-        #[serde(rename = "baseRefName")]
-        base_ref_name: String,
-    }
-    let raws: Vec<Raw> = serde_json::from_str(&json)?;
-    let mut out = vec![];
-    for r in raws {
-        if r.head_ref_name.starts_with(prefix) {
-            out.push(PrInfo {
-                number: r.number,
-                head: r.head_ref_name,
-                base: r.base_ref_name,
-            });
-        }
-    }
-    if out.is_empty() {
-        warn!("No open PRs with head starting with `{}` found.", prefix);
-    }
-    Ok(out)
 }
 
 /// Fetch open PRs for a specific set of head branches (exact matches), returning
