@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use tracing::info;
 
 use crate::git::{git_ro, git_rw};
-use crate::github::{append_warning_to_pr, list_spr_prs};
+use crate::github::{append_warning_to_pr, list_open_prs_for_heads};
 use crate::limit::Limit;
 use crate::parsing::derive_local_groups;
 
@@ -203,7 +203,7 @@ pub fn prep_squash(
     if let Some(next_idx) = next_idx_opt {
         if next_idx < groups.len() {
             let next_branch = format!("{}{}", prefix, groups[next_idx].tag);
-            let prs = list_spr_prs(prefix)?;
+            let prs = list_open_prs_for_heads(&[next_branch.clone()])?;
             if let Some(pr) = prs.iter().find(|p| p.head == next_branch) {
                 append_warning_to_pr(
                     pr.number,

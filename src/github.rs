@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::git::{gh_ro, gh_rw, git_ro};
 
@@ -195,42 +195,58 @@ pub fn graphql_escape(s: &str) -> String {
     out
 }
 
-pub fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
+/// Fetch open PRs for a specific set of head branches (exact matches), returning
+/// only those heads that currently have an open PR. This avoids scanning a large
+/// number of unrelated PRs in big repositories.
+pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
+    let mut out: Vec<PrInfo> = Vec::new();
+    if heads.is_empty() {
+        return Ok(out);
+    }
+    let (owner, name) = get_repo_owner_name()?;
+
+    // Build a single GraphQL query with aliases per head branch
+    let mut q =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (i, head) in heads.iter().enumerate() {
+        q.push_str(&format!(
+            "pr{}: pullRequests(headRefName:\"{}\", states:[OPEN], first:1) {{ nodes {{ number headRefName baseRefName }} }} ",
+            i,
+            graphql_escape(head)
+        ));
+    }
+    q.push_str("} }");
+
     let json = gh_ro(
         [
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            "200",
-            "--json",
-            "number,headRefName,baseRefName",
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", q),
+            "-F",
+            &format!("owner={}", owner),
+            "-F",
+            &format!("name={}", name),
         ]
         .as_slice(),
     )?;
-    #[derive(Deserialize)]
-    struct Raw {
-        number: u64,
-        #[serde(rename = "headRefName")]
-        head_ref_name: String,
-        #[serde(rename = "baseRefName")]
-        base_ref_name: String,
-    }
-    let raws: Vec<Raw> = serde_json::from_str(&json)?;
-    let mut out = vec![];
-    for r in raws {
-        if r.head_ref_name.starts_with(prefix) {
-            out.push(PrInfo {
-                number: r.number,
-                head: r.head_ref_name,
-                base: r.base_ref_name,
-            });
+
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &v["data"]["repository"];
+    for (i, _head) in heads.iter().enumerate() {
+        let key = format!("pr{}", i);
+        if let Some(nodes) = repo[&key]["nodes"].as_array() {
+            if let Some(node) = nodes.first() {
+                let number = node["number"].as_u64().unwrap_or(0);
+                if number > 0 {
+                    let head = node["headRefName"].as_str().unwrap_or("").to_string();
+                    let base = node["baseRefName"].as_str().unwrap_or("").to_string();
+                    out.push(PrInfo { number, head, base });
+                }
+            }
         }
     }
-    if out.is_empty() {
-        warn!("No open PRs with head starting with `{}` found.", prefix);
-    }
+
     Ok(out)
 }
 

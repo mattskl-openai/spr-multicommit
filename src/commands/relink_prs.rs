@@ -3,7 +3,7 @@ use tracing::{info, warn};
 
 use crate::commands::common;
 use crate::git::{gh_rw, normalize_branch_name, sanitize_gh_base_ref};
-use crate::github::list_spr_prs;
+use crate::github::list_open_prs_for_heads;
 use crate::parsing::derive_local_groups;
 
 pub fn relink_prs(base: &str, prefix: &str, dry: bool) -> Result<()> {
@@ -16,7 +16,11 @@ pub fn relink_prs(base: &str, prefix: &str, dry: bool) -> Result<()> {
     }
 
     // Existing PRs map by head
-    let prs = list_spr_prs(prefix)?;
+    let heads: Vec<String> = groups
+        .iter()
+        .map(|g| format!("{}{}", prefix, g.tag))
+        .collect();
+    let prs = list_open_prs_for_heads(&heads)?;
     if prs.is_empty() {
         bail!("No open PRs with head starting with `{prefix}`.");
     }

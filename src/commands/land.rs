@@ -4,7 +4,7 @@ use tracing::warn;
 use crate::cli::LandCmd;
 use crate::git::{gh_rw, git_ro, git_rw, sanitize_gh_base_ref, to_remote_ref};
 use crate::github::{
-    fetch_pr_bodies_graphql, fetch_pr_ci_review_status, graphql_escape, list_spr_prs,
+    fetch_pr_bodies_graphql, fetch_pr_ci_review_status, graphql_escape, list_open_prs_for_heads,
 };
 use crate::parsing::derive_local_groups;
 
@@ -21,7 +21,11 @@ pub fn land_until(
     if groups.is_empty() {
         bail!("No local groups found; nothing to land.");
     }
-    let prs = list_spr_prs(prefix)?;
+    let heads: Vec<String> = groups
+        .iter()
+        .map(|g| format!("{}{}", prefix, g.tag))
+        .collect();
+    let prs = list_open_prs_for_heads(&heads)?;
     if prs.is_empty() {
         bail!("No open PRs with head starting with `{prefix}`.");
     }

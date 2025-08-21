@@ -7,7 +7,8 @@ use tracing::info;
 use crate::commands::common;
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
-    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_spr_prs, upsert_pr_cached,
+    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_open_prs_for_heads,
+    upsert_pr_cached,
 };
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{derive_groups_between, Group};
@@ -38,7 +39,11 @@ pub fn build_from_tags(
     // Build bottom→top and collect PR refs for the visual update pass.
     let mut just_created_numbers: Vec<u64> = vec![];
     // Prefetch open PRs to reduce per-branch lookups
-    let pr_list = list_spr_prs(prefix)?;
+    let heads: Vec<String> = groups
+        .iter()
+        .map(|g| format!("{}{}", prefix, g.tag))
+        .collect();
+    let pr_list = list_open_prs_for_heads(&heads)?;
     let mut prs_by_head: HashMap<String, u64> = HashMap::new();
     let mut current_base_by_number: HashMap<u64, String> = HashMap::new();
     for p in pr_list {
