@@ -234,6 +234,61 @@ pub fn list_spr_prs(prefix: &str) -> Result<Vec<PrInfo>> {
     Ok(out)
 }
 
+/// Fetch open PRs for a specific set of head branches (exact matches), returning
+/// only those heads that currently have an open PR. This avoids scanning a large
+/// number of unrelated PRs in big repositories.
+pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
+    let mut out: Vec<PrInfo> = Vec::new();
+    if heads.is_empty() {
+        return Ok(out);
+    }
+    let (owner, name) = get_repo_owner_name()?;
+
+    // Build a single GraphQL query with aliases per head branch
+    let mut q =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (i, head) in heads.iter().enumerate() {
+        q.push_str(&format!(
+            "pr{}: pullRequests(headRefName:\"{}\", states:[OPEN], first:1) {{ nodes {{ number headRefName baseRefName }} }} ",
+            i,
+            graphql_escape(head)
+        ));
+    }
+    q.push_str("} }");
+
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", q),
+            "-F",
+            &format!("owner={}", owner),
+            "-F",
+            &format!("name={}", name),
+        ]
+        .as_slice(),
+    )?;
+
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &v["data"]["repository"];
+    for (i, _head) in heads.iter().enumerate() {
+        let key = format!("pr{}", i);
+        if let Some(nodes) = repo[&key]["nodes"].as_array() {
+            if let Some(node) = nodes.first() {
+                let number = node["number"].as_u64().unwrap_or(0);
+                if number > 0 {
+                    let head = node["headRefName"].as_str().unwrap_or("").to_string();
+                    let base = node["baseRefName"].as_str().unwrap_or("").to_string();
+                    out.push(PrInfo { number, head, base });
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// List PRs for a given head branch across all states
 /// Return the set of branch names (head refs) that currently have an OPEN PR
 pub fn list_open_pr_heads() -> Result<HashSet<String>> {

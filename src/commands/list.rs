@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::github::{fetch_pr_ci_review_status, list_spr_prs};
+use crate::github::{fetch_pr_ci_review_status, list_open_prs_for_heads};
 use crate::parsing::derive_local_groups;
 
 pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
@@ -12,8 +12,13 @@ pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Fetch PRs to annotate with numbers and statuses when available
-    let prs = list_spr_prs(prefix)?; // may be empty; that's fine
+    // Fetch PRs to annotate with numbers and statuses when available.
+    // Optimize by querying only the heads in this local stack rather than scanning many PRs.
+    let heads: Vec<String> = groups
+        .iter()
+        .map(|g| format!("{}{}", prefix, g.tag))
+        .collect();
+    let prs = list_open_prs_for_heads(&heads)?; // may be empty; that's fine
     let mut status_map: std::collections::HashMap<u64, crate::github::PrCiReviewStatus> =
         std::collections::HashMap::new();
     if !prs.is_empty() {
@@ -94,7 +99,11 @@ pub fn list_commits_display(base: &str, prefix: &str) -> Result<()> {
     }
 
     // Fetch PRs to annotate groups with remote numbers when available
-    let prs = list_spr_prs(prefix)?; // may be empty; that's fine
+    let heads: Vec<String> = groups
+        .iter()
+        .map(|g| format!("{}{}", prefix, g.tag))
+        .collect();
+    let prs = list_open_prs_for_heads(&heads)?; // may be empty; that's fine
 
     let mut commit_counter: usize = 0; // global, bottom-up
     for (i, g) in groups.iter().enumerate() {
