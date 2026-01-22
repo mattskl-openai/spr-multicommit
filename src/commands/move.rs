@@ -83,7 +83,7 @@ pub fn move_groups_after(
             info!("Already in desired position: {}", a);
             return Ok(());
         }
-    } else if !(a < b) {
+    } else if a >= b {
         return Err(anyhow!("Invalid range: require A<B (got {}..{})", a, b));
     }
     if c != 0 && c >= a && c <= b {

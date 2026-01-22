@@ -126,15 +126,7 @@ pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiRev
             } else if has_approved {
                 review = "APPROVED".to_string();
             } else {
-                let is_draft = repo[&key]["isDraft"].as_bool().unwrap_or(false);
-                let req_cnt = repo[&key]["reviewRequests"]["totalCount"]
-                    .as_u64()
-                    .unwrap_or(0);
-                if is_draft || req_cnt > 0 {
-                    review = "REVIEW_REQUIRED".to_string();
-                } else {
-                    review = "REVIEW_REQUIRED".to_string();
-                }
+                review = "REVIEW_REQUIRED".to_string();
             }
         }
 

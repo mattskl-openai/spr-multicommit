@@ -206,7 +206,7 @@ pub fn prep_squash(
     if let Some(next_idx) = next_idx_opt {
         if next_idx < groups.len() {
             let next_branch = format!("{}{}", prefix, groups[next_idx].tag);
-            let prs = list_open_prs_for_heads(&[next_branch.clone()])?;
+            let prs = list_open_prs_for_heads(std::slice::from_ref(&next_branch))?;
             if let Some(pr) = prs.iter().find(|p| p.head == next_branch) {
                 append_warning_to_pr(
                     pr.number,

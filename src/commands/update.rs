@@ -176,7 +176,7 @@ pub fn build_from_groups(
                     if shas_equal {
                         continue;
                     }
-                    let fields = vec![
+                    let fields = [
                         format!("pullRequestId:\"{}\"", info.id),
                         format!("baseRefName:\"{}\"", graphql_escape(&base_target)),
                     ];

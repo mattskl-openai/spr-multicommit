@@ -64,7 +64,7 @@ pub fn fix_pr_tail(
             "Selected tail commit(s) contain pr:<tag> markers; cannot move commits that start or belong to PR groups: {}",
             offenders
                 .iter()
-                .map(|s| format!("{}", &s.chars().take(8).collect::<String>()))
+                .map(|s| s.chars().take(8).collect::<String>())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
