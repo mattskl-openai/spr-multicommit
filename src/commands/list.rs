@@ -4,9 +4,9 @@ use tracing::info;
 use crate::github::{fetch_pr_ci_review_status, list_open_prs_for_heads};
 use crate::parsing::derive_local_groups;
 
-pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
+pub fn list_prs_display(base: &str, prefix: &str, ignore_tag: &str) -> Result<()> {
     // Derive stack from local commits (source of truth)
-    let (_merge_base, groups) = derive_local_groups(base)?;
+    let (_merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
         info!("No groups discovered; nothing to list.");
         return Ok(());
@@ -90,9 +90,9 @@ pub fn list_prs_display(base: &str, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn list_commits_display(base: &str, prefix: &str) -> Result<()> {
+pub fn list_commits_display(base: &str, prefix: &str, ignore_tag: &str) -> Result<()> {
     // Derive stack from local commits (source of truth)
-    let (_merge_base, groups) = derive_local_groups(base)?;
+    let (_merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
         info!("No groups discovered; nothing to list.");
         return Ok(());

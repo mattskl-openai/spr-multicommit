@@ -8,6 +8,8 @@ pub struct FileConfig {
     pub base: Option<String>,
     pub prefix: Option<String>,
     pub land: Option<String>,
+    /// Optional `pr:<tag>` value that starts an ignore block during group parsing.
+    pub ignore_tag: Option<String>,
 }
 
 fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
@@ -35,6 +37,9 @@ pub fn load_config() -> Result<FileConfig> {
             if let Some(mode) = home_cfg.land {
                 merged.land = Some(mode);
             }
+            if let Some(ignore_tag) = home_cfg.ignore_tag {
+                merged.ignore_tag = Some(ignore_tag);
+            }
         }
     }
 
@@ -51,6 +56,9 @@ pub fn load_config() -> Result<FileConfig> {
             }
             if repo_cfg.land.is_some() {
                 merged.land = repo_cfg.land;
+            }
+            if repo_cfg.ignore_tag.is_some() {
+                merged.ignore_tag = repo_cfg.ignore_tag;
             }
         }
     }

@@ -428,11 +428,13 @@ pub fn build_from_tags(
     base: &str,
     from: &str,
     prefix: &str,
+    ignore_tag: &str,
     no_pr: bool,
     dry: bool,
     _update_pr_body: bool,
     limit: Option<Limit>,
 ) -> Result<()> {
-    let (_merge_base, groups): (String, Vec<Group>) = derive_groups_between(base, from)?;
+    let (_merge_base, groups): (String, Vec<Group>) =
+        derive_groups_between(base, from, ignore_tag)?;
     build_from_groups(base, prefix, no_pr, dry, _update_pr_body, limit, groups)
 }

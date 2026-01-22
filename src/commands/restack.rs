@@ -14,11 +14,17 @@ use crate::parsing::derive_local_groups;
 /// - Run: `git rebase --onto <base> <upstream> <current-branch>`.
 ///
 /// This moves the entire range starting at the first commit of group N+1 onto `base`, leaving the first N PRs untouched.
-pub fn restack_after(base: &str, after: usize, safe: bool, dry: bool) -> Result<()> {
+pub fn restack_after(
+    base: &str,
+    ignore_tag: &str,
+    after: usize,
+    safe: bool,
+    dry: bool,
+) -> Result<()> {
     // Ensure we operate against the latest remote state
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
-    let (merge_base, groups) = derive_local_groups(base)?;
+    let (merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
         info!("No local PR groups found; nothing to restack.");
         return Ok(());

@@ -21,11 +21,13 @@ cargo install --path .
 Quick start
 -----------
 
-1. Create commits with `pr:<tag>` markers to define PR groups, bottom → top. Example:
+1. Create commits with `pr:<tag>` markers to define PR groups, bottom → top. Use `pr:ignore` to skip commits until the next `pr:<tag>`. Example:
 
 ```bash
 git commit -m "feat: parser groundwork pr:alpha"
 git commit -m "feat: alpha follow-ups"
+git commit -m "chore: local experiments pr:ignore"
+git commit -m "wip: spike cleanup"
 git commit -m "feat: new API pr:beta" -m "Body explaining the change"
 ```
 
@@ -61,12 +63,16 @@ prefix: mattskl-spr/
 # Default land mode when not specified on the CLI
 # one of: "flatten" (default) or "per-pr"
 land: flatten
+
+# Tag used to ignore commits between PR groups
+# Commit with pr:ignore_tag starts ignore mode until the next pr:<tag>
+ignore_tag: ignore
 ```
 
 Precedence for defaults:
 
 - CLI flag > repo YAML > home YAML > built-in defaults
-- Built-in defaults: `base = origin/oai-main`, `prefix = "${USER}-spr/"`, `land = flatten`
+- Built-in defaults: `base = origin/oai-main`, `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`
 
 Global flags
 ------------
@@ -100,7 +106,7 @@ Key options:
 
 Behavior:
 
-- Parses `pr:<tag>` markers from `merge-base(base, from)..from`
+- Parses `pr:<tag>` markers from `merge-base(base, from)..from` (commits between `pr:ignore` and the next `pr:<tag>` are ignored)
 - Creates/updates per-PR branches and GitHub PRs
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
   - May temporarily set existing PR bases to the repo base while pushing, then re-chain them to match the local stack
@@ -118,7 +124,7 @@ Options:
 
 Behavior:
 
-- Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest)
+- Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest; `pr:ignore` blocks are skipped)
 - For `--after 0`: upstream is `merge-base(base, HEAD)`
 - For `--after N>0`: upstream is the parent of the first commit of group N+1
 - Runs: `git rebase --onto <base> <upstream> <current-branch>`

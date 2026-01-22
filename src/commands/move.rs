@@ -40,13 +40,14 @@ fn format_simple_plan(old: &[usize], new: &[usize], a: usize, b: usize, c: usize
 
 pub fn move_groups_after(
     base: &str,
+    ignore_tag: &str,
     range: &str,
     after: &str,
     safe: bool,
     dry: bool,
 ) -> Result<()> {
     // Discover groups from local commits bottom→top
-    let (merge_base, groups) = derive_local_groups(base)?;
+    let (merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     let n = groups.len();
     if n == 0 {
         info!("No local PR groups found; nothing to move.");

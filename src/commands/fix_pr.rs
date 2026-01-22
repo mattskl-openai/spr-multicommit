@@ -7,12 +7,19 @@ use crate::git::git_ro;
 use crate::parsing::derive_local_groups;
 
 /// Move the last `tail_count` commits (top-of-stack) to become the tail of PR `n` (1-based, bottom→top).
-pub fn fix_pr_tail(base: &str, n: usize, tail_count: usize, safe: bool, dry: bool) -> Result<()> {
+pub fn fix_pr_tail(
+    base: &str,
+    ignore_tag: &str,
+    n: usize,
+    tail_count: usize,
+    safe: bool,
+    dry: bool,
+) -> Result<()> {
     if tail_count == 0 {
         return Ok(());
     }
 
-    let (merge_base, groups) = derive_local_groups(base)?;
+    let (merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     let total_groups = groups.len();
     if total_groups == 0 {
         info!("No local PR groups found; nothing to fix.");
