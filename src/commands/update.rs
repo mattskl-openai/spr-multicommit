@@ -13,18 +13,16 @@ use crate::github::{
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{derive_groups_between, Group};
 
-/// Bootstrap/refresh stack from pr:<tag> markers on `from` vs merge-base(base, from).
-pub fn build_from_tags(
+/// Bootstrap/refresh stack from already-parsed PR groups.
+pub fn build_from_groups(
     base: &str,
-    from: &str,
     prefix: &str,
     no_pr: bool,
     dry: bool,
     _update_pr_body: bool,
     limit: Option<Limit>,
+    mut groups: Vec<Group>,
 ) -> Result<()> {
-    let (_merge_base, mut groups): (String, Vec<Group>) = derive_groups_between(base, from)?;
-
     if groups.is_empty() {
         info!("No groups discovered; nothing to do.");
         return Ok(());
@@ -423,4 +421,18 @@ pub fn build_from_tags(
     }
 
     Ok(())
+}
+
+/// Bootstrap/refresh stack from pr:<tag> markers on `from` vs merge-base(base, from).
+pub fn build_from_tags(
+    base: &str,
+    from: &str,
+    prefix: &str,
+    no_pr: bool,
+    dry: bool,
+    _update_pr_body: bool,
+    limit: Option<Limit>,
+) -> Result<()> {
+    let (_merge_base, groups): (String, Vec<Group>) = derive_groups_between(base, from)?;
+    build_from_groups(base, prefix, no_pr, dry, _update_pr_body, limit, groups)
 }

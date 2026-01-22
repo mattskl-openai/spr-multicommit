@@ -85,22 +85,24 @@ fn main() -> Result<()> {
                 return Err(anyhow::anyhow!(
                     "`spr update --restack` is deprecated. Use `spr restack --after N` instead."
                 ));
-            } else if crate::parsing::has_tagged_commits(&base, &from)? {
-                crate::commands::build_from_tags(
+            } else {
+                let (_merge_base, groups) = crate::parsing::derive_groups_between(&base, &from)?;
+                if groups.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "No pr:<tag> markers found between {} and {}. Use `spr restack --after N`.",
+                        base,
+                        from
+                    ));
+                }
+                crate::commands::build_from_groups(
                     &base,
-                    &from,
                     &prefix,
                     no_pr,
                     cli.dry_run,
                     update_pr_body,
                     limit,
+                    groups,
                 )?;
-            } else {
-                return Err(anyhow::anyhow!(
-                    "No pr:<tag> markers found between {} and {}. Use `spr restack --after N`.",
-                    base,
-                    from
-                ));
             }
         }
         crate::cli::Cmd::Restack { after, safe } => {

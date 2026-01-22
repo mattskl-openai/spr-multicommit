@@ -138,14 +138,6 @@ pub fn parse_groups(raw: &str) -> Result<Vec<Group>> {
     Ok(groups)
 }
 
-pub fn has_tagged_commits(base: &str, from: &str) -> Result<bool> {
-    let merge_base = git_ro(["merge-base", base, from].as_slice())?
-        .trim()
-        .to_string();
-    let out = git_ro(["log", "--format=%B", &format!("{merge_base}..{from}")].as_slice())?;
-    Ok(out.lines().any(|s| s.contains("pr:")))
-}
-
 /// Derive PR groups from local commits between merge-base(base, to)..to (oldest→newest).
 /// Returns (merge_base, groups).
 pub fn derive_groups_between(base: &str, to: &str) -> Result<(String, Vec<Group>)> {
