@@ -238,8 +238,23 @@ pub fn build_from_groups(
         .map(|p| format!("{}:refs/heads/{}", p.target_sha, p.branch))
         .collect();
     if !force_refspecs.is_empty() {
-        let mut argv: Vec<String> =
-            vec!["push".into(), "--force-with-lease".into(), "origin".into()];
+        // Use explicit lease SHAs so we don't depend on remote-tracking refs being up-to-date.
+        let force_leases: Vec<String> = planned
+            .iter()
+            .filter(|p| p.kind == PushKind::Force)
+            .filter_map(|p| {
+                remote_map
+                    .get(&p.branch)
+                    .map(|sha| format!("--force-with-lease=refs/heads/{}:{}", p.branch, sha))
+            })
+            .collect();
+        let mut argv: Vec<String> = vec!["push".into(), "origin".into()];
+        if force_leases.is_empty() {
+            // Fallback to default lease behavior if we couldn't resolve remote SHAs.
+            argv.push("--force-with-lease".into());
+        } else {
+            argv.extend(force_leases.clone());
+        }
         argv.extend(force_refspecs.clone());
         let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let pb = ProgressBar::new_spinner();
