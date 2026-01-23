@@ -113,22 +113,23 @@ Behavior:
 
 ### spr restack
 
-Restack the local stack by rebasing commits after the bottom N PR groups onto the latest base.
+Restack the local stack by rebuilding commits after the bottom N PR groups onto the latest base.
 
 Options:
 
 - `--after <N|bottom|top|last|all>`: 'drop' the first N PR groups; rebase the remaining commits onto `--base`
   - `0` or `bottom`: restack all groups (moves everything after merge-base)
-  - `top` or `last` or `all`: skip all PRs; current branch is synced to the base tip after `git fetch`
- - `--safe`: create a local backup branch at current `HEAD` before rebasing
+  - `top` or `last` or `all`: skip all PRs; ignored commits (pr:ignore blocks) are preserved, so the branch may remain ahead of base
+- `--safe`: create a local backup branch at current `HEAD` before rebasing
 
 Behavior:
 
-- Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest; `pr:ignore` blocks are skipped)
-- For `--after 0`: upstream is `merge-base(base, HEAD)`
-- For `--after N>0`: upstream is the parent of the first commit of group N+1
-- Runs: `git rebase --onto <base> <upstream> <current-branch>`
- - With `--safe`, a backup branch named like `backup/restack/<current-branch>-<short-sha>` is created first
+- Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest; ignore blocks are preserved but excluded from grouping)
+- Drops the first N groups, then rebuilds the remaining commits onto `--base` via a temp worktree
+  - Ignored commits attached to dropped groups are kept before the remaining stack
+  - Ignored commits attached to kept groups move with those groups
+- Updates the current branch to the rebuilt tip
+- With `--safe`, a backup branch named like `backup/restack/<current-branch>-<short-sha>` is created first
 
 ### spr list pr
 
@@ -169,6 +170,7 @@ Aliases:
   - `--after bottom` is the same as `--after 0`
   - `--after top` is the same as `--after N`
 - `--safe`: create a local backup branch at current `HEAD` before rewriting
+ - Ignore blocks (`pr:ignore`) stay attached to the preceding PR group and move with it
 
 Prints an explicit plan, e.g.: `2..3→4: [1,2,3,4,5,6] → [1,4,2,3,5,6]`.
 
@@ -245,6 +247,7 @@ Behavior:
 
 - Rewrites local history to move the tail M commits after PR N’s tail commit
 - `--safe`: create a local backup branch at current `HEAD` before executing
+- Ignore blocks (`pr:ignore`) are preserved and cannot be moved; the command aborts if the tail intersects an ignore block
 
 ### spr cleanup
 

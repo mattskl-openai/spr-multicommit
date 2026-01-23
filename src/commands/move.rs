@@ -1,8 +1,10 @@
+//! Reorder local PR groups while preserving ignore blocks.
+
 use anyhow::{anyhow, Result};
 use tracing::info;
 
 use crate::commands::common;
-use crate::parsing::derive_local_groups;
+use crate::parsing::derive_local_groups_with_ignored;
 
 fn parse_range(input: &str) -> Result<(usize, usize)> {
     if let Some(dots) = input.find("..") {
@@ -38,6 +40,29 @@ fn format_simple_plan(old: &[usize], new: &[usize], a: usize, b: usize, c: usize
     )
 }
 
+/// Cherry-pick a contiguous block of commits, preserving local-only history.
+fn cherry_pick_block(dry: bool, tmp_path: &str, commits: &[String]) -> Result<()> {
+    if commits.is_empty() {
+        return Ok(());
+    }
+    let first = commits.first().expect("commits not empty");
+    let last = commits.last().expect("commits not empty");
+    if commits.len() == 1 {
+        common::cherry_pick_commit(dry, tmp_path, first)
+    } else {
+        common::cherry_pick_range(dry, tmp_path, first, last)
+    }
+}
+
+/// Move a group (or group range) to come after a target group index.
+///
+/// Ignore blocks (`pr:ignore` and its configured alias) remain attached to the
+/// group that precedes them, so local-only commits move with their owning group.
+///
+/// # Errors
+///
+/// Returns errors for invalid ranges, invalid `--after` positions, or when Git
+/// operations (worktree creation, cherry-picks, reset) fail.
 pub fn move_groups_after(
     base: &str,
     ignore_tag: &str,
@@ -47,7 +72,7 @@ pub fn move_groups_after(
     dry: bool,
 ) -> Result<()> {
     // Discover groups from local commits bottom→top
-    let (merge_base, groups) = derive_local_groups(base, ignore_tag)?;
+    let (merge_base, leading_ignored, groups) = derive_local_groups_with_ignored(base, ignore_tag)?;
     let n = groups.len();
     if n == 0 {
         info!("No local PR groups found; nothing to move.");
@@ -137,12 +162,16 @@ pub fn move_groups_after(
     // Build the new history in a temporary worktree off merge-base
     let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "move", &merge_base, &short)?;
 
+    // Preserve ignored commits that appear before the first group
+    cherry_pick_block(dry, &tmp_path, &leading_ignored)?;
+
     // Cherry-pick commits in the new order, group by group (batched per-group)
     for idx in &new_order {
         let g = &groups[*idx - 1];
         if let (Some(first), Some(last)) = (g.commits.first(), g.commits.last()) {
             common::cherry_pick_range(dry, &tmp_path, first, last)?;
         }
+        cherry_pick_block(dry, &tmp_path, &g.ignored_after)?;
     }
 
     let new_tip = common::tip_of_tmp(&tmp_path)?;

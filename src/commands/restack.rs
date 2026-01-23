@@ -1,19 +1,21 @@
+//! Restack a local PR stack while keeping ignored commits on the branch.
+
 use anyhow::Result;
 use tracing::info;
 
 use crate::commands::common;
 use crate::git::git_rw;
-use crate::parsing::derive_local_groups;
+use crate::parsing::derive_local_groups_with_ignored;
 
-/// Restack the local stack by rebasing all commits after the first `after` PRs onto `base`.
+/// Restack the local stack by rebasing commits after the first `after` PRs onto `base`.
 ///
-/// How it works:
-/// - Compute PR groups from `base..HEAD` (via `pr:<tag>` markers), bottom→top.
-/// - If `after == 0`: set `upstream = merge-base(base, HEAD)`.
-/// - Else: set `upstream = <first_commit_of_group_{after+1}>^` (parent of the first commit after the first N groups).
-/// - Run: `git rebase --onto <base> <upstream> <current-branch>`.
+/// This preserves ignored commits (`pr:ignore` blocks) by carrying them into the
+/// rebuilt history. Ignored commits that appear between dropped PR groups are kept
+/// before the remaining stack.
 ///
-/// This moves the entire range starting at the first commit of group N+1 onto `base`, leaving the first N PRs untouched.
+/// # Errors
+///
+/// Returns errors from git operations (fetch, worktree creation, cherry-picks, reset).
 pub fn restack_after(
     base: &str,
     ignore_tag: &str,
@@ -24,7 +26,8 @@ pub fn restack_after(
     // Ensure we operate against the latest remote state
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
-    let (merge_base, groups) = derive_local_groups(base, ignore_tag)?;
+    let (_merge_base, leading_ignored, groups) =
+        derive_local_groups_with_ignored(base, ignore_tag)?;
     if groups.is_empty() {
         info!("No local PR groups found; nothing to restack.");
         return Ok(());
@@ -32,7 +35,12 @@ pub fn restack_after(
     let (cur_branch, short) = common::get_current_branch_and_short()?;
     // Clamp 'after' to the number of groups; if equal, there is nothing to move
     let after = std::cmp::min(after, groups.len());
-    if after == groups.len() {
+    let mut kept_ignored: Vec<String> = leading_ignored;
+    for g in groups.iter().take(after) {
+        kept_ignored.extend(g.ignored_after.iter().cloned());
+    }
+    let remaining = &groups[after..];
+    if remaining.is_empty() && kept_ignored.is_empty() {
         // Nothing to move; sync current branch to base
         if safe {
             let _ = common::create_backup_branch(dry, "restack", &cur_branch, &short)?;
@@ -47,31 +55,44 @@ pub fn restack_after(
         return Ok(());
     }
 
-    // Determine upstream for rebase. To include the first commit of group N+1 in the rebase,
-    // set upstream to the parent of that commit (i.e., `<first>^`). For N == 0, use merge-base.
-    let upstream: String = if after == 0 {
-        merge_base
-    } else {
-        let next = &groups[after];
-        if let Some(first) = next.commits.first() {
-            format!("{}^", first)
-        } else {
-            merge_base
-        }
-    };
-
-    // Create a local backup branch pointing to current HEAD before rebasing
+    // Create a local backup branch pointing to current HEAD before rewriting
     if safe {
         let _ = common::create_backup_branch(dry, "restack", &cur_branch, &short)?;
     }
+
+    let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "restack", base, &short)?;
+    // Preserve ignored commits from dropped groups before the remaining stack.
+    if !kept_ignored.is_empty() {
+        let first = kept_ignored.first().expect("kept_ignored not empty");
+        let last = kept_ignored.last().expect("kept_ignored not empty");
+        if kept_ignored.len() == 1 {
+            common::cherry_pick_commit(dry, &tmp_path, first)?;
+        } else {
+            common::cherry_pick_range(dry, &tmp_path, first, last)?;
+        }
+    }
+    for g in remaining {
+        if let (Some(first), Some(last)) = (g.commits.first(), g.commits.last()) {
+            common::cherry_pick_range(dry, &tmp_path, first, last)?;
+        }
+        if !g.ignored_after.is_empty() {
+            let first = g.ignored_after.first().expect("ignored_after not empty");
+            let last = g.ignored_after.last().expect("ignored_after not empty");
+            if g.ignored_after.len() == 1 {
+                common::cherry_pick_commit(dry, &tmp_path, first)?;
+            } else {
+                common::cherry_pick_range(dry, &tmp_path, first, last)?;
+            }
+        }
+    }
+
+    let new_tip = common::tip_of_tmp(&tmp_path)?;
     info!(
-        "Rebasing commits after first {} PR(s) of {} onto {} (upstream = {})",
-        after, cur_branch, base, upstream
+        "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
+        after, cur_branch, base
     );
-    git_rw(
-        dry,
-        ["rebase", "--onto", base, &upstream, &cur_branch].as_slice(),
-    )?;
+    common::reset_current_branch_to(dry, &new_tip)?;
+    common::cleanup_temp_worktree(dry, &tmp_path, &tmp_branch)?;
 
     Ok(())
 }
