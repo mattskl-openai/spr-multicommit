@@ -75,6 +75,7 @@ fn main() -> Result<()> {
     let cfg = crate::config::load_config()?;
     let (base, prefix, ignore_tag) =
         resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
+    let overwrite_pr_description = cfg.overwrite_pr_description.unwrap_or(true);
     match cli.cmd {
         crate::cli::Cmd::Update {
             from,
@@ -89,6 +90,7 @@ fn main() -> Result<()> {
                 crate::cli::Extent::Pr { n } => crate::limit::Limit::ByPr(n),
                 crate::cli::Extent::Commits { n } => crate::limit::Limit::ByCommits(n),
             });
+            let overwrite_pr_description = overwrite_pr_description || update_pr_body;
             if restack {
                 return Err(anyhow::anyhow!(
                     "`spr update --restack` is deprecated. Use `spr restack --after N` instead."
@@ -108,7 +110,7 @@ fn main() -> Result<()> {
                     &prefix,
                     no_pr,
                     cli.dry_run,
-                    update_pr_body,
+                    overwrite_pr_description,
                     limit,
                     groups,
                 )?;
@@ -144,7 +146,14 @@ fn main() -> Result<()> {
             } else {
                 crate::cli::PrepSelection::All
             };
-            crate::commands::prep_squash(&base, &prefix, &ignore_tag, selection, cli.dry_run)?;
+            crate::commands::prep_squash(
+                &base,
+                &prefix,
+                &ignore_tag,
+                overwrite_pr_description,
+                selection,
+                cli.dry_run,
+            )?;
         }
         crate::cli::Cmd::List { what } => {
             match what {

@@ -10,6 +10,8 @@ pub struct FileConfig {
     pub land: Option<String>,
     /// Optional `pr:<tag>` value that starts an ignore block during group parsing.
     pub ignore_tag: Option<String>,
+    /// Whether `spr update` should overwrite PR descriptions from commit messages.
+    pub overwrite_pr_description: Option<bool>,
 }
 
 fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
@@ -40,6 +42,9 @@ pub fn load_config() -> Result<FileConfig> {
             if let Some(ignore_tag) = home_cfg.ignore_tag {
                 merged.ignore_tag = Some(ignore_tag);
             }
+            if let Some(overwrite_pr_description) = home_cfg.overwrite_pr_description {
+                merged.overwrite_pr_description = Some(overwrite_pr_description);
+            }
         }
     }
 
@@ -59,6 +64,9 @@ pub fn load_config() -> Result<FileConfig> {
             }
             if repo_cfg.ignore_tag.is_some() {
                 merged.ignore_tag = repo_cfg.ignore_tag;
+            }
+            if repo_cfg.overwrite_pr_description.is_some() {
+                merged.overwrite_pr_description = repo_cfg.overwrite_pr_description;
             }
         }
     }
