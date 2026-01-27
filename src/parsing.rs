@@ -111,7 +111,7 @@ impl Group {
 /// Commits with a single `pr:<tag>` marker start a new group, and untagged commits
 /// are appended to the current group once one exists.
 ///
-/// If a commit's tag matches `ignore_tag` (case-insensitive), the current group is
+/// If a commit's tag matches `ignore_tag` (case-sensitive), the current group is
 /// finalized and the parser enters ignore mode; commits are skipped until the next
 /// non-ignore `pr:<tag>` marker is seen.
 ///
@@ -181,7 +181,7 @@ pub fn parse_groups_with_ignored(
         if tag_matches == 1 {
             let cap = re.captures(&message).unwrap();
             let tag = cap.get(1).unwrap().as_str().to_string();
-            if tag.eq_ignore_ascii_case(ignore_tag) {
+            if tag == ignore_tag {
                 flush_current(&mut current, &mut groups);
                 ignoring = true;
                 ignored_block.push(sha);
@@ -373,5 +373,19 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].tag, "alpha");
         assert!(groups[0].ignored_after.is_empty());
+    }
+
+    #[test]
+    fn parse_groups_ignore_tag_is_case_sensitive() {
+        let raw = make_log(&[
+            ("a1", "feat: alpha start pr:alpha"),
+            ("i1", "chore: uppercase tag pr:IGNORE"),
+            ("b1", "feat: beta start pr:beta"),
+        ]);
+        let groups = parse_groups(&raw, "ignore").expect("parse_groups ok");
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].tag, "alpha");
+        assert_eq!(groups[1].tag, "IGNORE");
+        assert_eq!(groups[2].tag, "beta");
     }
 }
