@@ -10,13 +10,23 @@
 //! and fail with "branch already exists". To keep `--safe` re-runnable after a
 //! failure, `create_backup_branch` force-updates the backup ref in place.
 //!
+//! Temporary worktrees and their branches follow the same naming scheme. A
+//! failed rewrite can therefore leave behind a temp branch that will collide
+//! on the next run. `create_temp_worktree` proactively removes any existing
+//! temp worktree/branch with the same derived name before creating a new one,
+//! and uses `git worktree add -B` as a final safeguard when cleanup is skipped
+//! in dry-run mode.
+//!
 //! Backup branches are local-only and are intended as an escape hatch for a
 //! single user; callers should not rely on them being immutable.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 use tracing::info;
 
-use crate::git::{git_ro, git_rw};
+use crate::git::{git_ro, git_rw, normalize_branch_name};
 use crate::parsing::Group;
 
 /// Returns the current branch name and the short SHA of `HEAD`.
@@ -64,6 +74,14 @@ pub fn create_backup_branch(
     Ok(backup)
 }
 
+/// Creates a temporary worktree/branch off `merge_base` for stack rewrites.
+///
+/// The temp branch and path names are derived from `(kind, short)` and are
+/// therefore stable for a given `HEAD`. To keep rewrite commands re-runnable
+/// after failures, we delete any existing temp worktree/branch with the same
+/// derived name before creating the new worktree. We then use `-B` (reset or
+/// create) rather than `-b` to avoid "branch already exists" failures when a
+/// dry-run skipped the cleanup steps.
 pub fn create_temp_worktree(
     dry: bool,
     kind: &str,
@@ -72,6 +90,7 @@ pub fn create_temp_worktree(
 ) -> Result<(String, String)> {
     let tmp_branch = format!("spr/tmp-{}-{}", kind, short);
     let tmp_path = format!("/tmp/spr-{}-{}", kind, short);
+    cleanup_existing_temp_state(dry, &tmp_path, &tmp_branch)?;
     info!(
         "Creating temp worktree {} on branch {}…",
         tmp_path, tmp_branch
@@ -82,7 +101,7 @@ pub fn create_temp_worktree(
             "worktree",
             "add",
             "-f",
-            "-b",
+            "-B",
             &tmp_branch,
             &tmp_path,
             merge_base,
@@ -90,6 +109,112 @@ pub fn create_temp_worktree(
         .as_slice(),
     )?;
     Ok((tmp_path, tmp_branch))
+}
+
+/// A single parsed entry from `git worktree list --porcelain`.
+///
+/// The `branch` value, when present, is normalized to a local branch name.
+#[derive(Debug, Clone)]
+struct WorktreeEntry {
+    path: String,
+    branch: Option<String>,
+}
+
+/// Lists worktrees in porcelain form and extracts their paths and branches.
+///
+/// We parse porcelain output to reliably determine whether a temp branch is
+/// currently checked out elsewhere, which must be resolved before deleting the
+/// branch.
+fn list_worktrees() -> Result<Vec<WorktreeEntry>> {
+    let out = git_ro(["worktree", "list", "--porcelain"].as_slice())?;
+    let mut entries: Vec<WorktreeEntry> = Vec::new();
+    let mut cur_path: Option<String> = None;
+    let mut cur_branch: Option<String> = None;
+
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            if let Some(path) = cur_path.take() {
+                entries.push(WorktreeEntry {
+                    path,
+                    branch: cur_branch.take(),
+                });
+            }
+            cur_path = Some(rest.trim().to_string());
+            cur_branch = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("branch ") {
+            if cur_path.is_some() {
+                cur_branch = Some(normalize_branch_name(rest.trim()));
+            }
+        }
+    }
+
+    if let Some(path) = cur_path.take() {
+        entries.push(WorktreeEntry {
+            path,
+            branch: cur_branch.take(),
+        });
+    }
+
+    Ok(entries)
+}
+
+/// Returns true when a local branch with the given name exists.
+fn branch_exists(branch: &str) -> Result<bool> {
+    let out = git_ro(["branch", "--list", branch].as_slice())?;
+    Ok(!out.trim().is_empty())
+}
+
+/// Removes any pre-existing temp worktree and branch for this derived name.
+///
+/// Cleanup is ordered to respect Git's constraints: any worktree that has the
+/// temp branch checked out must be removed before the branch can be deleted.
+/// We also remove a matching temp path that is not registered as a worktree,
+/// which can happen after interrupted runs.
+fn cleanup_existing_temp_state(dry: bool, tmp_path: &str, tmp_branch: &str) -> Result<()> {
+    let entries = list_worktrees()?;
+    let mut removed_paths: HashSet<String> = HashSet::new();
+
+    // If the temp branch is checked out in any worktree, remove those first
+    // so the branch can be deleted and recreated.
+    for entry in entries
+        .iter()
+        .filter(|e| e.branch.as_deref() == Some(tmp_branch))
+    {
+        info!(
+            "Removing existing temp worktree {} for branch {}…",
+            entry.path, tmp_branch
+        );
+        let _ = git_rw(
+            dry,
+            ["worktree", "remove", "-f", entry.path.as_str()].as_slice(),
+        )?;
+        removed_paths.insert(entry.path.clone());
+    }
+
+    // Also remove a worktree registered at the exact temp path, even if the
+    // branch name is missing (e.g., detached HEAD).
+    if entries.iter().any(|e| e.path == tmp_path) && !removed_paths.contains(tmp_path) {
+        info!("Removing existing temp worktree at {}…", tmp_path);
+        let _ = git_rw(dry, ["worktree", "remove", "-f", tmp_path].as_slice())?;
+    } else if Path::new(tmp_path).exists() {
+        info!(
+            "Temp path {} exists but is not registered as a worktree; removing it…",
+            tmp_path
+        );
+        if !dry {
+            fs::remove_dir_all(tmp_path)
+                .with_context(|| format!("failed to remove existing temp path {}", tmp_path))?;
+        }
+    }
+
+    if branch_exists(tmp_branch)? {
+        info!("Deleting existing temp branch {}…", tmp_branch);
+        let _ = git_rw(dry, ["branch", "-D", tmp_branch].as_slice())?;
+    }
+
+    Ok(())
 }
 
 pub fn cherry_pick_commit(dry: bool, tmp_path: &str, sha: &str) -> Result<()> {
@@ -134,7 +259,10 @@ pub fn build_head_base_chain(base: &str, groups: &[Group], prefix: &str) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{create_backup_branch, get_current_branch_and_short};
+    use super::{
+        cleanup_temp_worktree, create_backup_branch, create_temp_worktree,
+        get_current_branch_and_short,
+    };
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -212,5 +340,47 @@ mod tests {
         let head = git(&repo, ["rev-parse", "HEAD"].as_slice());
         let backup_head = git(&repo, ["rev-parse", backup.as_str()].as_slice());
         assert_eq!(head.trim(), backup_head.trim(), "backup should match HEAD");
+    }
+
+    #[test]
+    fn create_temp_worktree_replaces_existing_temp_branch() {
+        let _lock = CWD_LOCK.lock().expect("lock cwd");
+        let dir = init_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let (_cur_branch, short) =
+            get_current_branch_and_short().expect("get current branch and short sha");
+        let merge_base = git(&repo, ["rev-parse", "HEAD"].as_slice());
+        let merge_base = merge_base.trim().to_string();
+
+        let (tmp_path, tmp_branch) = create_temp_worktree(false, "restack", &merge_base, &short)
+            .expect("create initial temp worktree");
+
+        // Simulate a failed prior run that removed the worktree but left the
+        // temp branch behind.
+        git(
+            &repo,
+            ["worktree", "remove", "-f", tmp_path.as_str()].as_slice(),
+        );
+        let branch_head = git(&repo, ["rev-parse", tmp_branch.as_str()].as_slice());
+        assert_eq!(
+            branch_head.trim(),
+            merge_base,
+            "temp branch should still exist after worktree removal"
+        );
+
+        let (tmp_path_2, tmp_branch_2) =
+            create_temp_worktree(false, "restack", &merge_base, &short)
+                .expect("recreate temp worktree after cleanup");
+        assert_eq!(tmp_path, tmp_path_2, "temp path should be stable");
+        assert_eq!(tmp_branch, tmp_branch_2, "temp branch should be stable");
+        assert!(
+            Path::new(&tmp_path_2).exists(),
+            "temp worktree path should exist"
+        );
+
+        cleanup_temp_worktree(false, &tmp_path_2, &tmp_branch_2)
+            .expect("cleanup recreated temp worktree");
     }
 }
