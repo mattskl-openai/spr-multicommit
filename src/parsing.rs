@@ -302,24 +302,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_groups_ignores_blocks() {
-        let raw = make_log(&[
-            ("a1", "feat: alpha start pr:alpha"),
-            ("a2", "feat: alpha follow-up"),
-            ("i1", "chore: experiments pr:ignore"),
-            ("i2", "wip: local spike"),
-            ("b1", "feat: beta start pr:beta"),
-            ("b2", "feat: beta follow-up"),
-        ]);
-        let groups = parse_groups(&raw, "ignore").expect("parse_groups ok");
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].tag, "alpha");
-        assert_eq!(groups[0].commits, vec!["a1", "a2"]);
-        assert_eq!(groups[1].tag, "beta");
-        assert_eq!(groups[1].commits, vec!["b1", "b2"]);
-    }
-
-    #[test]
     fn parse_groups_custom_ignore_tag() {
         let raw = make_log(&[
             ("a1", "feat: alpha start pr:alpha"),
@@ -348,6 +330,7 @@ mod tests {
             ("i1", "chore: experiments pr:ignore"),
             ("i2", "wip: local spike"),
             ("b1", "feat: beta start pr:beta"),
+            ("b2", "feat: beta follow-up"),
         ]);
         let (leading, groups) =
             parse_groups_with_ignored(&raw, "ignore").expect("parse_groups_with_ignored ok");
@@ -357,7 +340,16 @@ mod tests {
         assert_eq!(groups[0].commits, vec!["a1", "a2"]);
         assert_eq!(groups[0].ignored_after, vec!["i1", "i2"]);
         assert_eq!(groups[1].tag, "beta");
+        assert_eq!(groups[1].commits, vec!["b1", "b2"]);
         assert!(groups[1].ignored_after.is_empty());
+
+        // Superset check: the wrapper should drop ignored commits but preserve grouping.
+        let groups_via_wrapper = parse_groups(&raw, "ignore").expect("parse_groups ok");
+        assert_eq!(groups_via_wrapper.len(), 2);
+        assert_eq!(groups_via_wrapper[0].tag, "alpha");
+        assert_eq!(groups_via_wrapper[0].commits, vec!["a1", "a2"]);
+        assert_eq!(groups_via_wrapper[1].tag, "beta");
+        assert_eq!(groups_via_wrapper[1].commits, vec!["b1", "b2"]);
     }
 
     #[test]
