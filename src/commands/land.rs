@@ -11,13 +11,14 @@ use crate::parsing::derive_local_groups;
 pub fn land_until(
     base: &str,
     prefix: &str,
+    ignore_tag: &str,
     n: usize,
     dry: bool,
     mode: LandCmd,
     bypass_safety: bool,
 ) -> Result<()> {
     // Local stack is the source of truth: derive order from local groups
-    let (_merge_base, groups) = derive_local_groups(base)?;
+    let (_merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
         bail!("No local groups found; nothing to land.");
     }
@@ -217,20 +218,38 @@ pub fn land_until(
 pub fn land_per_pr_until(
     base: &str,
     prefix: &str,
+    ignore_tag: &str,
     n: usize,
     dry: bool,
     bypass_safety: bool,
 ) -> Result<()> {
-    land_until(base, prefix, n, dry, LandCmd::PerPr, bypass_safety)
+    land_until(
+        base,
+        prefix,
+        ignore_tag,
+        n,
+        dry,
+        LandCmd::PerPr,
+        bypass_safety,
+    )
 }
 
 /// Flatten: behave like per-pr landing but squash-merge the Nth PR and set its base to the actual base.
 pub fn land_flatten_until(
     base: &str,
     prefix: &str,
+    ignore_tag: &str,
     n: usize,
     dry: bool,
     bypass_safety: bool,
 ) -> Result<()> {
-    land_until(base, prefix, n, dry, LandCmd::Flatten, bypass_safety)
+    land_until(
+        base,
+        prefix,
+        ignore_tag,
+        n,
+        dry,
+        LandCmd::Flatten,
+        bypass_safety,
+    )
 }

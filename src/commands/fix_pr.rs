@@ -1,18 +1,38 @@
+//! Adjust the tail of a PR group while preserving ignore blocks.
+
 use anyhow::{anyhow, bail, Result};
 use regex::Regex;
+use std::collections::HashSet;
 use tracing::info;
 
 use crate::commands::common;
 use crate::git::git_ro;
-use crate::parsing::derive_local_groups;
+use crate::parsing::derive_local_groups_with_ignored;
 
 /// Move the last `tail_count` commits (top-of-stack) to become the tail of PR `n` (1-based, bottom→top).
-pub fn fix_pr_tail(base: &str, n: usize, tail_count: usize, safe: bool, dry: bool) -> Result<()> {
+///
+/// Ignore blocks are treated as part of the preceding group and are never moved.
+/// If the selected tail commits intersect an ignore block, the operation aborts.
+///
+/// # Errors
+///
+/// Returns errors when the target index is out of range, when the tail contains
+/// `pr:<tag>` markers, when the tail intersects ignored commits, or when Git
+/// operations (worktree creation, cherry-picks, reset) fail.
+pub fn fix_pr_tail(
+    base: &str,
+    ignore_tag: &str,
+    n: usize,
+    tail_count: usize,
+    safe: bool,
+    dry: bool,
+) -> Result<()> {
     if tail_count == 0 {
         return Ok(());
     }
 
-    let (merge_base, groups) = derive_local_groups(base)?;
+    let (merge_base, leading_ignored, groups) =
+        derive_local_groups_with_ignored(base, ignore_tag)?;
     let total_groups = groups.len();
     if total_groups == 0 {
         info!("No local PR groups found; nothing to fix.");
@@ -30,10 +50,12 @@ pub fn fix_pr_tail(base: &str, n: usize, tail_count: usize, safe: bool, dry: boo
     let target_n = n;
 
     // Flatten commits bottom→top
-    let mut all_commits: Vec<String> = groups
-        .iter()
-        .flat_map(|g| g.commits.iter().cloned())
-        .collect();
+    let mut all_commits: Vec<String> = Vec::new();
+    all_commits.extend(leading_ignored.iter().cloned());
+    for g in &groups {
+        all_commits.extend(g.commits.iter().cloned());
+        all_commits.extend(g.ignored_after.iter().cloned());
+    }
     if all_commits.is_empty() {
         info!("No commits found; nothing to fix.");
         return Ok(());
@@ -57,18 +79,49 @@ pub fn fix_pr_tail(base: &str, n: usize, tail_count: usize, safe: bool, dry: boo
             "Selected tail commit(s) contain pr:<tag> markers; cannot move commits that start or belong to PR groups: {}",
             offenders
                 .iter()
-                .map(|s| format!("{}", &s.chars().take(8).collect::<String>()))
+                .map(|s| s.chars().take(8).collect::<String>())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
     }
 
-    // Determine insertion index after last commit of PR N within the remainder
-    let last_of_n = groups
+    // Disallow moving commits from ignore blocks; they must stay attached to their PR.
+    let mut ignored_set: HashSet<String> = HashSet::new();
+    ignored_set.extend(leading_ignored.iter().cloned());
+    for g in &groups {
+        ignored_set.extend(g.ignored_after.iter().cloned());
+    }
+    let mut ignored_moved: Vec<String> = top_commits
+        .iter()
+        .filter(|sha| ignored_set.contains(*sha))
+        .cloned()
+        .collect();
+    if !ignored_moved.is_empty() {
+        ignored_moved.sort();
+        ignored_moved.dedup();
+        bail!(
+            "Selected tail commit(s) are in an ignored block; adjust --tail to avoid moving ignored commits: {}",
+            ignored_moved
+                .iter()
+                .map(|s| s.chars().take(8).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // Determine insertion index after last commit of PR N (including its ignore block) within the remainder
+    let target = groups
         .get(target_n - 1)
-        .and_then(|g| g.commits.last())
-        .ok_or_else(|| anyhow!("PR {} has no commits", target_n))?
-        .clone();
+        .ok_or_else(|| anyhow!("PR {} has no commits", target_n))?;
+    let last_of_n = if let Some(last_ignored) = target.ignored_after.last() {
+        last_ignored.clone()
+    } else {
+        target
+            .commits
+            .last()
+            .ok_or_else(|| anyhow!("PR {} has no commits", target_n))?
+            .clone()
+    };
     let insert_pos = all_commits
         .iter()
         .position(|sha| sha == &last_of_n)

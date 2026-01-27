@@ -10,11 +10,12 @@ use crate::parsing::derive_local_groups;
 pub fn prep_squash(
     base: &str,
     prefix: &str,
+    ignore_tag: &str,
     selection: crate::cli::PrepSelection,
     dry: bool,
 ) -> Result<()> {
     // Work purely on local commit stack: build groups from base..HEAD
-    let (merge_base, groups) = derive_local_groups(base)?;
+    let (merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
         info!("Nothing to prep");
         return Ok(());
@@ -197,13 +198,15 @@ pub fn prep_squash(
     };
 
     // Push updates for the selected scope (do not force PR body rewrite by default)
-    crate::commands::update::build_from_tags(base, "HEAD", prefix, false, dry, false, limit)?;
+    crate::commands::build_from_tags(
+        base, "HEAD", prefix, ignore_tag, false, dry, false, limit,
+    )?;
 
     // Add a warning to the first PR not included in the push
     if let Some(next_idx) = next_idx_opt {
         if next_idx < groups.len() {
             let next_branch = format!("{}{}", prefix, groups[next_idx].tag);
-            let prs = list_open_prs_for_heads(&[next_branch.clone()])?;
+            let prs = list_open_prs_for_heads(std::slice::from_ref(&next_branch))?;
             if let Some(pr) = prs.iter().find(|p| p.head == next_branch) {
                 append_warning_to_pr(
                     pr.number,

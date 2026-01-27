@@ -21,11 +21,13 @@ cargo install --path .
 Quick start
 -----------
 
-1. Create commits with `pr:<tag>` markers to define PR groups, bottom → top. Example:
+1. Create commits with `pr:<tag>` markers to define PR groups, bottom → top. Use `pr:ignore` to skip commits until the next `pr:<tag>`. Example:
 
 ```bash
 git commit -m "feat: parser groundwork pr:alpha"
 git commit -m "feat: alpha follow-ups"
+git commit -m "chore: local experiments pr:ignore"
+git commit -m "wip: spike cleanup"
 git commit -m "feat: new API pr:beta" -m "Body explaining the change"
 ```
 
@@ -61,12 +63,16 @@ prefix: mattskl-spr/
 # Default land mode when not specified on the CLI
 # one of: "flatten" (default) or "per-pr"
 land: flatten
+
+# Tag used to ignore commits between PR groups
+# Commit with pr:ignore_tag starts ignore mode until the next pr:<tag>
+ignore_tag: ignore
 ```
 
 Precedence for defaults:
 
 - CLI flag > repo YAML > home YAML > built-in defaults
-- Built-in defaults: `base = origin/oai-main`, `prefix = "${USER}-spr/"`, `land = flatten`
+- Built-in defaults: `base = origin/oai-main`, `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`
 
 Global flags
 ------------
@@ -100,29 +106,30 @@ Key options:
 
 Behavior:
 
-- Parses `pr:<tag>` markers from `merge-base(base, from)..from`
+- Parses `pr:<tag>` markers from `merge-base(base, from)..from` (commits between `pr:ignore` and the next `pr:<tag>` are ignored)
 - Creates/updates per-PR branches and GitHub PRs
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
   - May temporarily set existing PR bases to the repo base while pushing, then re-chain them to match the local stack
 
 ### spr restack
 
-Restack the local stack by rebasing commits after the bottom N PR groups onto the latest base.
+Restack the local stack by rebuilding commits after the bottom N PR groups onto the latest base.
 
 Options:
 
 - `--after <N|bottom|top|last|all>`: 'drop' the first N PR groups; rebase the remaining commits onto `--base`
   - `0` or `bottom`: restack all groups (moves everything after merge-base)
-  - `top` or `last` or `all`: skip all PRs; current branch is synced to the base tip after `git fetch`
- - `--safe`: create a local backup branch at current `HEAD` before rebasing
+  - `top` or `last` or `all`: skip all PRs; ignored commits (pr:ignore blocks) are preserved, so the branch may remain ahead of base
+- `--safe`: create a local backup branch at current `HEAD` before rebasing
 
 Behavior:
 
-- Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest)
-- For `--after 0`: upstream is `merge-base(base, HEAD)`
-- For `--after N>0`: upstream is the parent of the first commit of group N+1
-- Runs: `git rebase --onto <base> <upstream> <current-branch>`
- - With `--safe`, a backup branch named like `backup/restack/<current-branch>-<short-sha>` is created first
+- Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest; ignore blocks are preserved but excluded from grouping)
+- Drops the first N groups, then rebuilds the remaining commits onto `--base` via a temp worktree
+  - Ignored commits attached to dropped groups are kept before the remaining stack
+  - Ignored commits attached to kept groups move with those groups
+- Updates the current branch to the rebuilt tip
+- With `--safe`, a backup branch named like `backup/restack/<current-branch>-<short-sha>` is created first
 
 ### spr list pr
 
@@ -163,6 +170,7 @@ Aliases:
   - `--after bottom` is the same as `--after 0`
   - `--after top` is the same as `--after N`
 - `--safe`: create a local backup branch at current `HEAD` before rewriting
+ - Ignore blocks (`pr:ignore`) stay attached to the preceding PR group and move with it
 
 Prints an explicit plan, e.g.: `2..3→4: [1,2,3,4,5,6] → [1,4,2,3,5,6]`.
 
@@ -239,6 +247,7 @@ Behavior:
 
 - Rewrites local history to move the tail M commits after PR N’s tail commit
 - `--safe`: create a local backup branch at current `HEAD` before executing
+- Ignore blocks (`pr:ignore`) are preserved and cannot be moved; the command aborts if the tail intersects an ignore block
 
 ### spr cleanup
 

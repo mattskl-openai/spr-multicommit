@@ -6,10 +6,10 @@ use crate::git::{gh_rw, normalize_branch_name, sanitize_gh_base_ref};
 use crate::github::list_open_prs_for_heads;
 use crate::parsing::derive_local_groups;
 
-pub fn relink_prs(base: &str, prefix: &str, dry: bool) -> Result<()> {
+pub fn relink_prs(base: &str, prefix: &str, ignore_tag: &str, dry: bool) -> Result<()> {
     let base_n = normalize_branch_name(base);
     // Build local expected stack from base..HEAD
-    let (_merge_base, groups) = derive_local_groups(base)?;
+    let (_merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
         info!("No local groups found; nothing to fix.");
         return Ok(());
