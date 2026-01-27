@@ -1,9 +1,30 @@
+//! Shared git helpers for stack-rewriting commands.
+//!
+//! These helpers centralize the mechanics used by `restack`, `move`, and
+//! `fix-pr`: naming temporary branches/worktrees, creating safety backups, and
+//! resetting the current branch to a rebuilt tip.
+//!
+//! A subtle but important invariant is that backup branch names include the
+//! short SHA of `HEAD`. When a rewrite command fails before `HEAD` changes, a
+//! second attempt would otherwise try to create the same backup branch again
+//! and fail with "branch already exists". To keep `--safe` re-runnable after a
+//! failure, `create_backup_branch` force-updates the backup ref in place.
+//!
+//! Backup branches are local-only and are intended as an escape hatch for a
+//! single user; callers should not rely on them being immutable.
+
 use anyhow::Result;
 use tracing::info;
 
 use crate::git::{git_ro, git_rw};
 use crate::parsing::Group;
 
+/// Returns the current branch name and the short SHA of `HEAD`.
+///
+/// This is primarily used to derive stable, human-readable names for backup
+/// branches and temporary worktree branches. If `HEAD` is detached, the branch
+/// component will be reported as `HEAD`, which can lead to less useful backup
+/// names.
 pub fn get_current_branch_and_short() -> Result<(String, String)> {
     let cur_branch = git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
         .trim()
@@ -14,6 +35,16 @@ pub fn get_current_branch_and_short() -> Result<(String, String)> {
     Ok((cur_branch, short))
 }
 
+/// Creates or updates a local backup branch pointing at the current `HEAD`.
+///
+/// The backup name is derived from `(kind, cur_branch, short)` and is therefore
+/// stable for a given `HEAD`. This stability is desirable for operator clarity,
+/// but it means repeat runs at the same `HEAD` will collide. We force-update
+/// the branch (`git branch -f`) so that `spr restack --safe` remains runnable
+/// after a failed attempt that left the backup branch behind.
+///
+/// The existence check is only used to drive the log message; the branch is
+/// always updated to point at `HEAD`.
 pub fn create_backup_branch(
     dry: bool,
     kind: &str,
@@ -21,8 +52,15 @@ pub fn create_backup_branch(
     short: &str,
 ) -> Result<String> {
     let backup = format!("backup/{}/{}-{}", kind, cur_branch, short);
-    info!("Creating backup branch at HEAD: {}", backup);
-    let _ = git_rw(dry, ["branch", &backup, "HEAD"].as_slice())?;
+    let exists = git_ro(["branch", "--list", &backup].as_slice())?;
+    if exists.trim().is_empty() {
+        info!("Creating backup branch at HEAD: {}", backup);
+    } else {
+        info!("Backup branch exists; overwriting at HEAD: {}", backup);
+    }
+    // Use `-f` to make backup creation idempotent. When the name already
+    // exists, we explicitly move it to the current HEAD.
+    let _ = git_rw(dry, ["branch", "-f", &backup, "HEAD"].as_slice())?;
     Ok(backup)
 }
 
@@ -92,4 +130,87 @@ pub fn build_head_base_chain(base: &str, groups: &[Group], prefix: &str) -> Vec<
         parent = head;
     }
     expected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{create_backup_branch, get_current_branch_and_short};
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    // Tests in this module mutate the process-wide current working directory.
+    // Serialize them to avoid cross-test interference.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DirGuard {
+        original: PathBuf,
+    }
+
+    impl DirGuard {
+        fn change_to(path: &Path) -> Self {
+            let original = env::current_dir().expect("current dir available");
+            env::set_current_dir(path).expect("set current dir to temp repo");
+            Self { original }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.original).expect("restore original current dir");
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = dir.path();
+        git(repo, ["init"].as_slice());
+        git(repo, ["config", "user.email", "spr@example.com"].as_slice());
+        git(repo, ["config", "user.name", "SPR Tests"].as_slice());
+        fs::write(repo.join("file.txt"), "v1\n").expect("write file");
+        git(repo, ["add", "."].as_slice());
+        git(repo, ["commit", "-m", "init"].as_slice());
+        dir
+    }
+
+    #[test]
+    fn create_backup_branch_overwrites_existing() {
+        let _lock = CWD_LOCK.lock().expect("lock cwd");
+        let dir = init_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let (cur_branch, short) =
+            get_current_branch_and_short().expect("get current branch and short sha");
+
+        let backup =
+            create_backup_branch(false, "restack", &cur_branch, &short).expect("create backup");
+        let backup_again = create_backup_branch(false, "restack", &cur_branch, &short)
+            .expect("overwrite backup");
+
+        assert_eq!(backup, backup_again, "backup name should be stable");
+
+        let head = git(&repo, ["rev-parse", "HEAD"].as_slice());
+        let backup_head = git(&repo, ["rev-parse", backup.as_str()].as_slice());
+        assert_eq!(head.trim(), backup_head.trim(), "backup should match HEAD");
+    }
 }
