@@ -73,6 +73,8 @@ fn main() -> Result<()> {
     }
     init_tools()?;
     let cfg = crate::config::load_config()?;
+    let (base, prefix, ignore_tag) =
+        resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
     match cli.cmd {
         crate::cli::Cmd::Update {
             from,
@@ -83,8 +85,6 @@ fn main() -> Result<()> {
             extent,
         } => {
             set_dry_run_env(cli.dry_run, assume_existing_prs);
-            let (base, prefix, ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             let limit = extent.map(|e| match e {
                 crate::cli::Extent::Pr { n } => crate::limit::Limit::ByPr(n),
                 crate::cli::Extent::Commits { n } => crate::limit::Limit::ByCommits(n),
@@ -116,8 +116,6 @@ fn main() -> Result<()> {
         }
         crate::cli::Cmd::Restack { after, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            let (base, _, ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             let after_num: usize = match after.to_lowercase().as_str() {
                 "bottom" => 0,
                 "top" | "last" | "all" => usize::MAX,
@@ -132,8 +130,6 @@ fn main() -> Result<()> {
         }
         crate::cli::Cmd::Prep {} => {
             set_dry_run_env(cli.dry_run, false);
-            let (base, prefix, ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             if cli.until.is_some() && cli.exact.is_some() {
                 return Err(anyhow::anyhow!("--until conflicts with --exact"));
             }
@@ -151,8 +147,6 @@ fn main() -> Result<()> {
             crate::commands::prep_squash(&base, &prefix, &ignore_tag, selection, cli.dry_run)?;
         }
         crate::cli::Cmd::List { what } => {
-            let (base, prefix, ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             match what {
                 crate::cli::ListWhat::Pr => {
                     crate::commands::list_prs_display(&base, &prefix, &ignore_tag)?
@@ -164,8 +158,6 @@ fn main() -> Result<()> {
         }
         crate::cli::Cmd::Status {} => {
             // alias for `spr list pr`
-            let (base, prefix, ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::list_prs_display(&base, &prefix, &ignore_tag)?
         }
         crate::cli::Cmd::Land {
@@ -174,8 +166,6 @@ fn main() -> Result<()> {
             no_restack,
         } => {
             set_dry_run_env(cli.dry_run, false);
-            let (base, prefix, ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             let mode = which
                 .or(match cfg.land.as_deref() {
                     Some("per-pr") | Some("perpr") | Some("per_pr") => {
@@ -210,26 +200,18 @@ fn main() -> Result<()> {
         }
         crate::cli::Cmd::RelinkPrs {} => {
             set_dry_run_env(cli.dry_run, false);
-            let (base, prefix, ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::relink_prs(&base, &prefix, &ignore_tag, cli.dry_run)?;
         }
         crate::cli::Cmd::Cleanup {} => {
             set_dry_run_env(cli.dry_run, false);
-            let (_base, prefix, _ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::cleanup_remote_branches(&prefix, cli.dry_run)?;
         }
         crate::cli::Cmd::FixPr { n, tail, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            let (base, _prefix, ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::fix_pr_tail(&base, &ignore_tag, n, tail, safe, cli.dry_run)?;
         }
         crate::cli::Cmd::Move { range, after, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            let (base, _, ignore_tag) =
-                resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
             crate::commands::move_groups_after(
                 &base,
                 &ignore_tag,
