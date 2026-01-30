@@ -25,18 +25,36 @@ fn set_dry_run_env(dry_run: bool, assume_existing_prs: bool) {
     }
 }
 
+/// Resolve the base branch, branch prefix, and ignore tag with explicit precedence.
+///
+/// Base resolution follows: CLI `--base` → merged config `base` → discovery
+/// via `origin/HEAD`. Unlike other defaults, base discovery is not optional:
+/// if `origin/HEAD` cannot be resolved, this returns an error so the failure is
+/// visible and actionable to the user.
 fn resolve_base_prefix(
     cfg: &crate::config::Config,
     base: Option<String>,
     prefix: Option<String>,
-) -> (String, String, String) {
-    let base = base.unwrap_or_else(|| cfg.base.clone());
+) -> Result<(String, String, String)> {
+    let base = match base {
+        Some(base) => base,
+        None => {
+            if cfg.base.trim().is_empty() {
+                crate::git::discover_origin_head_base()?
+            } else {
+                cfg.base.clone()
+            }
+        }
+    };
     let mut prefix = prefix.unwrap_or_else(|| cfg.prefix.clone());
     // normalize: strip trailing '/' then ensure exactly one trailing '/'
     prefix = prefix.trim_end_matches('/').to_string();
     prefix.push('/');
-    let ignore_tag = cfg.ignore_tag.clone();
-    (base, prefix, ignore_tag)
+    let mut ignore_tag = cfg.ignore_tag.clone();
+    if ignore_tag.trim().is_empty() {
+        ignore_tag = "ignore".to_string();
+    }
+    Ok((base, prefix, ignore_tag))
 }
 
 fn main() -> Result<()> {
@@ -63,7 +81,7 @@ fn main() -> Result<()> {
     init_tools()?;
     let cfg = crate::config::load_config()?;
     let (base, prefix, ignore_tag) =
-        resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
+        resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone())?;
     let pr_description_mode = cfg.pr_description_mode;
     let restack_conflict_policy = cfg.restack_conflict;
     match cli.cmd {

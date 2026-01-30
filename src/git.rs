@@ -1,3 +1,10 @@
+//! Thin wrappers around `git`/`gh` commands plus repository-specific helpers.
+//!
+//! This module centralizes command execution, dry-run logging, and small
+//! normalization utilities used across commands. When no base branch is
+//! configured, callers rely on [`discover_origin_head_base`] to resolve the
+//! default base via `origin/HEAD`.
+
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
@@ -131,6 +138,31 @@ pub fn repo_root() -> Result<Option<String>> {
         Ok(path) => Ok(Some(path.trim().to_string())),
         Err(_) => Ok(None),
     }
+}
+
+/// Discover the repository's default branch via `origin/HEAD`.
+///
+/// This runs `git symbolic-ref --short refs/remotes/origin/HEAD` and expects
+/// output like `origin/main`. If `origin/HEAD` is unset or the command fails,
+/// callers should surface the error loudly and instruct users to set `base`
+/// explicitly in `.spr_multicommit_cfg.yml`.
+///
+/// This helper assumes the primary remote is named `origin` and that the
+/// local `origin/HEAD` symbolic ref is up to date. In repositories that use a
+/// different remote name or do not track `origin/HEAD`, explicit configuration
+/// is more reliable than discovery.
+pub fn discover_origin_head_base() -> Result<String> {
+    let out = git_ro(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"].as_slice())
+        .with_context(|| {
+            "failed to discover default branch from origin/HEAD; set `base` in .spr_multicommit_cfg.yml or run `git remote set-head origin -a`"
+        })?;
+    let base = out.trim();
+    if base.is_empty() {
+        bail!(
+            "origin/HEAD resolved to an empty ref; set `base` in .spr_multicommit_cfg.yml or run `git remote set-head origin -a`"
+        );
+    }
+    Ok(base.to_string())
 }
 
 pub fn verbose_log_cmd(tool: &str, args: &[&str]) {

@@ -39,6 +39,148 @@ fn update_stack_block(body: &str, new_block: &str) -> String {
     }
 }
 
+const MAX_BASE_UPDATES_PER_MUTATION: usize = 50;
+const MAX_BASE_MUTATION_CHARS: usize = 20_000;
+const MAX_BODY_UPDATES_PER_MUTATION: usize = 1;
+const MAX_BODY_MUTATION_CHARS: usize = 100_000;
+
+fn mutation_len_for_inputs(update_inputs: &[String]) -> usize {
+    let mut current_len = "mutation {".len() + 1;
+    for (i, input) in update_inputs.iter().enumerate() {
+        let alias = format!("m{}: ", i);
+        let frag = format!(
+            "updatePullRequest(input:{{{}}}){{ clientMutationId }} ",
+            input
+        );
+        current_len += alias.len() + frag.len();
+    }
+    current_len + 1
+}
+
+fn chunk_update_inputs(
+    update_inputs: &[String],
+    max_ops: usize,
+    max_chars: usize,
+) -> Vec<Vec<String>> {
+    let mut chunks: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_len = "mutation {".len() + 1;
+    for input in update_inputs {
+        let alias = format!("m{}: ", current.len());
+        let frag = format!(
+            "updatePullRequest(input:{{{}}}){{ clientMutationId }} ",
+            input
+        );
+        let next_len = current_len + alias.len() + frag.len();
+        if !current.is_empty() && (current.len() + 1 > max_ops || next_len > max_chars) {
+            chunks.push(current);
+            current = Vec::new();
+            current_len = "mutation {".len() + 1;
+        }
+        let alias = format!("m{}: ", current.len());
+        let frag = format!(
+            "updatePullRequest(input:{{{}}}){{ clientMutationId }} ",
+            input
+        );
+        current_len += alias.len() + frag.len();
+        current.push(input.clone());
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn is_resource_limit_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("RESOURCE_LIMITS_EXCEEDED")
+        || msg.contains("Resource limits for this query exceeded")
+}
+
+fn run_update_chunk(dry: bool, update_inputs: &[String]) -> Result<()> {
+    if update_inputs.is_empty() {
+        return Ok(());
+    }
+    let mut m = String::from("mutation {");
+    for (i, input) in update_inputs.iter().enumerate() {
+        m.push_str(&format!(
+            "m{}: updatePullRequest(input:{{{}}}){{ clientMutationId }} ",
+            i, input
+        ));
+    }
+    m.push('}');
+    gh_rw(
+        dry,
+        ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
+    )?;
+    Ok(())
+}
+
+fn run_update_chunk_with_retry(
+    dry: bool,
+    update_inputs: &[String],
+    pb: &ProgressBar,
+) -> Result<()> {
+    if update_inputs.is_empty() {
+        return Ok(());
+    }
+    match run_update_chunk(dry, update_inputs) {
+        Ok(()) => {
+            pb.inc(update_inputs.len() as u64);
+            Ok(())
+        }
+        Err(e) if is_resource_limit_error(&e) && update_inputs.len() > 1 => {
+            info!(
+                "Resource limits for this query exceeded; retrying with smaller chunks ({} updates)",
+                update_inputs.len()
+            );
+            let mid = update_inputs.len() / 2;
+            let (left, right) = update_inputs.split_at(mid);
+            run_update_chunk_with_retry(dry, left, pb)?;
+            run_update_chunk_with_retry(dry, right, pb)?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_update_mutations(
+    dry: bool,
+    update_inputs: Vec<String>,
+    label: &str,
+    max_ops: usize,
+    max_chars: usize,
+    prefer_single: bool,
+) -> Result<()> {
+    if update_inputs.is_empty() {
+        return Ok(());
+    }
+    let total_updates = update_inputs.len();
+    let pb = ProgressBar::new(total_updates as u64);
+    pb.set_style(
+        ProgressStyle::with_template(&format!(
+            "{{spinner}} {} {{pos}}/{{len}} PR(s)…",
+            label
+        ))
+        .unwrap()
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.enable_steady_tick(Duration::from_millis(120));
+    let chunks = if prefer_single && mutation_len_for_inputs(&update_inputs) <= max_chars {
+        vec![update_inputs]
+    } else {
+        chunk_update_inputs(&update_inputs, max_ops, max_chars)
+    };
+    for chunk in chunks {
+        if let Err(e) = run_update_chunk_with_retry(dry, &chunk, &pb) {
+            pb.finish_and_clear();
+            return Err(e);
+        }
+    }
+    pb.finish_and_clear();
+    Ok(())
+}
+
 /// Bootstrap/refresh stack from already-parsed PR groups.
 pub fn build_from_groups(
     base: &str,
@@ -176,8 +318,7 @@ pub fn build_from_groups(
             if !all_correct {
                 // Temporarily set base of all existing PRs to the repo base (e.g., main)
                 let bodies_by_number_pre = fetch_pr_bodies_graphql(&numbers_full_pre)?;
-                let mut m = String::from("mutation {");
-                let mut update_count = 0usize;
+                let mut base_updates_pre: Vec<String> = Vec::new();
                 for (num, info) in bodies_by_number_pre.iter() {
                     // Skip if already on base
                     let base_target = sanitize_gh_base_ref(base);
@@ -206,29 +347,17 @@ pub fn build_from_groups(
                         format!("pullRequestId:\"{}\"", info.id),
                         format!("baseRefName:\"{}\"", graphql_escape(&base_target)),
                     ];
-                    m.push_str(&format!(
-                        "m{}: updatePullRequest(input:{{{}}}){{ clientMutationId }} ",
-                        update_count,
-                        fields.join(", ")
-                    ));
-                    update_count += 1;
+                    base_updates_pre.push(fields.join(", "));
                 }
-                m.push('}');
-                if update_count > 0 {
-                    let pb = ProgressBar::new_spinner();
-                    pb.set_style(
-                        ProgressStyle::with_template("{spinner} Updating {pos} PR(s)…")
-                            .unwrap()
-                            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-                    );
-                    pb.set_position(update_count as u64);
-                    pb.enable_steady_tick(Duration::from_millis(120));
-                    let res = gh_rw(
+                if !base_updates_pre.is_empty() {
+                    run_update_mutations(
                         dry,
-                        ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
-                    );
-                    pb.finish_and_clear();
-                    res?;
+                        base_updates_pre,
+                        "Updating PR bases",
+                        MAX_BASE_UPDATES_PER_MUTATION,
+                        MAX_BASE_MUTATION_CHARS,
+                        true,
+                    )?;
                 }
             }
         }
@@ -370,21 +499,11 @@ pub fn build_from_groups(
         }
         let fetch_list: Vec<u64> = fetch_set.into_iter().collect();
         let bodies_by_number = fetch_pr_bodies_graphql(&fetch_list)?;
-        // Combine updates per PR: (id, maybe_body, maybe_base)
-        struct UpdateSpec {
-            id: String,
-            body: Option<String>,
-            base: Option<String>,
-        }
-        let mut update_specs: HashMap<u64, UpdateSpec> = HashMap::new();
-        // Bodies: always update (full or stack_only based on config)
+        let mut body_updates: Vec<String> = Vec::new();
+        let mut base_updates: Vec<String> = Vec::new();
+        // Bodies: always update (full or stack-only based on config)
         for (&num, stack_block) in &desired_stack_by_number {
             if let Some(info) = bodies_by_number.get(&num) {
-                let entry = update_specs.entry(num).or_insert(UpdateSpec {
-                    id: info.id.clone(),
-                    body: None,
-                    base: None,
-                });
                 match pr_description_mode {
                     PrDescriptionMode::Overwrite => {
                         if let Some(base) = base_body_by_number.get(&num) {
@@ -393,12 +512,20 @@ pub fn build_from_groups(
                             } else {
                                 format!("{}\n\n{}", base, stack_block)
                             };
-                            entry.body = Some(body);
+                            let fields = [
+                                format!("pullRequestId:\"{}\"", info.id),
+                                format!("body:\"{}\"", graphql_escape(&body)),
+                            ];
+                            body_updates.push(fields.join(", "));
                         }
                     }
                     PrDescriptionMode::StackOnly => {
                         let body = update_stack_block(&info.body, stack_block);
-                        entry.body = Some(body);
+                        let fields = [
+                            format!("pullRequestId:\"{}\"", info.id),
+                            format!("body:\"{}\"", graphql_escape(&body)),
+                        ];
+                        body_updates.push(fields.join(", "));
                     }
                 }
             }
@@ -406,46 +533,37 @@ pub fn build_from_groups(
         // Bases: set post-push to ensure final linkage
         for (&num, want_base) in &desired_base_by_number {
             if let Some(info) = bodies_by_number.get(&num) {
-                let entry = update_specs.entry(num).or_insert(UpdateSpec {
-                    id: info.id.clone(),
-                    body: None,
-                    base: None,
-                });
-                entry.base = Some(sanitize_gh_base_ref(want_base));
+                let fields = [
+                    format!("pullRequestId:\"{}\"", info.id),
+                    format!(
+                        "baseRefName:\"{}\"",
+                        graphql_escape(&sanitize_gh_base_ref(want_base))
+                    ),
+                ];
+                base_updates.push(fields.join(", "));
             }
         }
-        if !update_specs.is_empty() {
-            let mut m = String::from("mutation {");
-            let total_updates = update_specs.len();
-            for (i, (_num, spec)) in update_specs.into_iter().enumerate() {
-                let mut fields: Vec<String> = vec![format!("pullRequestId:\"{}\"", spec.id)];
-                if let Some(b) = spec.body {
-                    fields.push(format!("body:\"{}\"", graphql_escape(&b)));
-                }
-                if let Some(base_ref) = spec.base {
-                    fields.push(format!("baseRefName:\"{}\"", graphql_escape(&base_ref)));
-                }
-                m.push_str(&format!(
-                    "m{}: updatePullRequest(input:{{{}}}){{ clientMutationId }} ",
-                    i,
-                    fields.join(", ")
-                ));
+        if !base_updates.is_empty() || !body_updates.is_empty() {
+            if !base_updates.is_empty() {
+                run_update_mutations(
+                    dry,
+                    base_updates,
+                    "Updating PR bases",
+                    MAX_BASE_UPDATES_PER_MUTATION,
+                    MAX_BASE_MUTATION_CHARS,
+                    true,
+                )?;
             }
-            m.push('}');
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::with_template("{spinner} Updating {pos} PR(s)…")
-                    .unwrap()
-                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-            );
-            pb.set_position(total_updates as u64);
-            pb.enable_steady_tick(Duration::from_millis(120));
-            let res = gh_rw(
-                dry,
-                ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
-            );
-            pb.finish_and_clear();
-            res?;
+            if !body_updates.is_empty() {
+                run_update_mutations(
+                    dry,
+                    body_updates,
+                    "Updating PR descriptions",
+                    MAX_BODY_UPDATES_PER_MUTATION,
+                    MAX_BODY_MUTATION_CHARS,
+                    false,
+                )?;
+            }
         } else {
             info!("All PR descriptions/base refs up-to-date; no edits needed");
         }
