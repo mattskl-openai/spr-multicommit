@@ -26,27 +26,16 @@ fn set_dry_run_env(dry_run: bool, assume_existing_prs: bool) {
 }
 
 fn resolve_base_prefix(
-    cfg: &crate::config::FileConfig,
+    cfg: &crate::config::Config,
     base: Option<String>,
     prefix: Option<String>,
 ) -> (String, String, String) {
-    let base = base
-        .or(cfg.base.clone())
-        .unwrap_or_else(|| "origin/oai-main".to_string());
-    let user = std::env::var("USER").unwrap_or_else(|_| "".to_string());
-    let mut prefix = prefix
-        .or(cfg.prefix.clone())
-        .unwrap_or_else(|| format!("{}-spr", user));
+    let base = base.unwrap_or_else(|| cfg.base.clone());
+    let mut prefix = prefix.unwrap_or_else(|| cfg.prefix.clone());
     // normalize: strip trailing '/' then ensure exactly one trailing '/'
     prefix = prefix.trim_end_matches('/').to_string();
     prefix.push('/');
-    let mut ignore_tag = cfg
-        .ignore_tag
-        .clone()
-        .unwrap_or_else(|| "ignore".to_string());
-    if ignore_tag.trim().is_empty() {
-        ignore_tag = "ignore".to_string();
-    }
+    let ignore_tag = cfg.ignore_tag.clone();
     (base, prefix, ignore_tag)
 }
 
@@ -75,14 +64,14 @@ fn main() -> Result<()> {
     let cfg = crate::config::load_config()?;
     let (base, prefix, ignore_tag) =
         resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
-    let overwrite_pr_description = cfg.overwrite_pr_description.unwrap_or(true);
+    let pr_description_mode = cfg.pr_description_mode;
     match cli.cmd {
         crate::cli::Cmd::Update {
             from,
             no_pr,
             restack,
             assume_existing_prs,
-            update_pr_body,
+            pr_description_mode: pr_description_mode_override,
             extent,
         } => {
             set_dry_run_env(cli.dry_run, assume_existing_prs);
@@ -90,7 +79,7 @@ fn main() -> Result<()> {
                 crate::cli::Extent::Pr { n } => crate::limit::Limit::ByPr(n),
                 crate::cli::Extent::Commits { n } => crate::limit::Limit::ByCommits(n),
             });
-            let overwrite_pr_description = overwrite_pr_description || update_pr_body;
+            let pr_description_mode = pr_description_mode_override.unwrap_or(pr_description_mode);
             if restack {
                 return Err(anyhow::anyhow!(
                     "`spr update --restack` is deprecated. Use `spr restack --after N` instead."
@@ -110,7 +99,7 @@ fn main() -> Result<()> {
                     &prefix,
                     no_pr,
                     cli.dry_run,
-                    overwrite_pr_description,
+                    pr_description_mode,
                     limit,
                     groups,
                 )?;
@@ -150,7 +139,7 @@ fn main() -> Result<()> {
                 &base,
                 &prefix,
                 &ignore_tag,
-                overwrite_pr_description,
+                pr_description_mode,
                 selection,
                 cli.dry_run,
             )?;
@@ -175,14 +164,10 @@ fn main() -> Result<()> {
             no_restack,
         } => {
             set_dry_run_env(cli.dry_run, false);
-            let mode = which
-                .or(match cfg.land.as_deref() {
-                    Some("per-pr") | Some("perpr") | Some("per_pr") => {
-                        Some(crate::cli::LandCmd::PerPr)
-                    }
-                    _ => Some(crate::cli::LandCmd::Flatten),
-                })
-                .unwrap_or(crate::cli::LandCmd::Flatten);
+            let mode = which.unwrap_or_else(|| match cfg.land.as_str() {
+                "per-pr" | "perpr" | "per_pr" => crate::cli::LandCmd::PerPr,
+                _ => crate::cli::LandCmd::Flatten,
+            });
             let until = cli.until.unwrap_or(0);
             match mode {
                 crate::cli::LandCmd::Flatten => crate::commands::land_flatten_until(

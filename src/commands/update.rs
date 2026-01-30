@@ -5,6 +5,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::commands::common;
+use crate::config::PrDescriptionMode;
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
     fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_open_prs_for_heads,
@@ -44,7 +45,7 @@ pub fn build_from_groups(
     prefix: &str,
     no_pr: bool,
     dry: bool,
-    overwrite_pr_description: bool,
+    pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
     mut groups: Vec<Group>,
 ) -> Result<()> {
@@ -376,7 +377,7 @@ pub fn build_from_groups(
             base: Option<String>,
         }
         let mut update_specs: HashMap<u64, UpdateSpec> = HashMap::new();
-        // Bodies: always update (full or stack-only based on config)
+        // Bodies: always update (full or stack_only based on config)
         for (&num, stack_block) in &desired_stack_by_number {
             if let Some(info) = bodies_by_number.get(&num) {
                 let entry = update_specs.entry(num).or_insert(UpdateSpec {
@@ -384,18 +385,21 @@ pub fn build_from_groups(
                     body: None,
                     base: None,
                 });
-                if overwrite_pr_description {
-                    if let Some(base) = base_body_by_number.get(&num) {
-                        let body = if base.trim().is_empty() {
-                            stack_block.clone()
-                        } else {
-                            format!("{}\n\n{}", base, stack_block)
-                        };
+                match pr_description_mode {
+                    PrDescriptionMode::Overwrite => {
+                        if let Some(base) = base_body_by_number.get(&num) {
+                            let body = if base.trim().is_empty() {
+                                stack_block.clone()
+                            } else {
+                                format!("{}\n\n{}", base, stack_block)
+                            };
+                            entry.body = Some(body);
+                        }
+                    }
+                    PrDescriptionMode::StackOnly => {
+                        let body = update_stack_block(&info.body, stack_block);
                         entry.body = Some(body);
                     }
-                } else {
-                    let body = update_stack_block(&info.body, stack_block);
-                    entry.body = Some(body);
                 }
             }
         }
@@ -480,18 +484,10 @@ pub fn build_from_tags(
     ignore_tag: &str,
     no_pr: bool,
     dry: bool,
-    overwrite_pr_description: bool,
+    pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
 ) -> Result<()> {
     let (_merge_base, groups): (String, Vec<Group>) =
         derive_groups_between(base, from, ignore_tag)?;
-    build_from_groups(
-        base,
-        prefix,
-        no_pr,
-        dry,
-        overwrite_pr_description,
-        limit,
-        groups,
-    )
+    build_from_groups(base, prefix, no_pr, dry, pr_description_mode, limit, groups)
 }

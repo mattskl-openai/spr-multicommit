@@ -68,15 +68,14 @@ land: flatten
 # Commit with pr:ignore_tag starts ignore mode until the next pr:<tag>
 ignore_tag: ignore
 
-# Whether `spr update` overwrites PR descriptions from commit messages
-# When false, only the stack block is managed; the rest is preserved
-overwrite_pr_description: true
+# How `spr update` manages PR descriptions from commit messages
+pr_description_mode: overwrite | stack_only
 ```
 
 Precedence for defaults:
 
 - CLI flag > repo YAML > home YAML > built-in defaults
-- Built-in defaults: `base = origin/oai-main`, `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `overwrite_pr_description = true`
+- Built-in defaults: `base = origin/oai-main`, `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`
 
 Global flags
 ------------
@@ -103,7 +102,7 @@ Key options:
 
 - `--from <REF>`: commit range upper bound when parsing tags (default `HEAD`) (untested)
 - `--no-pr`: only (re)create branches; skip PR creation/updates (untested)
-- `--update-pr-body`: force PR description rewrites (overrides `overwrite_pr_description`)
+- `--pr-description-mode <overwrite|stack_only>`: override `pr_description_mode` for this update run
 - Extent (optional subcommand):
   - `pr --n <N>`: limit to first N PRs from the bottom
   - `commits --n <N>`: limit to first N commits (untested)
@@ -113,7 +112,7 @@ Behavior:
 - Parses `pr:<tag>` markers from `merge-base(base, from)..from` (commits between `pr:ignore` and the next `pr:<tag>` are ignored)
 - Creates/updates per-PR branches and GitHub PRs
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
-  - When `overwrite_pr_description` is false, only the stack block (between markers) is updated; the rest of the body is preserved
+  - When `pr_description_mode` is `stack_only`, only the stack block (between markers) is updated; the rest of the body is preserved
   - May temporarily set existing PR bases to the repo base while pushing, then re-chain them to match the local stack
 
 ### spr restack

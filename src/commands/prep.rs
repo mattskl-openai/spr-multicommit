@@ -11,7 +11,7 @@ pub fn prep_squash(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
-    overwrite_pr_description: bool,
+    pr_description_mode: crate::config::PrDescriptionMode,
     selection: crate::cli::PrepSelection,
     dry: bool,
 ) -> Result<()> {
@@ -206,7 +206,7 @@ pub fn prep_squash(
         ignore_tag,
         false,
         dry,
-        overwrite_pr_description,
+        pr_description_mode,
         limit,
     )?;
 
@@ -216,17 +216,20 @@ pub fn prep_squash(
             let next_branch = format!("{}{}", prefix, groups[next_idx].tag);
             let prs = list_open_prs_for_heads(std::slice::from_ref(&next_branch))?;
             if let Some(pr) = prs.iter().find(|p| p.head == next_branch) {
-                if overwrite_pr_description {
-                    append_warning_to_pr(
-                        pr.number,
-                        "🚨🚨 parent PRs have changed, this PR may show extra diffs from parent PR 🚨🚨",
-                        dry,
-                    )?;
-                } else {
-                    info!(
-                        "PR description overwrites disabled; skipping warning on PR #{}",
-                        pr.number
-                    );
+                match pr_description_mode {
+                    crate::config::PrDescriptionMode::Overwrite => {
+                        append_warning_to_pr(
+                            pr.number,
+                            "🚨🚨 parent PRs have changed, this PR may show extra diffs from parent PR 🚨🚨",
+                            dry,
+                        )?;
+                    }
+                    crate::config::PrDescriptionMode::StackOnly => {
+                        info!(
+                            "PR description mode is stack_only; skipping warning on PR #{}",
+                            pr.number
+                        );
+                    }
                 }
             }
         }
