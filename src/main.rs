@@ -65,6 +65,7 @@ fn main() -> Result<()> {
     let (base, prefix, ignore_tag) =
         resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone());
     let pr_description_mode = cfg.pr_description_mode;
+    let restack_conflict_policy = cfg.restack_conflict;
     match cli.cmd {
         crate::cli::Cmd::Update {
             from,
@@ -117,7 +118,14 @@ fn main() -> Result<()> {
                     )
                 })?,
             };
-            crate::commands::restack_after(&base, &ignore_tag, after_num, safe, cli.dry_run)?;
+            crate::commands::restack_after(
+                &base,
+                &ignore_tag,
+                after_num,
+                safe,
+                cli.dry_run,
+                restack_conflict_policy,
+            )?;
         }
         crate::cli::Cmd::Prep {} => {
             set_dry_run_env(cli.dry_run, false);
@@ -189,7 +197,14 @@ fn main() -> Result<()> {
             }
             if !no_restack {
                 // After landing the first N PRs, restack the remaining commits onto the latest base
-                crate::commands::restack_after(&base, &ignore_tag, until, false, cli.dry_run)?;
+                crate::commands::restack_after(
+                    &base,
+                    &ignore_tag,
+                    until,
+                    false,
+                    cli.dry_run,
+                    restack_conflict_policy,
+                )?;
             }
         }
         crate::cli::Cmd::RelinkPrs {} => {
