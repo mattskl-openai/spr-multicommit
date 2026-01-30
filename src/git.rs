@@ -6,7 +6,7 @@
 //! default base via `origin/HEAD`.
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use tracing::{error, info};
 
@@ -94,15 +94,55 @@ pub fn run(bin: &str, args: &[&str]) -> Result<String> {
         .output()
         .with_context(|| format!("failed to spawn {}", bin))?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let stderr = dedupe_prefixed_lines(bin, &stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         error!(
             "{} {:?} failed\nstdout:\n{}\nstderr:\n{}",
             bin, args, stdout, stderr
         );
-        bail!("command failed: {} {:?}", bin, args);
+        bail!(
+            "command failed: {} {:?}\nstdout:\n{}\nstderr:\n{}",
+            bin,
+            args,
+            stdout,
+            stderr
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn dedupe_prefixed_lines(bin: &str, stderr: &str) -> String {
+    let prefix = format!("{}:", bin);
+    let prefix_sp = format!("{}: ", bin);
+    let mut prefixed: HashSet<String> = HashSet::new();
+    for line in stderr.lines() {
+        if let Some(rest) = line
+            .strip_prefix(&prefix_sp)
+            .or_else(|| line.strip_prefix(&prefix))
+        {
+            prefixed.insert(rest.trim().to_string());
+        }
+    }
+    if prefixed.is_empty() {
+        return stderr.to_string();
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for line in stderr.lines() {
+        if line
+            .strip_prefix(&prefix_sp)
+            .or_else(|| line.strip_prefix(&prefix))
+            .is_some()
+        {
+            out.push(line);
+            continue;
+        }
+        if prefixed.contains(line.trim()) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 pub fn shellish(args: &[&str]) -> String {
