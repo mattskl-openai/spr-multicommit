@@ -7,11 +7,15 @@ use crate::limit::Limit;
 use crate::parsing::derive_local_groups;
 
 /// Squash PRs according to selection; operate locally then run update for the affected groups.
+///
+/// `list_order` is forwarded to the update step so progress output and PR lists use the
+/// same display order as `spr list`.
 pub fn prep_squash(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
     pr_description_mode: crate::config::PrDescriptionMode,
+    list_order: crate::config::ListOrder,
     selection: crate::cli::PrepSelection,
     dry: bool,
 ) -> Result<()> {
@@ -208,6 +212,7 @@ pub fn prep_squash(
         dry,
         pr_description_mode,
         limit,
+        list_order,
     )?;
 
     // Add a warning to the first PR not included in the push

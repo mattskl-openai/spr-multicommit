@@ -37,6 +37,43 @@ impl Default for RestackConflictPolicy {
     }
 }
 
+/// Output ordering for list-style displays.
+///
+/// The local stack order remains bottom-up and continues to define local PR numbers and
+/// commit indices; this enum only selects which entries are shown first. If a caller
+/// repurposes this for stack ordering, users will see renumbered or shuffled output that
+/// no longer matches the underlying commit chain.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListOrder {
+    /// Most recent items appear at the top (reverse of local stack order).
+    RecentOnTop,
+    /// Most recent items appear at the bottom (local stack order).
+    RecentOnBottom,
+}
+
+impl Default for ListOrder {
+    fn default() -> Self {
+        Self::RecentOnBottom
+    }
+}
+
+impl ListOrder {
+    /// Return 0-based group indices in the configured display order.
+    ///
+    /// The indices always refer to the local stack ordering (bottom-up). This means
+    /// `RecentOnTop` simply reverses iteration without renumbering. If a caller uses these
+    /// indices to renumber local PRs or commit indices, the visible order will disagree
+    /// with the bottom-up numbering.
+    pub fn display_indices(self, len: usize) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..len).collect();
+        if self == ListOrder::RecentOnTop {
+            indices.reverse();
+        }
+        indices
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct FileConfig {
     /// Root base branch for the stack, e.g. `origin/main`.
@@ -51,6 +88,8 @@ pub struct FileConfig {
     pub ignore_tag: Option<String>,
     /// How `spr update` should manage PR descriptions from commit messages.
     pub pr_description_mode: Option<PrDescriptionMode>,
+    /// Order for printing PR/commit lists and update progress output.
+    pub list_order: Option<ListOrder>,
     /// Behavior when `spr restack` encounters a cherry-pick conflict.
     ///
     /// Supported values:
@@ -68,6 +107,8 @@ pub struct Config {
     pub ignore_tag: String,
     /// How `spr update` should manage PR descriptions from commit messages.
     pub pr_description_mode: PrDescriptionMode,
+    /// Order for printing PR/commit lists and update progress output.
+    pub list_order: ListOrder,
     /// Behavior when `spr restack` encounters a cherry-pick conflict.
     pub restack_conflict: RestackConflictPolicy,
 }
@@ -89,6 +130,7 @@ fn default_config() -> Config {
         land: "flatten".to_string(),
         ignore_tag: "ignore".to_string(),
         pr_description_mode: PrDescriptionMode::Overwrite,
+        list_order: ListOrder::RecentOnBottom,
         restack_conflict: RestackConflictPolicy::Rollback,
     }
 }
@@ -109,6 +151,9 @@ fn apply_overrides(config: &Config, overrides: FileConfig) -> Config {
     }
     if let Some(pr_description_mode) = overrides.pr_description_mode {
         merged.pr_description_mode = pr_description_mode;
+    }
+    if let Some(list_order) = overrides.list_order {
+        merged.list_order = list_order;
     }
     if let Some(restack_conflict) = overrides.restack_conflict {
         merged.restack_conflict = restack_conflict;

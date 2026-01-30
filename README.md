@@ -72,6 +72,10 @@ ignore_tag: ignore
 # How `spr update` manages PR descriptions from commit messages
 pr_description_mode: overwrite | stack_only
 
+# Order for printing PR/commit lists
+# one of: "recent_on_bottom" (default) or "recent_on_top"
+list_order: recent_on_bottom
+
 # How `spr restack` behaves on cherry-pick conflicts: "rollback" (default) or "halt"
 restack_conflict: rollback
 ```
@@ -80,7 +84,7 @@ Precedence for defaults:
 
 - CLI flag > repo YAML > home YAML > git discovery (`origin/HEAD`)
 - Base has no built-in fallback; if discovery fails, set `base` explicitly
-- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `restack_conflict = rollback`
+- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `list_order = recent_on_bottom`, `restack_conflict = rollback`
 
 Global flags
 ------------
@@ -146,7 +150,7 @@ Behavior:
 
 ### spr list pr
 
-Lists PRs in the current stack (bottom → top) for the configured prefix.
+Lists PRs in the current stack for the configured prefix. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers remain bottom → top.
 
 Aliases:
 
@@ -164,7 +168,7 @@ Alias for `spr list pr`.
 
 ### spr list commit
 
-Lists commits in the current stack (bottom → top), grouped by local PR. Each group header shows the local PR number and branch (and remote PR number when available). Within each group, each line shows the bottom-up commit index (1-based) and the short SHA.
+Lists commits in the current stack, grouped by local PR. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers and commit indices remain bottom → top.
 
 Aliases:
 
