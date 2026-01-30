@@ -1,3 +1,8 @@
+//! Repository and user configuration for `spr`.
+//!
+//! Configuration is loaded from `$HOME/.spr_multicommit_cfg.yml` and then
+//! overridden by `<repo-root>/.spr_multicommit_cfg.yml` when present.
+
 use anyhow::Result;
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -6,12 +11,30 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
-#[value_enum(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
 pub enum PrDescriptionMode {
     /// Overwrite the entire PR body from commit messages + stack block.
     Overwrite,
     /// Only update the stack block; preserve the rest of the PR body.
     StackOnly,
+}
+
+/// Behavior when `spr restack` encounters a cherry-pick conflict.
+///
+/// This is YAML-deserializable and avoids stringly-typed policy handling.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RestackConflictPolicy {
+    /// Abort and clean up temp restack state (default).
+    Rollback,
+    /// Halt and leave the temp worktree/branch for manual resolution.
+    Halt,
+}
+
+impl Default for RestackConflictPolicy {
+    fn default() -> Self {
+        Self::Rollback
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -23,6 +46,12 @@ pub struct FileConfig {
     pub ignore_tag: Option<String>,
     /// How `spr update` should manage PR descriptions from commit messages.
     pub pr_description_mode: Option<PrDescriptionMode>,
+    /// Behavior when `spr restack` encounters a cherry-pick conflict.
+    ///
+    /// Supported values:
+    /// - `rollback` (default): abort and clean up temp restack state
+    /// - `halt`: stop and leave the temp worktree for manual resolution
+    pub restack_conflict: Option<RestackConflictPolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +63,8 @@ pub struct Config {
     pub ignore_tag: String,
     /// How `spr update` should manage PR descriptions from commit messages.
     pub pr_description_mode: PrDescriptionMode,
+    /// Behavior when `spr restack` encounters a cherry-pick conflict.
+    pub restack_conflict: RestackConflictPolicy,
 }
 
 fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
@@ -53,6 +84,7 @@ fn default_config() -> Config {
         land: "flatten".to_string(),
         ignore_tag: "ignore".to_string(),
         pr_description_mode: PrDescriptionMode::Overwrite,
+        restack_conflict: RestackConflictPolicy::Rollback,
     }
 }
 
@@ -72,6 +104,9 @@ fn apply_overrides(config: &Config, overrides: FileConfig) -> Config {
     }
     if let Some(pr_description_mode) = overrides.pr_description_mode {
         merged.pr_description_mode = pr_description_mode;
+    }
+    if let Some(restack_conflict) = overrides.restack_conflict {
+        merged.restack_conflict = restack_conflict;
     }
     merged
 }

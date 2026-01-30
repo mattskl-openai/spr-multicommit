@@ -70,12 +70,15 @@ ignore_tag: ignore
 
 # How `spr update` manages PR descriptions from commit messages
 pr_description_mode: overwrite | stack_only
+
+# How `spr restack` behaves on cherry-pick conflicts: "rollback" (default) or "halt"
+restack_conflict: rollback
 ```
 
 Precedence for defaults:
 
 - CLI flag > repo YAML > home YAML > built-in defaults
-- Built-in defaults: `base = origin/oai-main`, `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`
+- Built-in defaults: `base = origin/oai-main`, `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `restack_conflict = rollback`
 
 Global flags
 ------------
@@ -134,6 +137,10 @@ Behavior:
   - Ignored commits attached to kept groups move with those groups
 - Updates the current branch to the rebuilt tip
 - With `--safe`, a backup branch named like `backup/restack/<current-branch>-<short-sha>` is created first
+- Conflict handling is controlled by `restack_conflict` in config.
+- `rollback` (default) aborts the restack and attempts to clean up the temp restack worktree and branch (cleanup failures may require manual cleanup).
+- `halt` stops on conflict, leaves the temp restack worktree and branch in place, and prints manual rollback/continue instructions.
+- When using `halt`, resolve conflicts inside the printed temp worktree path; resolving in your original worktree will not advance the halted cherry-pick.
 
 ### spr list pr
 
