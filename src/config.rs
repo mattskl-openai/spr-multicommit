@@ -39,6 +39,11 @@ impl Default for RestackConflictPolicy {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct FileConfig {
+    /// Root base branch for the stack, e.g. `origin/main`.
+    ///
+    /// When this is `None` and the CLI does not supply `--base`, the caller
+    /// attempts to discover the base via `origin/HEAD` and will error loudly if
+    /// discovery fails.
     pub base: Option<String>,
     pub prefix: Option<String>,
     pub land: Option<String>,
@@ -79,7 +84,7 @@ fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
 fn default_config() -> Config {
     let user = std::env::var("USER").unwrap_or_else(|_| "".to_string());
     Config {
-        base: "origin/oai-main".to_string(),
+        base: String::new(),
         prefix: format!("{}-spr/", user),
         land: "flatten".to_string(),
         ignore_tag: "ignore".to_string(),

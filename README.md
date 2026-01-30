@@ -53,8 +53,9 @@ spr reads configuration from YAML in two locations (repo overrides home):
 Supported keys:
 
 ```yaml
-# Default base branch used when not provided via CLI
-base: origin/oai-main  # example; use your repo's default (e.g., main)
+# Base branch used as the root of the stack
+# If omitted, spr discovers origin/HEAD and errors if discovery fails
+base: origin/main
 
 # Branch prefix used for per-PR branches
 # Trailing slashes are normalized to exactly one
@@ -77,8 +78,9 @@ restack_conflict: rollback
 
 Precedence for defaults:
 
-- CLI flag > repo YAML > home YAML > built-in defaults
-- Built-in defaults: `base = origin/oai-main`, `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `restack_conflict = rollback`
+- CLI flag > repo YAML > home YAML > git discovery (`origin/HEAD`)
+- Base has no built-in fallback; if discovery fails, set `base` explicitly
+- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `restack_conflict = rollback`
 
 Global flags
 ------------
