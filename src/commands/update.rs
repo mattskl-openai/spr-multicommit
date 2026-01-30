@@ -253,7 +253,7 @@ pub fn build_from_groups(
             // Fallback to default lease behavior if we couldn't resolve remote SHAs.
             argv.push("--force-with-lease".into());
         } else {
-            argv.extend(force_leases.clone());
+            argv.extend(force_leases);
         }
         argv.extend(force_refspecs.clone());
         let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
