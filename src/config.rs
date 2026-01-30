@@ -52,12 +52,6 @@ pub enum ListOrder {
     RecentOnBottom,
 }
 
-impl Default for ListOrder {
-    fn default() -> Self {
-        Self::RecentOnBottom
-    }
-}
-
 impl ListOrder {
     /// Return 0-based group indices in the configured display order.
     ///
@@ -130,7 +124,7 @@ fn default_config() -> Config {
         land: "flatten".to_string(),
         ignore_tag: "ignore".to_string(),
         pr_description_mode: PrDescriptionMode::Overwrite,
-        list_order: ListOrder::RecentOnBottom,
+        list_order: ListOrder::RecentOnTop,
         restack_conflict: RestackConflictPolicy::Rollback,
     }
 }
