@@ -84,6 +84,7 @@ fn main() -> Result<()> {
         resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone())?;
     let pr_description_mode = cfg.pr_description_mode;
     let restack_conflict_policy = cfg.restack_conflict;
+    let list_order = cfg.list_order;
     match cli.cmd {
         crate::cli::Cmd::Update {
             from,
@@ -121,6 +122,7 @@ fn main() -> Result<()> {
                     pr_description_mode,
                     limit,
                     groups,
+                    list_order,
                 )?;
             }
         }
@@ -166,6 +168,7 @@ fn main() -> Result<()> {
                 &prefix,
                 &ignore_tag,
                 pr_description_mode,
+                list_order,
                 selection,
                 cli.dry_run,
             )?;
@@ -173,16 +176,16 @@ fn main() -> Result<()> {
         crate::cli::Cmd::List { what } => {
             match what {
                 crate::cli::ListWhat::Pr => {
-                    crate::commands::list_prs_display(&base, &prefix, &ignore_tag)?
+                    crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
                 }
                 crate::cli::ListWhat::Commit => {
-                    crate::commands::list_commits_display(&base, &prefix, &ignore_tag)?
+                    crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?
                 }
             }
         }
         crate::cli::Cmd::Status {} => {
             // alias for `spr list pr`
-            crate::commands::list_prs_display(&base, &prefix, &ignore_tag)?
+            crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
         }
         crate::cli::Cmd::Land {
             which,

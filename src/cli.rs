@@ -17,10 +17,10 @@ pub enum PrepSelection {
 
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub enum ListWhat {
-    /// List PRs in the stack (bottom-up)
+    /// List PRs in the stack (order via list_order config)
     #[command(alias = "p")]
     Pr,
-    /// List commits in the stack (bottom-up)
+    /// List commits in the stack (order via list_order config)
     #[command(alias = "c")]
     Commit,
 }

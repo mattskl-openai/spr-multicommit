@@ -5,7 +5,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::commands::common;
-use crate::config::PrDescriptionMode;
+use crate::config::{ListOrder, PrDescriptionMode};
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
     fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_open_prs_for_heads,
@@ -182,6 +182,11 @@ fn run_update_mutations(
 }
 
 /// Bootstrap/refresh stack from already-parsed PR groups.
+///
+/// `groups` must be in local stack order (bottom-up); that order is still used for base
+/// chaining and local PR numbering even when display is reversed. `list_order` controls
+/// the order in which groups are visited for rebuild logging and list output. If a caller
+/// shuffles `groups`, PR base updates will target the wrong branches.
 pub fn build_from_groups(
     base: &str,
     prefix: &str,
@@ -190,6 +195,7 @@ pub fn build_from_groups(
     pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
     mut groups: Vec<Group>,
+    list_order: ListOrder,
 ) -> Result<()> {
     if groups.is_empty() {
         info!("No groups discovered; nothing to do.");
@@ -244,11 +250,13 @@ pub fn build_from_groups(
     }
     let mut planned: Vec<PlannedPush> = vec![];
 
-    for (idx, g) in groups.iter_mut().enumerate() {
+    let display_indices = list_order.display_indices(groups.len());
+    for (display_idx, group_idx) in display_indices.iter().enumerate() {
+        let g = &groups[*group_idx];
         let branch = format!("{}{}", prefix, g.tag);
         info!(
             "({}/{}) Rebuilding branch {}",
-            idx + 1,
+            display_idx + 1,
             total_groups,
             branch
         );
@@ -572,7 +580,9 @@ pub fn build_from_groups(
     // Print full stack PR list in bottom→top order: "- <url> - <title>"
     if !no_pr {
         let mut ordered: Vec<(u64, String)> = vec![];
-        for g in &groups {
+        let display_indices = list_order.display_indices(groups.len());
+        for group_idx in display_indices {
+            let g = &groups[group_idx];
             let head_branch = format!("{}{}", prefix, g.tag);
             if let Some(&n) = prs_by_head.get(&head_branch) {
                 // Use local group title (source of truth for desired title)
@@ -595,6 +605,9 @@ pub fn build_from_groups(
 }
 
 /// Bootstrap/refresh stack from pr:<tag> markers on `from` vs merge-base(base, from).
+///
+/// This derives groups in local stack order and forwards `list_order` so rebuild progress
+/// and printed lists follow the same display order as `spr list`.
 pub fn build_from_tags(
     base: &str,
     from: &str,
@@ -604,8 +617,18 @@ pub fn build_from_tags(
     dry: bool,
     pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
+    list_order: ListOrder,
 ) -> Result<()> {
     let (_merge_base, groups): (String, Vec<Group>) =
         derive_groups_between(base, from, ignore_tag)?;
-    build_from_groups(base, prefix, no_pr, dry, pr_description_mode, limit, groups)
+    build_from_groups(
+        base,
+        prefix,
+        no_pr,
+        dry,
+        pr_description_mode,
+        limit,
+        groups,
+        list_order,
+    )
 }
