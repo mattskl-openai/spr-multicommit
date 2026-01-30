@@ -46,9 +46,9 @@ pub enum Cmd {
         #[arg(long)]
         assume_existing_prs: bool,
 
-        /// Rewrite PR descriptions (bodies) even when content would be unchanged
-        #[arg(long, default_value_t = false)]
-        update_pr_body: bool,
+        /// How to manage PR descriptions (overrides pr_description_mode config)
+        #[arg(long, value_enum)]
+        pr_description_mode: Option<crate::config::PrDescriptionMode>,
 
         /// Limit how much to update (optional sub-mode)
         #[command(subcommand)]

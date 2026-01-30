@@ -1,15 +1,39 @@
 use anyhow::Result;
+use clap::ValueEnum;
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value_enum(rename_all = "snake_case")]
+pub enum PrDescriptionMode {
+    /// Overwrite the entire PR body from commit messages + stack block.
+    Overwrite,
+    /// Only update the stack block; preserve the rest of the PR body.
+    StackOnly,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct FileConfig {
     pub base: Option<String>,
     pub prefix: Option<String>,
     pub land: Option<String>,
     /// Optional `pr:<tag>` value that starts an ignore block during group parsing.
     pub ignore_tag: Option<String>,
+    /// How `spr update` should manage PR descriptions from commit messages.
+    pub pr_description_mode: Option<PrDescriptionMode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub base: String,
+    pub prefix: String,
+    pub land: String,
+    /// Optional `pr:<tag>` value that starts an ignore block during group parsing.
+    pub ignore_tag: String,
+    /// How `spr update` should manage PR descriptions from commit messages.
+    pub pr_description_mode: PrDescriptionMode,
 }
 
 fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
@@ -21,25 +45,54 @@ fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
     Ok(Some(cfg))
 }
 
-pub fn load_config() -> Result<FileConfig> {
+fn default_config() -> Config {
+    let user = std::env::var("USER").unwrap_or_else(|_| "".to_string());
+    Config {
+        base: "origin/oai-main".to_string(),
+        prefix: format!("{}-spr/", user),
+        land: "flatten".to_string(),
+        ignore_tag: "ignore".to_string(),
+        pr_description_mode: PrDescriptionMode::Overwrite,
+    }
+}
+
+fn apply_overrides(config: &Config, overrides: FileConfig) -> Config {
+    let mut merged = config.clone();
+    if let Some(base) = overrides.base {
+        merged.base = base;
+    }
+    if let Some(prefix) = overrides.prefix {
+        merged.prefix = prefix;
+    }
+    if let Some(land) = overrides.land {
+        merged.land = land;
+    }
+    if let Some(ignore_tag) = overrides.ignore_tag {
+        merged.ignore_tag = ignore_tag;
+    }
+    if let Some(pr_description_mode) = overrides.pr_description_mode {
+        merged.pr_description_mode = pr_description_mode;
+    }
+    merged
+}
+
+fn normalize_config(config: &mut Config) {
+    let mut prefix = config.prefix.trim_end_matches('/').to_string();
+    prefix.push('/');
+    config.prefix = prefix;
+    if config.ignore_tag.trim().is_empty() {
+        config.ignore_tag = "ignore".to_string();
+    }
+}
+
+pub fn load_config() -> Result<Config> {
     // Home config
-    let mut merged = FileConfig::default();
+    let mut merged = default_config();
     if let Some(home) = std::env::var_os("HOME") {
         let mut p = PathBuf::from(home);
         p.push(".spr_multicommit_cfg.yml");
         if let Some(home_cfg) = read_config_file(&p)? {
-            if let Some(b) = home_cfg.base {
-                merged.base = Some(b);
-            }
-            if let Some(pfx) = home_cfg.prefix {
-                merged.prefix = Some(pfx);
-            }
-            if let Some(mode) = home_cfg.land {
-                merged.land = Some(mode);
-            }
-            if let Some(ignore_tag) = home_cfg.ignore_tag {
-                merged.ignore_tag = Some(ignore_tag);
-            }
+            merged = apply_overrides(&merged, home_cfg);
         }
     }
 
@@ -48,20 +101,10 @@ pub fn load_config() -> Result<FileConfig> {
         let mut p = PathBuf::from(root);
         p.push(".spr_multicommit_cfg.yml");
         if let Some(repo_cfg) = read_config_file(&p)? {
-            if repo_cfg.base.is_some() {
-                merged.base = repo_cfg.base;
-            }
-            if repo_cfg.prefix.is_some() {
-                merged.prefix = repo_cfg.prefix;
-            }
-            if repo_cfg.land.is_some() {
-                merged.land = repo_cfg.land;
-            }
-            if repo_cfg.ignore_tag.is_some() {
-                merged.ignore_tag = repo_cfg.ignore_tag;
-            }
+            merged = apply_overrides(&merged, repo_cfg);
         }
     }
 
+    normalize_config(&mut merged);
     Ok(merged)
 }

@@ -5,6 +5,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::commands::common;
+use crate::config::PrDescriptionMode;
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
     fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_open_prs_for_heads,
@@ -13,13 +14,38 @@ use crate::github::{
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{derive_groups_between, Group};
 
+/// Replace the existing spr stack block with `new_block`, or append it if missing.
+///
+/// The stack block is delimited by `<!-- spr-stack:start -->` and
+/// `<!-- spr-stack:end -->`. If the markers are absent, the block is appended
+/// with a blank line separator (or becomes the whole body when empty).
+fn update_stack_block(body: &str, new_block: &str) -> String {
+    let start = "<!-- spr-stack:start -->";
+    let end = "<!-- spr-stack:end -->";
+    if let (Some(s), Some(e)) = (body.find(start), body.find(end)) {
+        if e >= s {
+            let e = e + end.len();
+            let mut out = String::new();
+            out.push_str(&body[..s]);
+            out.push_str(new_block);
+            out.push_str(&body[e..]);
+            return out;
+        }
+    }
+    if body.trim().is_empty() {
+        new_block.to_string()
+    } else {
+        format!("{}\n\n{}", body, new_block)
+    }
+}
+
 /// Bootstrap/refresh stack from already-parsed PR groups.
 pub fn build_from_groups(
     base: &str,
     prefix: &str,
     no_pr: bool,
     dry: bool,
-    _update_pr_body: bool,
+    pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
     mut groups: Vec<Group>,
 ) -> Result<()> {
@@ -300,19 +326,22 @@ pub fn build_from_groups(
                 numbers_full.push(n);
             }
         }
-        let numbers_rev: Vec<u64> = numbers_full.iter().cloned().rev().collect();
-        // Build desired bodies and base refs from local commits
-        let mut desired_by_number: HashMap<u64, String> = HashMap::new();
+        // Build desired stack blocks and base refs from local commits
+        let mut desired_stack_by_number: HashMap<u64, String> = HashMap::new();
+        let mut base_body_by_number: HashMap<u64, String> = HashMap::new();
         let mut desired_base_by_number: HashMap<u64, String> = HashMap::new();
         let chain = common::build_head_base_chain(base, &groups, prefix);
+        let numbers_rev: Vec<u64> = numbers_full.iter().cloned().rev().collect();
         for (head_branch, want_base_ref) in chain {
             if let Some(&num) = prs_by_head.get(&head_branch) {
+                desired_base_by_number.insert(num, want_base_ref.clone());
                 // Stack visual (optional rewrite)
                 if let Some(g) = groups
                     .iter()
                     .find(|g| format!("{}{}", prefix, g.tag) == head_branch)
                 {
                     let base = g.pr_body_base()?;
+                    base_body_by_number.insert(num, base);
                     let mut lines = String::new();
                     for n in &numbers_rev {
                         let marker = if *n == num {
@@ -326,20 +355,14 @@ pub fn build_from_groups(
                         "<!-- spr-stack:start -->\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n<!-- spr-stack:end -->",
                         lines.trim_end(),
                     );
-                    let body = if base.trim().is_empty() {
-                        stack_block.clone()
-                    } else {
-                        format!("{}\n\n{}", base, stack_block)
-                    };
-                    desired_by_number.insert(num, body);
-                    desired_base_by_number.insert(num, want_base_ref.clone());
+                    desired_stack_by_number.insert(num, stack_block);
                 }
             }
         }
 
         // Fetch PR ids/bodies for union of all PRs we may rewrite bodies for
         let mut fetch_set: std::collections::HashSet<u64> = numbers_full.iter().cloned().collect();
-        for &n in desired_by_number.keys() {
+        for &n in desired_stack_by_number.keys() {
             fetch_set.insert(n);
         }
         for &n in desired_base_by_number.keys() {
@@ -354,15 +377,30 @@ pub fn build_from_groups(
             base: Option<String>,
         }
         let mut update_specs: HashMap<u64, UpdateSpec> = HashMap::new();
-        // Bodies: always update
-        for (&num, desired) in &desired_by_number {
+        // Bodies: always update (full or stack_only based on config)
+        for (&num, stack_block) in &desired_stack_by_number {
             if let Some(info) = bodies_by_number.get(&num) {
                 let entry = update_specs.entry(num).or_insert(UpdateSpec {
                     id: info.id.clone(),
                     body: None,
                     base: None,
                 });
-                entry.body = Some(desired.clone());
+                match pr_description_mode {
+                    PrDescriptionMode::Overwrite => {
+                        if let Some(base) = base_body_by_number.get(&num) {
+                            let body = if base.trim().is_empty() {
+                                stack_block.clone()
+                            } else {
+                                format!("{}\n\n{}", base, stack_block)
+                            };
+                            entry.body = Some(body);
+                        }
+                    }
+                    PrDescriptionMode::StackOnly => {
+                        let body = update_stack_block(&info.body, stack_block);
+                        entry.body = Some(body);
+                    }
+                }
             }
         }
         // Bases: set post-push to ensure final linkage
@@ -446,10 +484,10 @@ pub fn build_from_tags(
     ignore_tag: &str,
     no_pr: bool,
     dry: bool,
-    _update_pr_body: bool,
+    pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
 ) -> Result<()> {
     let (_merge_base, groups): (String, Vec<Group>) =
         derive_groups_between(base, from, ignore_tag)?;
-    build_from_groups(base, prefix, no_pr, dry, _update_pr_body, limit, groups)
+    build_from_groups(base, prefix, no_pr, dry, pr_description_mode, limit, groups)
 }

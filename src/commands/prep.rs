@@ -11,6 +11,7 @@ pub fn prep_squash(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
+    pr_description_mode: crate::config::PrDescriptionMode,
     selection: crate::cli::PrepSelection,
     dry: bool,
 ) -> Result<()> {
@@ -197,9 +198,16 @@ pub fn prep_squash(
         crate::cli::PrepSelection::Exact(i) => (Some(Limit::ByPr(i)), Some(i)),
     };
 
-    // Push updates for the selected scope (do not force PR body rewrite by default)
+    // Push updates for the selected scope (respect PR body overwrite config)
     crate::commands::build_from_tags(
-        base, "HEAD", prefix, ignore_tag, false, dry, false, limit,
+        base,
+        "HEAD",
+        prefix,
+        ignore_tag,
+        false,
+        dry,
+        pr_description_mode,
+        limit,
     )?;
 
     // Add a warning to the first PR not included in the push
@@ -208,11 +216,21 @@ pub fn prep_squash(
             let next_branch = format!("{}{}", prefix, groups[next_idx].tag);
             let prs = list_open_prs_for_heads(std::slice::from_ref(&next_branch))?;
             if let Some(pr) = prs.iter().find(|p| p.head == next_branch) {
-                append_warning_to_pr(
-                    pr.number,
-                    "🚨🚨 parent PRs have changed, this PR may show extra diffs from parent PR 🚨🚨",
-                    dry,
-                )?;
+                match pr_description_mode {
+                    crate::config::PrDescriptionMode::Overwrite => {
+                        append_warning_to_pr(
+                            pr.number,
+                            "🚨🚨 parent PRs have changed, this PR may show extra diffs from parent PR 🚨🚨",
+                            dry,
+                        )?;
+                    }
+                    crate::config::PrDescriptionMode::StackOnly => {
+                        info!(
+                            "PR description mode is stack_only; skipping warning on PR #{}",
+                            pr.number
+                        );
+                    }
+                }
             }
         }
     }
