@@ -191,7 +191,7 @@ fn main() -> Result<()> {
             no_restack,
         } => {
             set_dry_run_env(cli.dry_run, false);
-            let mode = which.unwrap_or_else(|| match cfg.land.as_str() {
+            let mode = which.unwrap_or(match cfg.land.as_str() {
                 "per-pr" | "perpr" | "per_pr" => crate::cli::LandCmd::PerPr,
                 _ => crate::cli::LandCmd::Flatten,
             });
