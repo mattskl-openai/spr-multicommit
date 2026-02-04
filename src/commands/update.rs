@@ -184,6 +184,7 @@ fn run_update_mutations(
 /// chaining and local PR numbering even when display is reversed. `list_order` controls
 /// the order in which groups are visited for rebuild logging and list output. If a caller
 /// shuffles `groups`, PR base updates will target the wrong branches.
+#[allow(clippy::too_many_arguments)]
 pub fn build_from_groups(
     base: &str,
     prefix: &str,
@@ -605,6 +606,7 @@ pub fn build_from_groups(
 ///
 /// This derives groups in local stack order and forwards `list_order` so rebuild progress
 /// and printed lists follow the same display order as `spr list`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_from_tags(
     base: &str,
     from: &str,
