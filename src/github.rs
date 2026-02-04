@@ -1,3 +1,10 @@
+//! GitHub API helpers used by `spr` commands.
+//!
+//! This module centralizes read/write calls to GitHub so command modules can operate on
+//! typed results instead of raw JSON. The status-list path relies on branch-name lookups:
+//! for each local stack head, we resolve either the currently open PR or (if none is open)
+//! the latest merged PR for that same head ref.
+
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -14,10 +21,17 @@ pub struct PrInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
+    /// The head ref currently has an open pull request.
     Open,
+    /// The head ref has no open pull request but does have a merged pull request.
     Merged,
 }
 
+/// Pull request identity plus the state classification used by stack status display.
+///
+/// The `head` is expected to match a synthetic stack branch name (for example
+/// `dank-spr/foo`), and `state` indicates whether this record came from an open PR query
+/// or a merged PR fallback query.
 #[derive(Debug, Clone)]
 pub struct PrInfoWithState {
     pub number: u64,
@@ -255,8 +269,23 @@ pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
     Ok(out)
 }
 
-/// Fetch, for each requested head branch, either the open PR (preferred) or the
-/// latest merged PR when no open PR exists. Returns at most one PR per head.
+/// Fetches one status-bearing PR per requested head branch.
+///
+/// For each entry in `heads`, this function first checks for an open PR and falls back to
+/// a merged PR only when no open PR exists. That precedence keeps status output focused on
+/// active review state and avoids showing a stale merged marker when a new PR has been
+/// opened from the same branch name.
+///
+/// The return vector contains at most one item per requested head; heads with no open or
+/// merged PR are omitted entirely. Callers should treat absence as "no known remote PR".
+///
+/// If a caller incorrectly assumes one output row per input head, it can misalign local and
+/// remote state and display incorrect status icons.
+///
+/// # Errors
+///
+/// Returns an error when repository identification fails, when `gh api graphql` fails, or
+/// when the GraphQL response cannot be parsed.
 pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoWithState>> {
     let mut out: Vec<PrInfoWithState> = Vec::new();
     if heads.is_empty() {

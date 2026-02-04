@@ -3,6 +3,11 @@
 //! The local stack order is derived bottom-up from commits and is the source of truth for
 //! local PR numbers and commit indices. `ListOrder` only affects which groups or commits
 //! are shown first; it does not change the underlying numbering.
+//!
+//! For `spr list pr`, the leading two-character status slot is:
+//! - `CI` + `Review` symbols for open PRs
+//! - `⑃M` for merged PRs
+//! - `??` when no matching PR metadata is available
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -15,6 +20,12 @@ use crate::github::{
 };
 use crate::parsing::derive_local_groups;
 
+/// Maps remote PR state into the two-character status slot used by `spr list pr`.
+///
+/// Open PRs show CI and review icons independently, while merged PRs intentionally use the
+/// fixed marker `⑃M` so they are visually distinct from open green PRs (`✓✓`). If callers
+/// pass an open PR number that is missing from `status_map`, this returns `??`; displaying
+/// anything else would incorrectly imply CI/review information was fetched.
 fn status_icons(
     pr_state: Option<PrState>,
     pr_number: Option<u64>,
