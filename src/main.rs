@@ -173,16 +173,14 @@ fn main() -> Result<()> {
                 cli.dry_run,
             )?;
         }
-        crate::cli::Cmd::List { what } => {
-            match what {
-                crate::cli::ListWhat::Pr => {
-                    crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
-                }
-                crate::cli::ListWhat::Commit => {
-                    crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?
-                }
+        crate::cli::Cmd::List { what } => match what {
+            crate::cli::ListWhat::Pr => {
+                crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
             }
-        }
+            crate::cli::ListWhat::Commit => {
+                crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?
+            }
+        },
         crate::cli::Cmd::Status {} => {
             // alias for `spr list pr`
             crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?

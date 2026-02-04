@@ -158,12 +158,9 @@ fn run_update_mutations(
     let total_updates = update_inputs.len();
     let pb = ProgressBar::new(total_updates as u64);
     pb.set_style(
-        ProgressStyle::with_template(&format!(
-            "{{spinner}} {} {{pos}}/{{len}} PR(s)…",
-            label
-        ))
-        .unwrap()
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        ProgressStyle::with_template(&format!("{{spinner}} {} {{pos}}/{{len}} PR(s)…", label))
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
     );
     pb.enable_steady_tick(Duration::from_millis(120));
     let chunks = if prefer_single && mutation_len_for_inputs(&update_inputs) <= max_chars {
