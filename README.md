@@ -156,7 +156,7 @@ Aliases:
 
 - `p`
 
-Legend: CI ✓/✗/◐ and Review ✓/✗/◐ indicate passing/failing/pending states when available.
+Legend: CI ✓/✗/◐ and Review ✓/✗/◐ indicate passing/failing/pending states when available. `⑃M` indicates the PR is already merged.
 
 ### spr status
 

@@ -12,6 +12,19 @@ pub struct PrInfo {
     pub base: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Merged,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrInfoWithState {
+    pub number: u64,
+    pub head: String,
+    pub state: PrState,
+}
+
 #[derive(Clone)]
 pub struct PrBodyInfo {
     pub id: String,
@@ -236,6 +249,81 @@ pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
                     out.push(PrInfo { number, head, base });
                 }
             }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Fetch, for each requested head branch, either the open PR (preferred) or the
+/// latest merged PR when no open PR exists. Returns at most one PR per head.
+pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoWithState>> {
+    let mut out: Vec<PrInfoWithState> = Vec::new();
+    if heads.is_empty() {
+        return Ok(out);
+    }
+    let (owner, name) = get_repo_owner_name()?;
+
+    // Build one query with two aliases per head: open and merged.
+    let mut q =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (i, head) in heads.iter().enumerate() {
+        q.push_str(&format!(
+            "openPr{}: pullRequests(headRefName:\"{}\", states:[OPEN], first:1) {{ nodes {{ number headRefName baseRefName }} }} ",
+            i,
+            graphql_escape(head)
+        ));
+        q.push_str(&format!(
+            "mergedPr{}: pullRequests(headRefName:\"{}\", states:[MERGED], first:1) {{ nodes {{ number headRefName baseRefName }} }} ",
+            i,
+            graphql_escape(head)
+        ));
+    }
+    q.push_str("} }");
+
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", q),
+            "-F",
+            &format!("owner={}", owner),
+            "-F",
+            &format!("name={}", name),
+        ]
+        .as_slice(),
+    )?;
+
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &v["data"]["repository"];
+    for (i, _head) in heads.iter().enumerate() {
+        let open_key = format!("openPr{}", i);
+        let merged_key = format!("mergedPr{}", i);
+
+        let open_node = repo[&open_key]["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.first());
+        let merged_node = repo[&merged_key]["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.first());
+
+        let (node, state) = if let Some(node) = open_node {
+            (node, PrState::Open)
+        } else if let Some(node) = merged_node {
+            (node, PrState::Merged)
+        } else {
+            continue;
+        };
+
+        let number = node["number"].as_u64().unwrap_or(0);
+        if number > 0 {
+            let head = node["headRefName"].as_str().unwrap_or("").to_string();
+            out.push(PrInfoWithState {
+                number,
+                head,
+                state,
+            });
         }
     }
 

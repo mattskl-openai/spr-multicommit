@@ -5,11 +5,49 @@
 //! are shown first; it does not change the underlying numbering.
 
 use anyhow::Result;
+use std::collections::HashMap;
 use tracing::info;
 
 use crate::config::ListOrder;
-use crate::github::{fetch_pr_ci_review_status, list_open_prs_for_heads};
+use crate::github::{
+    fetch_pr_ci_review_status, list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
+    PrCiReviewStatus, PrState,
+};
 use crate::parsing::derive_local_groups;
+
+fn status_icons(
+    pr_state: Option<PrState>,
+    pr_number: Option<u64>,
+    status_map: &HashMap<u64, PrCiReviewStatus>,
+) -> (&'static str, &'static str) {
+    match pr_state {
+        Some(PrState::Merged) => ("⑃", "M"),
+        Some(PrState::Open) => {
+            if let Some(n) = pr_number {
+                if let Some(st) = status_map.get(&n) {
+                    let ci_icon = match st.ci_state.as_str() {
+                        "SUCCESS" => "✓",
+                        "FAILURE" | "ERROR" => "✗",
+                        "PENDING" | "EXPECTED" => "◐",
+                        _ => "?",
+                    };
+                    let rv_icon = match st.review_decision.as_str() {
+                        "APPROVED" => "✓",
+                        "CHANGES_REQUESTED" => "✗",
+                        "REVIEW_REQUIRED" => "◐",
+                        _ => "?",
+                    };
+                    (ci_icon, rv_icon)
+                } else {
+                    ("?", "?")
+                }
+            } else {
+                ("?", "?")
+            }
+        }
+        None => ("?", "?"),
+    }
+}
 
 /// Print a per-PR summary for the current local stack.
 ///
@@ -38,11 +76,14 @@ pub fn list_prs_display(
         .iter()
         .map(|g| format!("{}{}", prefix, g.tag))
         .collect();
-    let prs = list_open_prs_for_heads(&heads)?; // may be empty; that's fine
-    let mut status_map: std::collections::HashMap<u64, crate::github::PrCiReviewStatus> =
-        std::collections::HashMap::new();
+    let prs = list_open_or_merged_prs_for_heads(&heads)?; // may be empty; that's fine
+    let mut status_map: HashMap<u64, PrCiReviewStatus> = HashMap::new();
     if !prs.is_empty() {
-        let numbers: Vec<u64> = prs.iter().map(|p| p.number).collect();
+        let numbers: Vec<u64> = prs
+            .iter()
+            .filter(|p| p.state == PrState::Open)
+            .map(|p| p.number)
+            .collect();
         if let Ok(m) = fetch_pr_ci_review_status(&numbers) {
             status_map = m;
         }
@@ -56,7 +97,9 @@ pub fn list_prs_display(
     for group_idx in display_indices {
         let g = &groups[group_idx];
         let head_branch = format!("{}{}", prefix, g.tag);
-        let num = prs.iter().find(|p| p.head == head_branch).map(|p| p.number);
+        let pr = prs.iter().find(|p| p.head == head_branch);
+        let num = pr.map(|p| p.number);
+        let pr_state = pr.map(|p| p.state);
         let count = g.commits.len();
         let plural = if count == 1 { "commit" } else { "commits" };
         let first_sha = g.commits.first().map(|s| s.as_str()).unwrap_or("");
@@ -69,39 +112,11 @@ pub fn list_prs_display(
             Some(n) => format!(" (#{})", n),
             None => "".to_string(),
         };
-        // Status icons
-        let (ci_icon, rv_icon) = if let Some(n) = num {
-            if let Some(st) = status_map.get(&n) {
-                let ci_icon = match st.ci_state.as_str() {
-                    "SUCCESS" => "✓",
-                    "FAILURE" | "ERROR" => "✗",
-                    "PENDING" | "EXPECTED" => "◐",
-                    _ => "?",
-                };
-                let rv_icon = match st.review_decision.as_str() {
-                    "APPROVED" => "✓",
-                    "CHANGES_REQUESTED" => "✗",
-                    "REVIEW_REQUIRED" => "◐",
-                    _ => "?",
-                };
-                (ci_icon, rv_icon)
-            } else {
-                ("?", "?")
-            }
-        } else {
-            ("?", "?")
-        };
+        let (ci_icon, rv_icon) = status_icons(pr_state, num, &status_map);
         let local_pr_num = group_idx + 1;
         info!(
             "{}{} LPR #{} - {} : {}{} - {} {}",
-            ci_icon,
-            rv_icon,
-            local_pr_num,
-            short,
-            head_branch,
-            remote_pr_num_str,
-            count,
-            plural
+            ci_icon, rv_icon, local_pr_num, short, head_branch, remote_pr_num_str, count, plural
         );
         let subject_idx = if list_order == ListOrder::RecentOnTop {
             g.subjects.len().saturating_sub(1)
@@ -120,6 +135,45 @@ pub fn list_prs_display(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_icons_uses_merged_marker() {
+        let status_map = HashMap::new();
+        assert_eq!(
+            status_icons(Some(PrState::Merged), Some(42), &status_map),
+            ("⑃", "M")
+        );
+    }
+
+    #[test]
+    fn status_icons_maps_open_ci_and_review_states() {
+        let mut status_map = HashMap::new();
+        status_map.insert(
+            7,
+            PrCiReviewStatus {
+                ci_state: "SUCCESS".to_string(),
+                review_decision: "APPROVED".to_string(),
+            },
+        );
+        assert_eq!(
+            status_icons(Some(PrState::Open), Some(7), &status_map),
+            ("✓", "✓")
+        );
+    }
+
+    #[test]
+    fn status_icons_unknown_when_status_missing() {
+        let status_map = HashMap::new();
+        assert_eq!(
+            status_icons(Some(PrState::Open), Some(99), &status_map),
+            ("?", "?")
+        );
+    }
 }
 
 /// Print commits grouped by local PR, keeping commit indices in bottom-up order.
