@@ -31,8 +31,7 @@ pub fn fix_pr_tail(
         return Ok(());
     }
 
-    let (merge_base, leading_ignored, groups) =
-        derive_local_groups_with_ignored(base, ignore_tag)?;
+    let (merge_base, leading_ignored, groups) = derive_local_groups_with_ignored(base, ignore_tag)?;
     let total_groups = groups.len();
     if total_groups == 0 {
         info!("No local PR groups found; nothing to fix.");

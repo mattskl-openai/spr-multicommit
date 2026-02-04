@@ -70,7 +70,14 @@ impl CherryPickOp {
 
 fn cherry_pick_head_exists(tmp_path: &str) -> bool {
     Command::new("git")
-        .args(["-C", tmp_path, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"])
+        .args([
+            "-C",
+            tmp_path,
+            "rev-parse",
+            "-q",
+            "--verify",
+            "CHERRY_PICK_HEAD",
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -247,7 +254,12 @@ pub fn restack_after(
 
     // Create a local backup branch pointing to current HEAD before rewriting
     let backup_branch = if safe {
-        Some(common::create_backup_branch(dry, "restack", &cur_branch, &short)?)
+        Some(common::create_backup_branch(
+            dry,
+            "restack",
+            &cur_branch,
+            &short,
+        )?)
     } else {
         None
     };
