@@ -60,6 +60,14 @@ fn status_icons(
     }
 }
 
+/// Return the subject shown on the indented summary line for a PR group.
+///
+/// This is always the first (oldest) commit subject in the group. Display ordering only
+/// controls which groups are listed first and must not change the per-group summary subject.
+fn summary_subject(subjects: &[String], _list_order: ListOrder) -> &str {
+    subjects.first().map(|s| s.as_str()).unwrap_or("")
+}
+
 /// Print a per-PR summary for the current local stack.
 ///
 /// The local stack order is derived bottom-up from commits, so local PR numbers are based
@@ -129,16 +137,7 @@ pub fn list_prs_display(
             "{}{} LPR #{} - {} : {}{} - {} {}",
             ci_icon, rv_icon, local_pr_num, short, head_branch, remote_pr_num_str, count, plural
         );
-        let subject_idx = if list_order == ListOrder::RecentOnTop {
-            g.subjects.len().saturating_sub(1)
-        } else {
-            0
-        };
-        let first_subject = g
-            .subjects
-            .get(subject_idx)
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let first_subject = summary_subject(&g.subjects, list_order);
         info!(
             "{s}{s}{s}{s}{s}{subject}",
             s = crate::format::EM_SPACE,
@@ -224,6 +223,7 @@ pub fn list_commits_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ListOrder;
 
     #[test]
     fn status_icons_uses_merged_marker() {
@@ -256,6 +256,23 @@ mod tests {
         assert_eq!(
             status_icons(Some(PrState::Open), Some(99), &status_map),
             ("?", "?")
+        );
+    }
+
+    #[test]
+    fn summary_subject_uses_first_commit_subject_for_any_display_order() {
+        let subjects = vec![
+            "oldest commit subject".to_string(),
+            "newest commit subject".to_string(),
+        ];
+
+        assert_eq!(
+            summary_subject(&subjects, ListOrder::RecentOnBottom),
+            "oldest commit subject"
+        );
+        assert_eq!(
+            summary_subject(&subjects, ListOrder::RecentOnTop),
+            "oldest commit subject"
         );
     }
 }
