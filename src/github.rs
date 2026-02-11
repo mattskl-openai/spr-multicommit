@@ -8,7 +8,7 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::git::{gh_ro, gh_rw, git_ro};
 
@@ -298,12 +298,12 @@ pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoW
         String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
     for (i, head) in heads.iter().enumerate() {
         q.push_str(&format!(
-            "openPr{}: pullRequests(headRefName:\"{}\", states:[OPEN], first:1) {{ nodes {{ number headRefName baseRefName }} }} ",
+            "openPr{}: pullRequests(headRefName:\"{}\", states:[OPEN], first:1, orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ number headRefName baseRefName }} }} ",
             i,
             graphql_escape(head)
         ));
         q.push_str(&format!(
-            "mergedPr{}: pullRequests(headRefName:\"{}\", states:[MERGED], first:1) {{ nodes {{ number headRefName baseRefName }} }} ",
+            "mergedPr{}: pullRequests(headRefName:\"{}\", states:[MERGED], first:1, orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ number headRefName baseRefName }} }} ",
             i,
             graphql_escape(head)
         ));
@@ -337,22 +337,26 @@ pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoW
             .as_array()
             .and_then(|nodes| nodes.first());
 
-        let (node, state) = if let Some(node) = open_node {
-            (node, PrState::Open)
+        let (node, state, alias) = if let Some(node) = open_node {
+            (node, PrState::Open, open_key.as_str())
         } else if let Some(node) = merged_node {
-            (node, PrState::Merged)
+            (node, PrState::Merged, merged_key.as_str())
         } else {
             continue;
         };
 
-        let number = node["number"].as_u64().unwrap_or(0);
-        if number > 0 {
+        if let Some(number) = node["number"].as_u64().filter(|n| *n > 0) {
             let head = node["headRefName"].as_str().unwrap_or("").to_string();
             out.push(PrInfoWithState {
                 number,
                 head,
                 state,
             });
+        } else {
+            warn!(
+                "Skipping {} result without a valid numeric PR number",
+                alias
+            );
         }
     }
 
