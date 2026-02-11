@@ -3,7 +3,7 @@
 //! Configuration is loaded from `$HOME/.spr_multicommit_cfg.yml` and then
 //! overridden by `<repo-root>/.spr_multicommit_cfg.yml` when present.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::Deserialize;
 use std::fs;
@@ -69,6 +69,7 @@ impl ListOrder {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Root base branch for the stack, e.g. `origin/main`.
     ///
@@ -111,8 +112,10 @@ fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
     if !path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(path)?;
-    let cfg: FileConfig = serde_yaml::from_str(&content)?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+    let cfg: FileConfig = serde_yaml::from_str(&content)
+        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
     Ok(Some(cfg))
 }
 
@@ -186,4 +189,58 @@ pub fn load_config() -> Result<Config> {
 
     normalize_config(&mut merged);
     Ok(merged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_config_file, PrDescriptionMode};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn read_config_file_allows_yaml_comments() {
+        let dir = tempdir().expect("tempdir");
+        let mut path = dir.path().to_path_buf();
+        path.push(".spr_multicommit_cfg.yml");
+        fs::write(
+            &path,
+            r#"
+# top-level comment
+base: origin/main # trailing comment
+pr_description_mode: stack_only
+"#,
+        )
+        .expect("write config");
+
+        let cfg = read_config_file(&path)
+            .expect("parse config")
+            .expect("config exists");
+        assert_eq!(cfg.base.as_deref(), Some("origin/main"));
+        assert_eq!(cfg.pr_description_mode, Some(PrDescriptionMode::StackOnly));
+    }
+
+    #[test]
+    fn read_config_file_rejects_unknown_key() {
+        let dir = tempdir().expect("tempdir");
+        let mut path = dir.path().to_path_buf();
+        path.push(".spr_multicommit_cfg.yml");
+        fs::write(
+            &path,
+            r#"
+overwrite_pr_description: false
+"#,
+        )
+        .expect("write config");
+
+        let err = read_config_file(&path).expect_err("unknown key should fail");
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("unknown field `overwrite_pr_description`"),
+            "unexpected error: {err_msg}"
+        );
+        assert!(
+            err_msg.contains(path.to_string_lossy().as_ref()),
+            "error should include config path: {err_msg}"
+        );
+    }
 }
