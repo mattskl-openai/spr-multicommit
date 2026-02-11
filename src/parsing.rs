@@ -132,10 +132,7 @@ pub fn parse_groups(raw: &str, ignore_tag: &str) -> Result<Vec<Group>> {
 /// # Errors
 ///
 /// Returns an error if any commit message contains more than one `pr:<tag>` marker.
-pub fn parse_groups_with_ignored(
-    raw: &str,
-    ignore_tag: &str,
-) -> Result<(Vec<String>, Vec<Group>)> {
+pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<String>, Vec<Group>)> {
     let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
     let mut groups: Vec<Group> = vec![];
     let mut current: Option<Group> = None;
