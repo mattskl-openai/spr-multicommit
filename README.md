@@ -133,7 +133,7 @@ Options:
 - `--after <N|bottom|top|last|all>`: 'drop' the first N PR groups; rebase the remaining commits onto `--base`
   - `0` or `bottom`: restack all groups (moves everything after merge-base)
   - `top` or `last` or `all`: skip all PRs; ignored commits (pr:ignore blocks) are preserved, so the branch may remain ahead of base
-- `--safe`: create a local backup branch at current `HEAD` before rebasing
+- `--safe`: create a local backup tag at current `HEAD` before rebasing
 
 Behavior:
 
@@ -142,7 +142,7 @@ Behavior:
   - Ignored commits attached to dropped groups are kept before the remaining stack
   - Ignored commits attached to kept groups move with those groups
 - Updates the current branch to the rebuilt tip
-- With `--safe`, a backup branch named like `backup/restack/<current-branch>-<short-sha>` is created first
+- With `--safe`, a backup tag named like `backup/restack/<current-branch>-<short-sha>` is created first
 - Conflict handling is controlled by `restack_conflict` in config.
 - `rollback` (default) aborts the restack and attempts to clean up the temp restack worktree and branch (cleanup failures may require manual cleanup).
 - `halt` stops on conflict, leaves the temp restack worktree and branch in place, and prints manual rollback/continue instructions.
@@ -190,7 +190,7 @@ Aliases:
 - `spr move A..B --after C`: move PRs A..B to come after PR C (requires A < B and C ∉ [A..B]; C ∈ [0..N])
   - `--after bottom` is the same as `--after 0`
   - `--after top` is the same as `--after N`
-- `--safe`: create a local backup branch at current `HEAD` before rewriting
+- `--safe`: create a local backup tag at current `HEAD` before rewriting
  - Ignore blocks (`pr:ignore`) stay attached to the preceding PR group and move with it
 
 Prints an explicit plan, e.g.: `2..3→4: [1,2,3,4,5,6] → [1,4,2,3,5,6]`.
@@ -267,7 +267,7 @@ spr fix-pr 1 --tail 2
 Behavior:
 
 - Rewrites local history to move the tail M commits after PR N’s tail commit
-- `--safe`: create a local backup branch at current `HEAD` before executing
+- `--safe`: create a local backup tag at current `HEAD` before executing
 - Ignore blocks (`pr:ignore`) are preserved and cannot be moved; the command aborts if the tail intersects an ignore block
 
 ### spr cleanup
@@ -335,7 +335,7 @@ spr restack --after 0
 # Restack everything above the first 2 PRs ('drops' the first 2 PRs)
 spr restack --after 2
 
-# Restack safely (creates a backup branch before rebase)
+# Restack safely (creates a backup tag before rebase)
 spr restack --after 2 --safe
 
 # Land top PR only using config default mode (flatten by default)
