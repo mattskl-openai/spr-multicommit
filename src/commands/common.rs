@@ -332,8 +332,8 @@ mod tests {
 
         let backup =
             create_backup_branch(false, "restack", &cur_branch, &short).expect("create backup");
-        let backup_again = create_backup_branch(false, "restack", &cur_branch, &short)
-            .expect("overwrite backup");
+        let backup_again =
+            create_backup_branch(false, "restack", &cur_branch, &short).expect("overwrite backup");
 
         assert_eq!(backup, backup_again, "backup name should be stable");
 

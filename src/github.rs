@@ -1,7 +1,14 @@
+//! GitHub API helpers used by `spr` commands.
+//!
+//! This module centralizes read/write calls to GitHub so command modules can operate on
+//! typed results instead of raw JSON. The status-list path relies on branch-name lookups:
+//! for each local stack head, we resolve either the currently open PR or (if none is open)
+//! the latest merged PR for that same head ref.
+
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::git::{gh_ro, gh_rw, git_ro};
 
@@ -10,6 +17,26 @@ pub struct PrInfo {
     pub number: u64,
     pub head: String,
     pub base: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    /// The head ref currently has an open pull request.
+    Open,
+    /// The head ref has no open pull request but does have a merged pull request.
+    Merged,
+}
+
+/// Pull request identity plus the state classification used by stack status display.
+///
+/// The `head` is expected to match a synthetic stack branch name (for example
+/// `dank-spr/foo`), and `state` indicates whether this record came from an open PR query
+/// or a merged PR fallback query.
+#[derive(Debug, Clone)]
+pub struct PrInfoWithState {
+    pub number: u64,
+    pub head: String,
+    pub state: PrState,
 }
 
 #[derive(Clone)]
@@ -236,6 +263,100 @@ pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
                     out.push(PrInfo { number, head, base });
                 }
             }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Fetches one status-bearing PR per requested head branch.
+///
+/// For each entry in `heads`, this function first checks for an open PR and falls back to
+/// a merged PR only when no open PR exists. That precedence keeps status output focused on
+/// active review state and avoids showing a stale merged marker when a new PR has been
+/// opened from the same branch name.
+///
+/// The return vector contains at most one item per requested head; heads with no open or
+/// merged PR are omitted entirely. Callers should treat absence as "no known remote PR".
+///
+/// If a caller incorrectly assumes one output row per input head, it can misalign local and
+/// remote state and display incorrect status icons.
+///
+/// # Errors
+///
+/// Returns an error when repository identification fails, when `gh api graphql` fails, or
+/// when the GraphQL response cannot be parsed.
+pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoWithState>> {
+    let mut out: Vec<PrInfoWithState> = Vec::new();
+    if heads.is_empty() {
+        return Ok(out);
+    }
+    let (owner, name) = get_repo_owner_name()?;
+
+    // Build one query with two aliases per head: open and merged.
+    let mut q =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (i, head) in heads.iter().enumerate() {
+        q.push_str(&format!(
+            "openPr{}: pullRequests(headRefName:\"{}\", states:[OPEN], first:1, orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ number headRefName baseRefName }} }} ",
+            i,
+            graphql_escape(head)
+        ));
+        q.push_str(&format!(
+            "mergedPr{}: pullRequests(headRefName:\"{}\", states:[MERGED], first:1, orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ number headRefName baseRefName }} }} ",
+            i,
+            graphql_escape(head)
+        ));
+    }
+    q.push_str("} }");
+
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", q),
+            "-F",
+            &format!("owner={}", owner),
+            "-F",
+            &format!("name={}", name),
+        ]
+        .as_slice(),
+    )?;
+
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &v["data"]["repository"];
+    for (i, _head) in heads.iter().enumerate() {
+        let open_key = format!("openPr{}", i);
+        let merged_key = format!("mergedPr{}", i);
+
+        let open_node = repo[&open_key]["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.first());
+        let merged_node = repo[&merged_key]["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.first());
+
+        let (node, state, alias) = if let Some(node) = open_node {
+            (node, PrState::Open, open_key.as_str())
+        } else if let Some(node) = merged_node {
+            (node, PrState::Merged, merged_key.as_str())
+        } else {
+            continue;
+        };
+
+        if let Some(number) = node["number"].as_u64().filter(|n| *n > 0) {
+            let head = node["headRefName"].as_str().unwrap_or("").to_string();
+            out.push(PrInfoWithState {
+                number,
+                head,
+                state,
+            });
+        } else {
+            warn!(
+                "Skipping {} result without a valid numeric PR number",
+                alias
+            );
         }
     }
 
