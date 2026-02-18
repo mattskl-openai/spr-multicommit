@@ -61,7 +61,7 @@ pub enum Cmd {
         #[arg(long, value_name = "N|bottom|top|last")]
         after: String,
 
-        /// Create a local backup branch at current HEAD before rebasing
+        /// Create a local backup tag at current HEAD before rebasing
         #[arg(long)]
         safe: bool,
     },
@@ -116,7 +116,7 @@ pub enum Cmd {
         /// Number of top commits to move to PR N's tail
         #[arg(short = 't', long = "tail", default_value_t = 1)]
         tail: usize,
-        /// Create a local backup branch at current HEAD before rewriting
+        /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
     },
@@ -129,7 +129,7 @@ pub enum Cmd {
         /// Target PR position to come after: number (0..=N), or one of: bottom, top. Must not be in [A..B]
         #[arg(long, value_name = "C|bottom|top")]
         after: String,
-        /// Create a local backup branch at current HEAD before rewriting
+        /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
     },

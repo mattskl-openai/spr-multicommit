@@ -134,10 +134,10 @@ pub fn fix_pr_tail(
         new_order.extend(all_commits[insert_pos + 1..].iter().cloned());
     }
 
-    // Optionally create a backup branch at current HEAD (safety)
+    // Optionally create a backup tag at current HEAD (safety)
     let (cur_branch, short) = common::get_current_branch_and_short()?;
     if safe {
-        let _ = common::create_backup_branch(dry, "fix-pr", &cur_branch, &short)?;
+        let _ = common::create_backup_tag(dry, "fix-pr", &cur_branch, &short)?;
     }
 
     // Build the new history in a temporary worktree off merge-base

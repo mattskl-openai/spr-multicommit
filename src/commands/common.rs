@@ -4,11 +4,11 @@
 //! `fix-pr`: naming temporary branches/worktrees, creating safety backups, and
 //! resetting the current branch to a rebuilt tip.
 //!
-//! A subtle but important invariant is that backup branch names include the
+//! A subtle but important invariant is that backup tag names include the
 //! short SHA of `HEAD`. When a rewrite command fails before `HEAD` changes, a
-//! second attempt would otherwise try to create the same backup branch again
-//! and fail with "branch already exists". To keep `--safe` re-runnable after a
-//! failure, `create_backup_branch` force-updates the backup ref in place.
+//! second attempt would otherwise try to create the same backup tag again and
+//! fail with "tag already exists". To keep `--safe` re-runnable after a
+//! failure, `create_backup_tag` force-updates the backup ref in place.
 //!
 //! Temporary worktrees and their branches follow the same naming scheme. A
 //! failed rewrite can therefore leave behind a temp branch that will collide
@@ -17,8 +17,8 @@
 //! and uses `git worktree add -B` as a final safeguard when cleanup is skipped
 //! in dry-run mode.
 //!
-//! Backup branches are local-only and are intended as an escape hatch for a
-//! single user; callers should not rely on them being immutable.
+//! Backup tags are local-only and are intended as an escape hatch for a single
+//! user; callers should not rely on them being immutable.
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -32,7 +32,7 @@ use crate::parsing::Group;
 /// Returns the current branch name and the short SHA of `HEAD`.
 ///
 /// This is primarily used to derive stable, human-readable names for backup
-/// branches and temporary worktree branches. If `HEAD` is detached, the branch
+/// tags and temporary worktree branches. If `HEAD` is detached, the branch
 /// component will be reported as `HEAD`, which can lead to less useful backup
 /// names.
 pub fn get_current_branch_and_short() -> Result<(String, String)> {
@@ -45,32 +45,27 @@ pub fn get_current_branch_and_short() -> Result<(String, String)> {
     Ok((cur_branch, short))
 }
 
-/// Creates or updates a local backup branch pointing at the current `HEAD`.
+/// Creates or updates a local backup tag pointing at the current `HEAD`.
 ///
 /// The backup name is derived from `(kind, cur_branch, short)` and is therefore
 /// stable for a given `HEAD`. This stability is desirable for operator clarity,
 /// but it means repeat runs at the same `HEAD` will collide. We force-update
-/// the branch (`git branch -f`) so that `spr restack --safe` remains runnable
-/// after a failed attempt that left the backup branch behind.
+/// the tag (`git tag -f`) so that `spr restack --safe` remains runnable after a
+/// failed attempt that left the backup tag behind.
 ///
-/// The existence check is only used to drive the log message; the branch is
+/// The existence check is only used to drive the log message; the tag is
 /// always updated to point at `HEAD`.
-pub fn create_backup_branch(
-    dry: bool,
-    kind: &str,
-    cur_branch: &str,
-    short: &str,
-) -> Result<String> {
+pub fn create_backup_tag(dry: bool, kind: &str, cur_branch: &str, short: &str) -> Result<String> {
     let backup = format!("backup/{}/{}-{}", kind, cur_branch, short);
-    let exists = git_ro(["branch", "--list", &backup].as_slice())?;
+    let exists = git_ro(["tag", "--list", &backup].as_slice())?;
     if exists.trim().is_empty() {
-        info!("Creating backup branch at HEAD: {}", backup);
+        info!("Creating backup tag at HEAD: {}", backup);
     } else {
-        info!("Backup branch exists; overwriting at HEAD: {}", backup);
+        info!("Backup tag exists; overwriting at HEAD: {}", backup);
     }
     // Use `-f` to make backup creation idempotent. When the name already
     // exists, we explicitly move it to the current HEAD.
-    let _ = git_rw(dry, ["branch", "-f", &backup, "HEAD"].as_slice())?;
+    let _ = git_rw(dry, ["tag", "-f", &backup, "HEAD"].as_slice())?;
     Ok(backup)
 }
 
@@ -260,7 +255,7 @@ pub fn build_head_base_chain(base: &str, groups: &[Group], prefix: &str) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_temp_worktree, create_backup_branch, create_temp_worktree,
+        cleanup_temp_worktree, create_backup_tag, create_temp_worktree,
         get_current_branch_and_short,
     };
     use std::env;
@@ -321,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn create_backup_branch_overwrites_existing() {
+    fn create_backup_tag_overwrites_existing() {
         let _lock = CWD_LOCK.lock().expect("lock cwd");
         let dir = init_repo();
         let repo = dir.path().to_path_buf();
@@ -331,15 +326,21 @@ mod tests {
             get_current_branch_and_short().expect("get current branch and short sha");
 
         let backup =
-            create_backup_branch(false, "restack", &cur_branch, &short).expect("create backup");
+            create_backup_tag(false, "restack", &cur_branch, &short).expect("create backup");
         let backup_again =
-            create_backup_branch(false, "restack", &cur_branch, &short).expect("overwrite backup");
+            create_backup_tag(false, "restack", &cur_branch, &short).expect("overwrite backup");
 
         assert_eq!(backup, backup_again, "backup name should be stable");
 
         let head = git(&repo, ["rev-parse", "HEAD"].as_slice());
-        let backup_head = git(&repo, ["rev-parse", backup.as_str()].as_slice());
+        let backup_ref = format!("refs/tags/{}", backup);
+        let backup_head = git(&repo, ["rev-parse", backup_ref.as_str()].as_slice());
         assert_eq!(head.trim(), backup_head.trim(), "backup should match HEAD");
+        let branch_out = git(&repo, ["branch", "--list", backup.as_str()].as_slice());
+        assert!(
+            branch_out.trim().is_empty(),
+            "backup should be a tag, not a branch"
+        );
     }
 
     #[test]

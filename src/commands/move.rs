@@ -153,10 +153,10 @@ pub fn move_groups_after(
         return Ok(());
     }
 
-    // Optionally create a backup branch at current HEAD
+    // Optionally create a backup tag at current HEAD
     let (cur_branch, short) = common::get_current_branch_and_short()?;
     if safe {
-        let _ = common::create_backup_branch(dry, "move", &cur_branch, &short)?;
+        let _ = common::create_backup_tag(dry, "move", &cur_branch, &short)?;
     }
 
     // Build the new history in a temporary worktree off merge-base

@@ -147,7 +147,7 @@ fn build_cherry_pick_plan(kept_ignored: &[String], remaining: &[Group]) -> Vec<C
 /// not affect the halted cherry-pick sequence.
 fn emit_halt_instructions(
     cur_branch: &str,
-    backup_branch: Option<&str>,
+    backup_tag: Option<&str>,
     base: &str,
     tmp_path: &str,
     tmp_branch: &str,
@@ -166,9 +166,9 @@ fn emit_halt_instructions(
     info!("  git worktree remove -f {}", tmp_path);
     info!("  git branch -D {}", tmp_branch);
     info!("  git checkout {}", cur_branch);
-    if let Some(backup) = backup_branch {
-        info!("  # Optional: restore the backup created by --safe");
-        info!("  git checkout {}", backup);
+    if let Some(backup) = backup_tag {
+        info!("  # Optional: restore the --safe backup tag onto your current branch");
+        info!("  git reset --hard refs/tags/{}", backup);
     }
 
     info!("To resolve and continue the restack manually:");
@@ -240,7 +240,7 @@ pub fn restack_after(
     if remaining.is_empty() && kept_ignored.is_empty() {
         // Nothing to move; sync current branch to base
         if safe {
-            let _ = common::create_backup_branch(dry, "restack", &cur_branch, &short)?;
+            let _ = common::create_backup_tag(dry, "restack", &cur_branch, &short)?;
         }
         info!(
             "Skipping all {} PR(s); syncing current branch {} to {}",
@@ -252,9 +252,9 @@ pub fn restack_after(
         return Ok(());
     }
 
-    // Create a local backup branch pointing to current HEAD before rewriting
-    let backup_branch = if safe {
-        Some(common::create_backup_branch(
+    // Create a local backup tag pointing to current HEAD before rewriting
+    let backup_tag = if safe {
+        Some(common::create_backup_tag(
             dry,
             "restack",
             &cur_branch,
@@ -272,7 +272,7 @@ pub fn restack_after(
             if conflict && conflict_policy == RestackConflictPolicy::Halt {
                 emit_halt_instructions(
                     &cur_branch,
-                    backup_branch.as_deref(),
+                    backup_tag.as_deref(),
                     base,
                     &tmp_path,
                     &tmp_branch,
