@@ -158,12 +158,9 @@ fn run_update_mutations(
     let total_updates = update_inputs.len();
     let pb = ProgressBar::new(total_updates as u64);
     pb.set_style(
-        ProgressStyle::with_template(&format!(
-            "{{spinner}} {} {{pos}}/{{len}} PR(s)…",
-            label
-        ))
-        .unwrap()
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        ProgressStyle::with_template(&format!("{{spinner}} {} {{pos}}/{{len}} PR(s)…", label))
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
     );
     pb.enable_steady_tick(Duration::from_millis(120));
     let chunks = if prefer_single && mutation_len_for_inputs(&update_inputs) <= max_chars {
@@ -187,6 +184,7 @@ fn run_update_mutations(
 /// chaining and local PR numbering even when display is reversed. `list_order` controls
 /// the order in which groups are visited for rebuild logging and list output. If a caller
 /// shuffles `groups`, PR base updates will target the wrong branches.
+#[allow(clippy::too_many_arguments)]
 pub fn build_from_groups(
     base: &str,
     prefix: &str,
@@ -608,6 +606,7 @@ pub fn build_from_groups(
 ///
 /// This derives groups in local stack order and forwards `list_order` so rebuild progress
 /// and printed lists follow the same display order as `spr list`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_from_tags(
     base: &str,
     from: &str,

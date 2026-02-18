@@ -148,45 +148,6 @@ pub fn list_prs_display(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_icons_uses_merged_marker() {
-        let status_map = HashMap::new();
-        assert_eq!(
-            status_icons(Some(PrState::Merged), Some(42), &status_map),
-            ("⑃", "M")
-        );
-    }
-
-    #[test]
-    fn status_icons_maps_open_ci_and_review_states() {
-        let mut status_map = HashMap::new();
-        status_map.insert(
-            7,
-            PrCiReviewStatus {
-                ci_state: "SUCCESS".to_string(),
-                review_decision: "APPROVED".to_string(),
-            },
-        );
-        assert_eq!(
-            status_icons(Some(PrState::Open), Some(7), &status_map),
-            ("✓", "✓")
-        );
-    }
-
-    #[test]
-    fn status_icons_unknown_when_status_missing() {
-        let status_map = HashMap::new();
-        assert_eq!(
-            status_icons(Some(PrState::Open), Some(99), &status_map),
-            ("?", "?")
-        );
-    }
-}
-
 /// Print commits grouped by local PR, keeping commit indices in bottom-up order.
 ///
 /// The commit indices are global and tied to the local stack ordering. When `list_order`
@@ -258,4 +219,43 @@ pub fn list_commits_display(
         info!("");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_icons_uses_merged_marker() {
+        let status_map = HashMap::new();
+        assert_eq!(
+            status_icons(Some(PrState::Merged), Some(42), &status_map),
+            ("⑃", "M")
+        );
+    }
+
+    #[test]
+    fn status_icons_maps_open_ci_and_review_states() {
+        let mut status_map = HashMap::new();
+        status_map.insert(
+            7,
+            PrCiReviewStatus {
+                ci_state: "SUCCESS".to_string(),
+                review_decision: "APPROVED".to_string(),
+            },
+        );
+        assert_eq!(
+            status_icons(Some(PrState::Open), Some(7), &status_map),
+            ("✓", "✓")
+        );
+    }
+
+    #[test]
+    fn status_icons_unknown_when_status_missing() {
+        let status_map = HashMap::new();
+        assert_eq!(
+            status_icons(Some(PrState::Open), Some(99), &status_map),
+            ("?", "?")
+        );
+    }
 }

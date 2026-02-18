@@ -173,16 +173,14 @@ fn main() -> Result<()> {
                 cli.dry_run,
             )?;
         }
-        crate::cli::Cmd::List { what } => {
-            match what {
-                crate::cli::ListWhat::Pr => {
-                    crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
-                }
-                crate::cli::ListWhat::Commit => {
-                    crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?
-                }
+        crate::cli::Cmd::List { what } => match what {
+            crate::cli::ListWhat::Pr => {
+                crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
             }
-        }
+            crate::cli::ListWhat::Commit => {
+                crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?
+            }
+        },
         crate::cli::Cmd::Status {} => {
             // alias for `spr list pr`
             crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
@@ -193,7 +191,7 @@ fn main() -> Result<()> {
             no_restack,
         } => {
             set_dry_run_env(cli.dry_run, false);
-            let mode = which.unwrap_or_else(|| match cfg.land.as_str() {
+            let mode = which.unwrap_or(match cfg.land.as_str() {
                 "per-pr" | "perpr" | "per_pr" => crate::cli::LandCmd::PerPr,
                 _ => crate::cli::LandCmd::Flatten,
             });
