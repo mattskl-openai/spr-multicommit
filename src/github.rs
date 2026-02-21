@@ -3,11 +3,14 @@
 //! This module centralizes read/write calls to GitHub so command modules can operate on
 //! typed results instead of raw JSON. The status-list path relies on branch-name lookups:
 //! for each local stack head, we resolve either the currently open PR or (if none is open)
-//! the latest merged PR for that same head ref.
+//! the latest merged PR for that same head ref. The update preflight also looks up the latest
+//! terminal PR event for a head ref so branch-name reuse can be blocked after recent merges or
+//! closes.
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
 
 use crate::git::{gh_ro, gh_rw, git_ro};
@@ -38,6 +41,38 @@ pub struct PrInfoWithState {
     pub head: String,
     pub state: PrState,
 }
+
+/// Terminal state for a branch-name reuse guard lookup.
+///
+/// `Merged` and `Closed` are intentionally distinct because the update preflight needs to
+/// report whether a recent terminal event came from a merge or a manual close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalPrState {
+    /// The prior PR on this head branch was merged.
+    Merged,
+    /// The prior PR on this head branch was closed without merging.
+    Closed,
+}
+
+/// Latest terminal PR metadata for a specific head branch.
+///
+/// The `head` is the exact GitHub head ref name that matched the query. `terminal_at` is the
+/// GitHub RFC3339 timestamp string for the event that matters to the branch-name reuse guard:
+/// `mergedAt` for merged PRs and `closedAt` for closed PRs.
+#[derive(Debug, Clone)]
+pub struct TerminalPrInfo {
+    pub number: u64,
+    pub head: String,
+    pub state: TerminalPrState,
+    pub terminal_at: String,
+    pub url: String,
+}
+
+/// Number of terminal PR candidates fetched per head before client-side time selection.
+///
+/// GitHub's pull request connection for this query can only order by created/update time, so we
+/// fetch a bounded recent window and then choose the newest terminal timestamp locally.
+const TERMINAL_PRS_PER_HEAD_QUERY_LIMIT: usize = 10;
 
 #[derive(Clone)]
 pub struct PrBodyInfo {
@@ -269,6 +304,190 @@ pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
     Ok(out)
 }
 
+/// Parse a GitHub GraphQL `DateTime` string and attach head-specific error context.
+fn parse_github_datetime_rfc3339(s: &str, context: &str) -> Result<OffsetDateTime> {
+    OffsetDateTime::parse(s, &Rfc3339).map_err(|e| {
+        anyhow!(
+            "Failed to parse GitHub DateTime for {}: {} ({})",
+            context,
+            s,
+            e
+        )
+    })
+}
+
+fn parse_terminal_pr_state(
+    node: &serde_json::Value,
+    requested_head: &str,
+    number: u64,
+) -> Result<TerminalPrState> {
+    let state = node["state"].as_str().ok_or_else(|| {
+        anyhow!(
+            "Terminal PR #{} missing state for {}",
+            number,
+            requested_head
+        )
+    })?;
+    if state == "MERGED" {
+        Ok(TerminalPrState::Merged)
+    } else if state == "CLOSED" {
+        Ok(TerminalPrState::Closed)
+    } else {
+        Err(anyhow!(
+            "Terminal PR #{} has unsupported state {} for {}",
+            number,
+            state,
+            requested_head
+        ))
+    }
+}
+
+fn parse_terminal_pr_timestamp(
+    node: &serde_json::Value,
+    requested_head: &str,
+    number: u64,
+    state: TerminalPrState,
+) -> Result<String> {
+    if state == TerminalPrState::Merged {
+        node["mergedAt"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Merged PR #{} missing mergedAt for {}",
+                    number,
+                    requested_head
+                )
+            })
+    } else {
+        node["closedAt"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Closed PR #{} missing closedAt for {}",
+                    number,
+                    requested_head
+                )
+            })
+    }
+}
+
+/// Parse one terminal-PR GraphQL node into typed metadata used by the update guard.
+///
+/// The caller still parses `terminal_at` separately for ordering so this function can preserve
+/// the original timestamp text for user-facing errors.
+fn parse_terminal_pr_node(
+    node: &serde_json::Value,
+    requested_head: &str,
+) -> Result<TerminalPrInfo> {
+    let number = node["number"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("Terminal PR result missing number for {}", requested_head))?;
+    let head = node["headRefName"].as_str().ok_or_else(|| {
+        anyhow!(
+            "Terminal PR result missing headRefName for {}",
+            requested_head
+        )
+    })?;
+    let state = parse_terminal_pr_state(node, requested_head, number)?;
+    let terminal_at = parse_terminal_pr_timestamp(node, requested_head, number, state)?;
+    let url = node["url"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Terminal PR #{} missing url for {}", number, requested_head))?;
+
+    Ok(TerminalPrInfo {
+        number,
+        head: head.to_string(),
+        state,
+        terminal_at,
+        url: url.to_string(),
+    })
+}
+
+/// Select the newest terminal PR by its terminal timestamp from a bounded set of PR nodes.
+///
+/// GitHub returns nodes ordered by `UPDATED_AT`, which can differ from close or merge time when
+/// older PRs receive later comments or edits. Picking the max terminal timestamp avoids basing
+/// the update guard on a stale terminal PR.
+fn select_latest_terminal_pr(
+    nodes: &[serde_json::Value],
+    requested_head: &str,
+) -> Result<Option<TerminalPrInfo>> {
+    let mut latest: Option<(OffsetDateTime, TerminalPrInfo)> = None;
+    for node in nodes {
+        let info = parse_terminal_pr_node(node, requested_head)?;
+        let terminal_at = parse_github_datetime_rfc3339(&info.terminal_at, requested_head)?;
+        if latest
+            .as_ref()
+            .map(|(current, _)| terminal_at > *current)
+            .unwrap_or(true)
+        {
+            latest = Some((terminal_at, info));
+        }
+    }
+
+    if let Some((_, info)) = latest {
+        Ok(Some(info))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Fetches the latest closed-or-merged PR for each requested head branch (exact match).
+///
+/// Heads with no closed or merged PR are omitted from the result. Callers that already know the
+/// set of heads with open PRs can use this to look up only the remaining candidates when
+/// enforcing branch-name reuse guardrails. GitHub does not expose a close-or-merge-time ordering
+/// field for this connection, so this function fetches a small recent window per head and picks
+/// the newest terminal PR client-side.
+pub fn list_terminal_prs_for_heads(heads: &[String]) -> Result<Vec<TerminalPrInfo>> {
+    let mut out: Vec<TerminalPrInfo> = Vec::new();
+    if heads.is_empty() {
+        return Ok(out);
+    }
+    let (owner, name) = get_repo_owner_name()?;
+
+    let mut q =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (i, head) in heads.iter().enumerate() {
+        q.push_str(&format!(
+            "pr{}: pullRequests(headRefName:\"{}\", states:[CLOSED,MERGED], first:{}, orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ number headRefName state mergedAt closedAt url }} }} ",
+            i,
+            graphql_escape(head),
+            TERMINAL_PRS_PER_HEAD_QUERY_LIMIT
+        ));
+    }
+    q.push_str("} }");
+
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", q),
+            "-F",
+            &format!("owner={}", owner),
+            "-F",
+            &format!("name={}", name),
+        ]
+        .as_slice(),
+    )?;
+
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &v["data"]["repository"];
+    for (i, requested_head) in heads.iter().enumerate() {
+        let key = format!("pr{}", i);
+        if let Some(nodes) = repo[&key]["nodes"].as_array() {
+            if let Some(info) = select_latest_terminal_pr(nodes, requested_head)? {
+                out.push(info);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// Fetches one status-bearing PR per requested head branch.
 ///
 /// For each entry in `heads`, this function first checks for an open PR and falls back to
@@ -484,4 +703,42 @@ pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()>
         info!("Appended warning to PR #{}", number);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_latest_terminal_pr, TerminalPrState};
+    use serde_json::json;
+
+    #[test]
+    // Verifies: terminal PR selection uses the most recent close-or-merge timestamp across states.
+    // Catches: regressions that trust UPDATED_AT ordering or ignore closed PRs in the reuse guard.
+    fn select_latest_terminal_pr_uses_max_terminal_timestamp_across_states() {
+        let nodes = vec![
+            json!({
+                "number": 11,
+                "headRefName": "dank-spr/example",
+                "state": "MERGED",
+                "mergedAt": "2026-02-01T00:00:00Z",
+                "closedAt": "2026-02-01T00:00:00Z",
+                "url": "https://github.com/o/r/pull/11"
+            }),
+            json!({
+                "number": 22,
+                "headRefName": "dank-spr/example",
+                "state": "CLOSED",
+                "mergedAt": null,
+                "closedAt": "2026-02-10T00:00:00Z",
+                "url": "https://github.com/o/r/pull/22"
+            }),
+        ];
+
+        let selected = select_latest_terminal_pr(&nodes, "dank-spr/example")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.number, 22);
+        assert_eq!(selected.state, TerminalPrState::Closed);
+        assert_eq!(selected.terminal_at, "2026-02-10T00:00:00Z");
+    }
 }

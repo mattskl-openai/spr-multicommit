@@ -91,6 +91,11 @@ pub struct FileConfig {
     /// - `rollback` (default): abort and clean up temp restack state
     /// - `halt`: stop and leave the temp worktree for manual resolution
     pub restack_conflict: Option<RestackConflictPolicy>,
+    /// Block `spr update` from recreating a PR when the same branch name had a recently merged
+    /// or closed PR within this many days.
+    ///
+    /// `0` effectively disables the guard for past terminal PRs.
+    pub branch_reuse_guard_days: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +111,11 @@ pub struct Config {
     pub list_order: ListOrder,
     /// Behavior when `spr restack` encounters a cherry-pick conflict.
     pub restack_conflict: RestackConflictPolicy,
+    /// Threshold in days for blocking `spr update` from recreating a PR on a branch name that
+    /// already had a recently merged or closed PR.
+    ///
+    /// `0` effectively disables the guard for past terminal PRs.
+    pub branch_reuse_guard_days: u32,
 }
 
 fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
@@ -129,6 +139,7 @@ fn default_config() -> Config {
         pr_description_mode: PrDescriptionMode::Overwrite,
         list_order: ListOrder::RecentOnTop,
         restack_conflict: RestackConflictPolicy::Rollback,
+        branch_reuse_guard_days: 180,
     }
 }
 
@@ -154,6 +165,9 @@ fn apply_overrides(config: &Config, overrides: FileConfig) -> Config {
     }
     if let Some(restack_conflict) = overrides.restack_conflict {
         merged.restack_conflict = restack_conflict;
+    }
+    if let Some(branch_reuse_guard_days) = overrides.branch_reuse_guard_days {
+        merged.branch_reuse_guard_days = branch_reuse_guard_days;
     }
     merged
 }
@@ -193,7 +207,7 @@ pub fn load_config() -> Result<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_config_file, PrDescriptionMode};
+    use super::{apply_overrides, default_config, read_config_file, FileConfig, PrDescriptionMode};
     use std::fs;
     use tempfile::tempdir;
 
@@ -242,5 +256,40 @@ overwrite_pr_description: false
             err_msg.contains(path.to_string_lossy().as_ref()),
             "error should include config path: {err_msg}"
         );
+    }
+
+    #[test]
+    // Verifies: YAML config parsing accepts an integer value for branch_reuse_guard_days.
+    // Catches: regressions where the new config key is rejected or parsed with the wrong type.
+    fn read_config_file_parses_branch_reuse_guard_days_integer() {
+        let dir = tempdir().unwrap();
+        let mut path = dir.path().to_path_buf();
+        path.push(".spr_multicommit_cfg.yml");
+        fs::write(&path, "branch_reuse_guard_days: 0\n").unwrap();
+
+        let cfg = read_config_file(&path).unwrap().unwrap();
+        assert_eq!(cfg.branch_reuse_guard_days, Some(0));
+    }
+
+    #[test]
+    // Verifies: file-config overrides replace the default branch reuse guard threshold.
+    // Catches: regressions where the new config key is ignored during config merge.
+    fn apply_overrides_updates_branch_reuse_guard_days() {
+        let base = default_config();
+        let merged = apply_overrides(
+            &base,
+            FileConfig {
+                base: None,
+                prefix: None,
+                land: None,
+                ignore_tag: None,
+                pr_description_mode: None,
+                list_order: None,
+                restack_conflict: None,
+                branch_reuse_guard_days: Some(30),
+            },
+        );
+
+        assert_eq!(merged.branch_reuse_guard_days, 30);
     }
 }

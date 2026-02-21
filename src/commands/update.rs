@@ -1,7 +1,8 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::time::Duration;
+use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tracing::info;
 
 use crate::commands::common;
@@ -9,7 +10,7 @@ use crate::config::{ListOrder, PrDescriptionMode};
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
     fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_open_prs_for_heads,
-    upsert_pr_cached,
+    list_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
 };
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{derive_groups_between, Group};
@@ -36,6 +37,109 @@ fn update_stack_block(body: &str, new_block: &str) -> String {
         new_block.to_string()
     } else {
         format!("{}\n\n{}", body, new_block)
+    }
+}
+
+/// Parse a GitHub GraphQL RFC3339 timestamp string.
+fn parse_github_timestamp_rfc3339(s: &str) -> Result<OffsetDateTime> {
+    OffsetDateTime::parse(s, &Rfc3339)
+        .with_context(|| format!("Failed to parse GitHub RFC3339 timestamp: {}", s))
+}
+
+/// Compute precise elapsed time since a terminal PR event.
+///
+/// Callers should use this typed duration for both comparisons and display conversion so the
+/// same source value drives the guard decision and the error message.
+fn recent_pr_age(terminal_at: OffsetDateTime, now: OffsetDateTime) -> TimeDuration {
+    now - terminal_at
+}
+
+/// Return the typed duration threshold used by the branch reuse guard.
+fn branch_reuse_guard_window(guard_days: u32) -> TimeDuration {
+    TimeDuration::days(i64::from(guard_days))
+}
+
+/// Return true when a terminal PR age falls within the configured guard window.
+///
+/// The comparison uses precise typed durations and does not round/truncate before comparing.
+fn recent_pr_age_blocks_recreation(age: TimeDuration, guard_window: TimeDuration) -> bool {
+    age <= guard_window
+}
+
+/// Convert a duration to fractional days for user-facing error messages.
+///
+/// This is display-only and intentionally preserves sub-day precision so the error text matches
+/// the same non-rounded comparison used by `merged_pr_age_blocks_recreation`.
+fn duration_days_precise(duration: TimeDuration) -> f64 {
+    duration.as_seconds_f64() / 86_400.0
+}
+
+/// Return the user-facing verb for a terminal PR event.
+fn terminal_pr_action(state: TerminalPrState) -> &'static str {
+    if state == TerminalPrState::Merged {
+        "merged"
+    } else {
+        "closed"
+    }
+}
+
+/// Fail `spr update` early when branch-name reuse matches a recently closed or merged PR.
+///
+/// The guard only runs when PR creation is enabled, the CLI override is not set, and the
+/// threshold is non-zero. It reuses the caller-provided `prs_by_head` map so only heads without
+/// open PRs are queried for terminal history; querying all heads would duplicate the open-PR
+/// lookup and could produce misleading results when a branch has both open and historical PRs.
+///
+/// # Errors
+///
+/// Returns an error when the terminal-PR lookup fails, when GitHub timestamps cannot be parsed,
+/// or when a recent closed or merged PR is found within the configured threshold.
+fn enforce_branch_reuse_guard(
+    no_pr: bool,
+    allow_branch_reuse: bool,
+    branch_reuse_guard_days: u32,
+    heads: &[String],
+    prs_by_head: &HashMap<String, u64>,
+) -> Result<()> {
+    if no_pr || allow_branch_reuse || branch_reuse_guard_days == 0 {
+        Ok(())
+    } else {
+        let heads_without_open_prs: Vec<String> = heads
+            .iter()
+            .filter(|head| !prs_by_head.contains_key(head.as_str()))
+            .cloned()
+            .collect();
+        if heads_without_open_prs.is_empty() {
+            Ok(())
+        } else {
+            let terminal_prs = list_terminal_prs_for_heads(&heads_without_open_prs)?;
+            let now = OffsetDateTime::now_utc();
+            let guard_window = branch_reuse_guard_window(branch_reuse_guard_days);
+            for terminal_pr in terminal_prs {
+                let terminal_at = parse_github_timestamp_rfc3339(&terminal_pr.terminal_at)
+                    .with_context(|| {
+                        format!(
+                            "Failed to parse terminal timestamp for PR #{} ({})",
+                            terminal_pr.number, terminal_pr.url
+                        )
+                    })?;
+                let age = recent_pr_age(terminal_at, now);
+                if recent_pr_age_blocks_recreation(age, guard_window) {
+                    let age_days = duration_days_precise(age);
+                    let action = terminal_pr_action(terminal_pr.state);
+                    return Err(anyhow!(
+                        "Refusing to recreate a PR for branch {} because PR #{} ({}) on that branch was {} {:.3} day(s) ago, within the configured guard window (branch_reuse_guard_days={}). You probably meant spr restack. If branch-name reuse is intentional, rerun with --allow-branch-reuse.",
+                        terminal_pr.head,
+                        terminal_pr.number,
+                        terminal_pr.url,
+                        action,
+                        age_days,
+                        branch_reuse_guard_days
+                    ));
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -194,6 +298,8 @@ pub fn build_from_groups(
     limit: Option<Limit>,
     mut groups: Vec<Group>,
     list_order: ListOrder,
+    allow_branch_reuse: bool,
+    branch_reuse_guard_days: u32,
 ) -> Result<()> {
     if groups.is_empty() {
         info!("No groups discovered; nothing to do.");
@@ -220,6 +326,13 @@ pub fn build_from_groups(
         prs_by_head.insert(p.head.clone(), p.number);
         current_base_by_number.insert(p.number, p.base);
     }
+    enforce_branch_reuse_guard(
+        no_pr,
+        allow_branch_reuse,
+        branch_reuse_guard_days,
+        &heads,
+        &prs_by_head,
+    )?;
     // Allow force-push within the selected scope when branch diverged from remote
 
     // Batch fetch remote SHAs for all target branches
@@ -629,5 +742,93 @@ pub fn build_from_tags(
         limit,
         groups,
         list_order,
+        true,
+        0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        branch_reuse_guard_window, parse_github_timestamp_rfc3339, recent_pr_age,
+        recent_pr_age_blocks_recreation, terminal_pr_action,
+    };
+    use crate::github::TerminalPrState;
+    use time::{Duration as TimeDuration, OffsetDateTime};
+
+    fn fixed_now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+
+    #[test]
+    // Verifies: recent terminal PRs well inside the threshold block PR recreation.
+    // Catches: regressions that invert the recent-age comparison for ordinary cases.
+    fn recent_pr_age_blocks_when_recent() {
+        let now = fixed_now();
+        let merged_at = now - TimeDuration::days(10);
+        let age = recent_pr_age(merged_at, now);
+        let guard_window = branch_reuse_guard_window(180);
+        assert!(recent_pr_age_blocks_recreation(age, guard_window));
+    }
+
+    #[test]
+    // Verifies: older terminal PRs outside the threshold do not block PR recreation.
+    // Catches: regressions that use a too-large threshold or reverse the allow path.
+    fn recent_pr_age_allows_when_old() {
+        let now = fixed_now();
+        let merged_at = now - TimeDuration::days(181);
+        let age = recent_pr_age(merged_at, now);
+        let guard_window = branch_reuse_guard_window(180);
+        assert!(!recent_pr_age_blocks_recreation(age, guard_window));
+    }
+
+    #[test]
+    // Verifies: a zero-day threshold allows historical terminal PRs with any positive elapsed age.
+    // Catches: regressions where the disabled threshold still blocks normal historical closures.
+    fn recent_pr_age_zero_threshold_allows_positive_age() {
+        let now = fixed_now();
+        let merged_at = now - TimeDuration::seconds(1);
+        let age = recent_pr_age(merged_at, now);
+        let guard_window = branch_reuse_guard_window(0);
+        assert!(!recent_pr_age_blocks_recreation(age, guard_window));
+    }
+
+    #[test]
+    // Verifies: the threshold comparison blocks values just under the day cutoff without rounding.
+    // Catches: regressions that round fractional days before comparing to the integer threshold.
+    fn recent_pr_age_just_under_threshold_blocks_without_rounding() {
+        let now = fixed_now();
+        let merged_at = now - TimeDuration::days(180) + TimeDuration::minutes(1);
+        let age = recent_pr_age(merged_at, now);
+        let guard_window = branch_reuse_guard_window(180);
+        assert!(recent_pr_age_blocks_recreation(age, guard_window));
+    }
+
+    #[test]
+    // Verifies: the threshold comparison allows values just over the day cutoff without rounding.
+    // Catches: regressions that floor or ceil fractional-day ages before threshold comparison.
+    fn recent_pr_age_just_over_threshold_allows_without_rounding() {
+        let now = fixed_now();
+        let merged_at = now - TimeDuration::days(180) - TimeDuration::minutes(1);
+        let age = recent_pr_age(merged_at, now);
+        let guard_window = branch_reuse_guard_window(180);
+        assert!(!recent_pr_age_blocks_recreation(age, guard_window));
+    }
+
+    #[test]
+    // Verifies: the guard error wording distinguishes merged and closed terminal PR events.
+    // Catches: regressions where closed PR blocks still claim the branch was merged.
+    fn terminal_pr_action_describes_terminal_state() {
+        assert_eq!(terminal_pr_action(TerminalPrState::Merged), "merged");
+        assert_eq!(terminal_pr_action(TerminalPrState::Closed), "closed");
+    }
+
+    #[test]
+    // Verifies: GitHub RFC3339 timestamps parse into the expected UTC instant.
+    // Catches: regressions in timestamp parsing format or timezone handling.
+    fn parse_github_timestamp_rfc3339_parses_valid_timestamp() {
+        let parsed = parse_github_timestamp_rfc3339("2026-02-20T12:34:56Z").unwrap();
+        let expected = OffsetDateTime::from_unix_timestamp(1_771_590_896).unwrap();
+        assert_eq!(parsed, expected);
+    }
 }

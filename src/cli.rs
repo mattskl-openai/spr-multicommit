@@ -50,6 +50,11 @@ pub enum Cmd {
         #[arg(long, value_enum)]
         pr_description_mode: Option<crate::config::PrDescriptionMode>,
 
+        /// Bypass the recent branch-name reuse guard and allow creating a new PR even when the
+        /// same branch name had a recently closed or merged PR.
+        #[arg(long)]
+        allow_branch_reuse: bool,
+
         /// Limit how much to update (optional sub-mode)
         #[command(subcommand)]
         extent: Option<Extent>,

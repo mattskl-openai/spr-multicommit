@@ -85,6 +85,7 @@ fn main() -> Result<()> {
     let pr_description_mode = cfg.pr_description_mode;
     let restack_conflict_policy = cfg.restack_conflict;
     let list_order = cfg.list_order;
+    let branch_reuse_guard_days = cfg.branch_reuse_guard_days;
     match cli.cmd {
         crate::cli::Cmd::Update {
             from,
@@ -92,6 +93,7 @@ fn main() -> Result<()> {
             restack,
             assume_existing_prs,
             pr_description_mode: pr_description_mode_override,
+            allow_branch_reuse,
             extent,
         } => {
             set_dry_run_env(cli.dry_run, assume_existing_prs);
@@ -123,6 +125,8 @@ fn main() -> Result<()> {
                     limit,
                     groups,
                     list_order,
+                    allow_branch_reuse,
+                    branch_reuse_guard_days,
                 )?;
             }
         }
