@@ -70,6 +70,10 @@ land: flatten
 ignore_tag: ignore
 
 # How `spr update` manages PR descriptions from commit messages
+# This setting affects how existing PR bodies are updated after creation.
+# Initial PR creation always uses the bottom commit in the PR group:
+# the title comes from the first line of that commit message, and the
+# PR description comes from the rest of that same commit message.
 pr_description_mode: overwrite | stack_only
 
 # Order for printing PR/commit lists
@@ -125,6 +129,9 @@ Behavior:
 
 - Parses `pr:<tag>` markers from `merge-base(base, from)..from` (commits between `pr:ignore` and the next `pr:<tag>` are ignored)
 - Creates/updates per-PR branches and GitHub PRs
+- When a PR is first created, `spr` always seeds it from the bottom commit in that PR group:
+  the PR title comes from the first line of that commit message, and the PR description comes
+  from the rest of that same commit message, regardless of `pr_description_mode`
 - Before creating a PR for a branch head without an open PR, checks whether the same branch name
   had a recently merged or closed PR and halts within `branch_reuse_guard_days`
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
