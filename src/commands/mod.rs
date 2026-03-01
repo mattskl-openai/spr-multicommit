@@ -17,5 +17,5 @@ pub use list::list_prs_display;
 pub use prep::prep_squash;
 pub use r#move::move_groups_after;
 pub use relink_prs::relink_prs;
-pub use restack::restack_after;
+pub use restack::{restack_after, restack_after_count};
 pub use update::{build_from_groups, build_from_tags};

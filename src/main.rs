@@ -9,6 +9,37 @@ mod git;
 mod github;
 mod limit;
 mod parsing;
+mod selectors;
+
+fn resolve_update_pr_limit(
+    groups: &[crate::parsing::Group],
+    to: Option<crate::selectors::GroupSelector>,
+    n: Option<usize>,
+    legacy_n: Option<usize>,
+) -> Result<crate::limit::Limit> {
+    if let Some(to) = to {
+        let count = crate::selectors::resolve_group_ordinal(groups, &to)?;
+        Ok(crate::limit::Limit::ByPr(count))
+    } else if let Some(n) = n {
+        if n == 0 {
+            Err(anyhow::anyhow!("`spr update pr --n` must be 1 or greater."))
+        } else {
+            Ok(crate::limit::Limit::ByPr(n))
+        }
+    } else if let Some(n) = legacy_n {
+        if n == 0 {
+            Err(anyhow::anyhow!(
+                "`spr update pr` positional limit must be 1 or greater."
+            ))
+        } else {
+            Ok(crate::limit::Limit::ByPr(n))
+        }
+    } else {
+        Err(anyhow::anyhow!(
+            "`spr update pr` requires either `--to <N|pr:<label>>` or `--n <N>`."
+        ))
+    }
+}
 
 fn init_tools() -> Result<()> {
     crate::git::ensure_tool("git")?;
@@ -97,10 +128,6 @@ fn main() -> Result<()> {
             extent,
         } => {
             set_dry_run_env(cli.dry_run, assume_existing_prs);
-            let limit = extent.map(|e| match e {
-                crate::cli::Extent::Pr { n } => crate::limit::Limit::ByPr(n),
-                crate::cli::Extent::Commits { n } => crate::limit::Limit::ByCommits(n),
-            });
             let pr_description_mode = pr_description_mode_override.unwrap_or(pr_description_mode);
             if restack {
                 return Err(anyhow::anyhow!(
@@ -116,6 +143,18 @@ fn main() -> Result<()> {
                         from
                     ));
                 }
+                let limit = if let Some(extent) = extent {
+                    match extent {
+                        crate::cli::Extent::Pr { to, n, legacy_n } => {
+                            Some(resolve_update_pr_limit(&groups, to, n, legacy_n)?)
+                        }
+                        crate::cli::Extent::Commits { n } => {
+                            Some(crate::limit::Limit::ByCommits(n))
+                        }
+                    }
+                } else {
+                    None
+                };
                 crate::commands::build_from_groups(
                     &base,
                     &prefix,
@@ -132,20 +171,10 @@ fn main() -> Result<()> {
         }
         crate::cli::Cmd::Restack { after, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            let after_num: usize = match after.to_lowercase().as_str() {
-                "bottom" => 0,
-                "top" | "last" | "all" => usize::MAX,
-                s => s.parse::<usize>().map_err(|_| {
-                    anyhow::anyhow!(
-                        "Invalid value for --after: {} (expected number or bottom|top|last)",
-                        s
-                    )
-                })?,
-            };
             crate::commands::restack_after(
                 &base,
                 &ignore_tag,
-                after_num,
+                &after,
                 safe,
                 cli.dry_run,
                 restack_conflict_policy,
@@ -157,7 +186,7 @@ fn main() -> Result<()> {
                 return Err(anyhow::anyhow!("--until conflicts with --exact"));
             }
             let selection = if let Some(n) = cli.until {
-                if n == 0 {
+                if n == crate::selectors::InclusiveSelector::All {
                     crate::cli::PrepSelection::All
                 } else {
                     crate::cli::PrepSelection::Until(n)
@@ -199,13 +228,15 @@ fn main() -> Result<()> {
                 "per-pr" | "perpr" | "per_pr" => crate::cli::LandCmd::PerPr,
                 _ => crate::cli::LandCmd::Flatten,
             });
-            let until = cli.until.unwrap_or(0);
-            match mode {
+            let until = cli
+                .until
+                .unwrap_or(crate::selectors::InclusiveSelector::All);
+            let landed_count = match mode {
                 crate::cli::LandCmd::Flatten => crate::commands::land_flatten_until(
                     &base,
                     &prefix,
                     &ignore_tag,
-                    until,
+                    &until,
                     cli.dry_run,
                     r#unsafe,
                 )?,
@@ -213,17 +244,17 @@ fn main() -> Result<()> {
                     &base,
                     &prefix,
                     &ignore_tag,
-                    until,
+                    &until,
                     cli.dry_run,
                     r#unsafe,
                 )?,
-            }
+            };
             if !no_restack {
                 // After landing the first N PRs, restack the remaining commits onto the latest base
-                crate::commands::restack_after(
+                crate::commands::restack_after_count(
                     &base,
                     &ignore_tag,
-                    until,
+                    landed_count,
                     false,
                     cli.dry_run,
                     restack_conflict_policy,
@@ -238,9 +269,9 @@ fn main() -> Result<()> {
             set_dry_run_env(cli.dry_run, false);
             crate::commands::cleanup_remote_branches(&prefix, cli.dry_run)?;
         }
-        crate::cli::Cmd::FixPr { n, tail, safe } => {
+        crate::cli::Cmd::FixPr { target, tail, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            crate::commands::fix_pr_tail(&base, &ignore_tag, n, tail, safe, cli.dry_run)?;
+            crate::commands::fix_pr_tail(&base, &ignore_tag, &target, tail, safe, cli.dry_run)?;
         }
         crate::cli::Cmd::Move { range, after, safe } => {
             set_dry_run_env(cli.dry_run, false);

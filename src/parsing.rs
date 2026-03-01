@@ -7,6 +7,7 @@
 use crate::git::git_ro;
 use anyhow::{bail, Result};
 use regex::Regex;
+use std::collections::HashSet;
 use tracing::warn;
 
 /// A PR group derived from `pr:<tag>` markers in commit messages.
@@ -103,6 +104,36 @@ impl Group {
             .trim()
             .to_string())
     }
+}
+
+#[derive(Debug)]
+struct DuplicateGroupTagError {
+    tag: String,
+}
+
+impl std::fmt::Display for DuplicateGroupTagError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Duplicate outstanding PR group tag `pr:{}`. `pr:<label>` starts a PR group, must remain unique within the outstanding stack, and is now used as a stable handle.",
+            self.tag
+        )
+    }
+}
+
+impl std::error::Error for DuplicateGroupTagError {}
+
+fn ensure_unique_group_tags(groups: &[Group]) -> Result<()> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for group in groups {
+        if !seen.insert(group.tag.as_str()) {
+            return Err(DuplicateGroupTagError {
+                tag: group.tag.clone(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Parse a reversed git log stream into PR groups, honoring an ignore tag.
@@ -209,6 +240,7 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
     if ignoring {
         flush_ignored(&mut ignored_block, &mut groups, &mut leading_ignored);
     }
+    ensure_unique_group_tags(&groups)?;
     Ok((leading_ignored, groups))
 }
 
@@ -376,5 +408,21 @@ mod tests {
         assert_eq!(groups[0].tag, "alpha");
         assert_eq!(groups[1].tag, "IGNORE");
         assert_eq!(groups[2].tag, "beta");
+    }
+
+    #[test]
+    fn parse_groups_rejects_duplicate_outstanding_tags() {
+        let raw = make_log(&[
+            ("a1", "feat: alpha start pr:alpha"),
+            ("a2", "feat: alpha follow-up"),
+            ("b1", "feat: duplicate alpha pr:alpha"),
+        ]);
+
+        let err = parse_groups(&raw, "ignore").unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Duplicate outstanding PR group tag `pr:alpha`"),
+            "unexpected error: {message}"
+        );
     }
 }

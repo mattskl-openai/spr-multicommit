@@ -5,19 +5,9 @@ use tracing::info;
 
 use crate::commands::common;
 use crate::parsing::derive_local_groups_with_ignored;
-
-fn parse_range(input: &str) -> Result<(usize, usize)> {
-    if let Some(dots) = input.find("..") {
-        let (a, b) = input.split_at(dots);
-        let b = &b[2..];
-        let ai: usize = a.trim().parse()?;
-        let bi: usize = b.trim().parse()?;
-        Ok((ai, bi))
-    } else {
-        let ai: usize = input.trim().parse()?;
-        Ok((ai, ai))
-    }
-}
+use crate::selectors::{
+    resolve_after_count, resolve_group_range, AfterSelector, GroupRangeSelector,
+};
 
 fn format_simple_plan(old: &[usize], new: &[usize], a: usize, b: usize, c: usize) -> String {
     let lhs = if a == b {
@@ -54,6 +44,16 @@ fn cherry_pick_block(dry: bool, tmp_path: &str, commits: &[String]) -> Result<()
     }
 }
 
+fn resolve_move_targets(
+    groups: &[crate::parsing::Group],
+    range: &GroupRangeSelector,
+    after: &AfterSelector,
+) -> Result<(usize, usize, usize)> {
+    let (a, b) = resolve_group_range(groups, range)?;
+    let c = resolve_after_count(groups, after)?;
+    Ok((a, b, c))
+}
+
 /// Move a group (or group range) to come after a target group index.
 ///
 /// Ignore blocks (`pr:ignore` and its configured alias) remain attached to the
@@ -66,8 +66,8 @@ fn cherry_pick_block(dry: bool, tmp_path: &str, commits: &[String]) -> Result<()
 pub fn move_groups_after(
     base: &str,
     ignore_tag: &str,
-    range: &str,
-    after: &str,
+    range: &GroupRangeSelector,
+    after: &AfterSelector,
     safe: bool,
     dry: bool,
 ) -> Result<()> {
@@ -79,7 +79,7 @@ pub fn move_groups_after(
         return Ok(());
     }
 
-    let (a, b) = parse_range(range)?; // 1-based inclusive
+    let (a, b, c) = resolve_move_targets(&groups, range, after)?;
     if a == 0 || b == 0 || a > n || b > n {
         return Err(anyhow!(
             "Range out of bounds: {}..{} with N={} groups",
@@ -88,17 +88,6 @@ pub fn move_groups_after(
             n
         ));
     }
-    let c: usize = match after.trim().to_lowercase().as_str() {
-        "bottom" => 0,
-        "top" => n,
-        s => s.parse::<usize>().map_err(|_| {
-            anyhow!(
-                "--after must be a number in 0..={} or one of: bottom, top (got '{}')",
-                n,
-                after
-            )
-        })?,
-    };
     if c > n {
         return Err(anyhow!("--after must be in 0..={} (got {})", n, c));
     }
@@ -185,4 +174,44 @@ pub fn move_groups_after(
     common::cleanup_temp_worktree(dry, &tmp_path, &tmp_branch)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_move_targets;
+    use crate::parsing::Group;
+    use crate::selectors::{AfterSelector, GroupRangeSelector, GroupSelector, StableHandle};
+
+    fn groups(tags: &[&str]) -> Vec<Group> {
+        tags.iter()
+            .map(|tag| Group {
+                tag: tag.to_string(),
+                subjects: vec![format!("feat: {tag}")],
+                commits: vec![format!("{tag}1")],
+                first_message: Some(format!("feat: {tag} pr:{tag}")),
+                ignored_after: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn move_range_and_after_resolve_from_stable_handles() {
+        let groups = groups(&["alpha", "beta", "gamma"]);
+        let range = GroupRangeSelector::Inclusive {
+            start: GroupSelector::Stable(StableHandle {
+                tag: "beta".to_string(),
+            }),
+            end: GroupSelector::Stable(StableHandle {
+                tag: "gamma".to_string(),
+            }),
+        };
+        let after = AfterSelector::Group(GroupSelector::Stable(StableHandle {
+            tag: "alpha".to_string(),
+        }));
+
+        assert_eq!(
+            resolve_move_targets(&groups, &range, &after).unwrap(),
+            (2, 3, 1)
+        );
+    }
 }
