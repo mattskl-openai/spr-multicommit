@@ -11,7 +11,7 @@ Stack-friendly CLI to manage, update, and land stacked GitHub pull requests.
 Installation
 ------------
 
-- Requires `git` and GitHub CLI `gh` (authenticated) in `PATH`.
+- Requires `git` in `PATH`. GitHub CLI `gh` (authenticated) is required for GitHub-backed commands such as `spr update`, `spr list`, and `spr land`, and also for `spr move` because it checks the bottom PR's auto-merge state before rewriting the stack.
 - Build from source:
 
 ```bash
@@ -44,6 +44,14 @@ spr update
 # Inspect the stack
 spr list pr
 spr list commit
+
+# After appending commits directly to canonical local per-PR branches,
+# fold those tails back into the checked-out stack branch.
+spr absorb
+
+# Inspect the rewritten stack, then republish the per-PR branches.
+spr list commit
+spr update
 ```
 
 `pr:<tag>` is the stable handle for a PR group, and `<tag>` must start with an
@@ -178,6 +186,43 @@ Behavior:
 - `halt` stops on conflict, leaves the temp restack worktree and branch in place, and prints manual rollback/continue instructions.
 - When using `halt`, resolve conflicts inside the printed temp worktree path; resolving in your original worktree will not advance the halted cherry-pick.
 
+### spr absorb
+
+Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.
+
+Behavior:
+
+- If you append commits to the end of a local PR branch such as `user-spr/alpha`, `spr absorb` rebuilds the local stack so the new commits become part of the matching PR group while preserving PR-group order
+- Inspects only exact local branches named `prefix + tag`
+- Skips missing branches, unchanged branches, and branches that are behind the current stack
+- Refuses to guess through divergence, source branches that incorporated later stack commits, merge commits, or absorbed commits that contain `pr:<tag>` markers
+- By default, also blocks copied later stack commits whose original replay would otherwise become empty or ambiguous
+- `--allow-replayed-duplicates` overrides that copied-commit blocker for safe cases by absorbing the copied commit and keeping its later non-seed replay in the rebuilt stack
+- Rebuilds the current stack from its existing `merge-base(base, HEAD)` rather than restacking onto the latest base tip
+- Inserts absorbed commits after the group's real commits and before that group's trailing ignored block
+- Creates a local backup tag before rewriting the stack
+- Does not update GitHub; inspect the rewritten stack first, then run `spr update`
+
+Typical workflow:
+
+```bash
+# The current stack has three PR groups: pr:alpha, pr:beta, and pr:gamma.
+git checkout user-spr/alpha
+git commit -m "feat: alpha branch tail"
+git commit -m "feat: alpha branch tail 2"
+
+git checkout <stack-branch>
+spr absorb
+spr list commit
+spr update
+```
+
+Override example for intentionally keeping both an earlier copied follow-up commit and its later replay:
+
+```bash
+spr absorb --allow-replayed-duplicates
+```
+
 ### spr list pr
 
 Lists PRs in the current stack for the configured prefix. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers remain bottom → top, but the output now shows both the current `LPR #N` and the stable `pr:<label>` handle for each group.
@@ -217,6 +262,10 @@ Aliases:
 ### spr move
 
 Reorder local PR groups by moving one or a range to come after a target PR.
+
+Requires authenticated GitHub CLI `gh` because `spr move` checks whether the
+current bottom PR has auto-merge enabled before allowing a rewrite that would
+move another PR below it.
 
 Aliases:
 

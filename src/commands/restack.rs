@@ -16,58 +16,11 @@ use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
 
 use crate::commands::common;
+use crate::commands::common::CherryPickOp;
 use crate::config::RestackConflictPolicy;
 use crate::git::git_rw;
 use crate::parsing::{derive_local_groups_with_ignored, Group};
 use crate::selectors::{resolve_after_count, AfterSelector};
-
-/// A single planned cherry-pick step used to rebuild the restacked history.
-///
-/// `spr restack` constructs an ordered plan of these operations and executes
-/// them inside a temporary worktree and branch. A `Range` represents a
-/// contiguous commit interval (inclusive) expressed as `first^..last`.
-///
-/// Callers should treat this as an execution primitive: errors are surfaced to
-/// the caller, and cleanup/rollback decisions are intentionally handled at a
-/// higher level where the conflict policy is known.
-#[derive(Debug, Clone)]
-enum CherryPickOp {
-    /// Cherry-pick a single commit SHA.
-    Commit { sha: String },
-    /// Cherry-pick an inclusive range from `first` through `last`.
-    Range { first: String, last: String },
-}
-
-impl CherryPickOp {
-    /// Execute this cherry-pick operation in the temp worktree at `tmp_path`.
-    ///
-    /// This method is intentionally thin and does not attempt to detect or
-    /// resolve conflicts; callers must check for conflict state and decide
-    /// whether to halt or roll back based on policy.
-    fn run(&self, dry: bool, tmp_path: &str) -> Result<()> {
-        match self {
-            CherryPickOp::Commit { sha } => common::cherry_pick_commit(dry, tmp_path, sha),
-            CherryPickOp::Range { first, last } => {
-                common::cherry_pick_range(dry, tmp_path, first, last)
-            }
-        }
-    }
-
-    /// Render a user-facing git command that mirrors this operation.
-    ///
-    /// This string is used in halt instructions so a human can continue the
-    /// remaining plan manually from the temp worktree.
-    fn command_for_user(&self, tmp_path: &str) -> String {
-        match self {
-            CherryPickOp::Commit { sha } => {
-                format!("git -C {} cherry-pick {}", tmp_path, sha)
-            }
-            CherryPickOp::Range { first, last } => {
-                format!("git -C {} cherry-pick {}^..{}", tmp_path, first, last)
-            }
-        }
-    }
-}
 
 fn cherry_pick_head_exists(tmp_path: &str) -> bool {
     Command::new("git")
@@ -105,40 +58,43 @@ fn cleanup_temp_worktree_best_effort(dry: bool, tmp_path: &str, tmp_branch: &str
 /// 1. Ignored commits attached to dropped groups, kept before the remaining stack.
 /// 2. Each remaining PR group's commits.
 /// 3. Each remaining group's trailing ignored block.
-fn build_cherry_pick_plan(kept_ignored: &[String], remaining: &[Group]) -> Vec<CherryPickOp> {
-    let mut ops: Vec<CherryPickOp> = vec![];
-
-    if let (Some(first), Some(last)) = (kept_ignored.first(), kept_ignored.last()) {
-        if kept_ignored.len() == 1 {
-            ops.push(CherryPickOp::Commit { sha: first.clone() });
-        } else {
-            ops.push(CherryPickOp::Range {
-                first: first.clone(),
-                last: last.clone(),
-            });
-        }
-    }
+fn build_cherry_pick_plan(
+    kept_ignored_segments: &[Vec<String>],
+    remaining: &[Group],
+) -> Vec<CherryPickOp> {
+    let mut ops: Vec<CherryPickOp> = kept_ignored_segments
+        .iter()
+        .filter_map(|segment| CherryPickOp::from_commits(segment))
+        .collect();
 
     for g in remaining {
-        if let (Some(first), Some(last)) = (g.commits.first(), g.commits.last()) {
-            ops.push(CherryPickOp::Range {
-                first: first.clone(),
-                last: last.clone(),
-            });
-        }
-        if let (Some(first), Some(last)) = (g.ignored_after.first(), g.ignored_after.last()) {
-            if g.ignored_after.len() == 1 {
-                ops.push(CherryPickOp::Commit { sha: first.clone() });
-            } else {
-                ops.push(CherryPickOp::Range {
-                    first: first.clone(),
-                    last: last.clone(),
-                });
-            }
-        }
+        ops.extend(CherryPickOp::from_commits(&g.commits));
+        ops.extend(CherryPickOp::from_commits(&g.ignored_after));
     }
 
     ops
+}
+
+fn build_kept_ignored_segments(
+    leading_ignored: Vec<String>,
+    groups: &[Group],
+    after: usize,
+) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = if leading_ignored.is_empty() {
+        Vec::new()
+    } else {
+        vec![leading_ignored]
+    };
+
+    segments.extend(
+        groups
+            .iter()
+            .take(after)
+            .filter(|group| !group.ignored_after.is_empty())
+            .map(|group| group.ignored_after.clone()),
+    );
+
+    segments
 }
 
 /// Emit user-facing rollback and manual-continue instructions for a halted restack.
@@ -209,17 +165,9 @@ fn restack_after_resolved(
 ) -> Result<()> {
     let (cur_branch, short) = common::get_current_branch_and_short()?;
     let after = std::cmp::min(after, groups.len());
-    let kept_ignored: Vec<String> = leading_ignored
-        .into_iter()
-        .chain(
-            groups
-                .iter()
-                .take(after)
-                .flat_map(|group| group.ignored_after.iter().cloned()),
-        )
-        .collect();
+    let kept_ignored_segments = build_kept_ignored_segments(leading_ignored, &groups, after);
     let remaining = &groups[after..];
-    if remaining.is_empty() && kept_ignored.is_empty() {
+    if remaining.is_empty() && kept_ignored_segments.is_empty() {
         if safe {
             let _ = common::create_backup_tag(dry, "restack", &cur_branch, &short)?;
         }
@@ -244,7 +192,7 @@ fn restack_after_resolved(
         };
 
         let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "restack", base, &short)?;
-        let ops = build_cherry_pick_plan(&kept_ignored, remaining);
+        let ops = build_cherry_pick_plan(&kept_ignored_segments, remaining);
         for (idx, op) in ops.iter().enumerate() {
             if let Err(err) = op.run(dry, &tmp_path) {
                 let conflict = cherry_pick_head_exists(&tmp_path);
@@ -361,7 +309,8 @@ pub fn restack_after_count(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_restack_after_count;
+    use super::{build_cherry_pick_plan, build_kept_ignored_segments, resolve_restack_after_count};
+    use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp};
     use crate::parsing::Group;
     use crate::selectors::{AfterSelector, GroupSelector, StableHandle};
 
@@ -385,5 +334,65 @@ mod tests {
         }));
 
         assert_eq!(resolve_restack_after_count(&groups, &after).unwrap(), 2);
+    }
+
+    #[test]
+    fn kept_ignored_segments_preserve_group_boundaries() {
+        let groups = vec![
+            Group {
+                tag: "alpha".to_string(),
+                subjects: vec!["feat: alpha".to_string()],
+                commits: vec!["a1".to_string()],
+                first_message: Some("feat: alpha pr:alpha".to_string()),
+                ignored_after: vec!["i1".to_string(), "i2".to_string()],
+            },
+            Group {
+                tag: "beta".to_string(),
+                subjects: vec!["feat: beta".to_string()],
+                commits: vec!["b1".to_string()],
+                first_message: Some("feat: beta pr:beta".to_string()),
+                ignored_after: vec!["i3".to_string(), "i4".to_string()],
+            },
+        ];
+
+        assert_eq!(
+            build_kept_ignored_segments(vec!["l1".to_string()], &groups, 2),
+            vec![
+                vec!["l1".to_string()],
+                vec!["i1".to_string(), "i2".to_string()],
+                vec!["i3".to_string(), "i4".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn build_cherry_pick_plan_keeps_ignored_segments_separate() {
+        let remaining = groups(&["gamma"]);
+
+        assert_eq!(
+            build_cherry_pick_plan(
+                &[
+                    vec!["i1".to_string(), "i2".to_string()],
+                    vec!["i3".to_string(), "i4".to_string()],
+                ],
+                &remaining,
+            ),
+            vec![
+                CherryPickOp::Range {
+                    first: "i1".to_string(),
+                    last: "i2".to_string(),
+                    empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+                },
+                CherryPickOp::Range {
+                    first: "i3".to_string(),
+                    last: "i4".to_string(),
+                    empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+                },
+                CherryPickOp::Commit {
+                    sha: "gamma1".to_string(),
+                    empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+                },
+            ]
+        );
     }
 }

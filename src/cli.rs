@@ -81,6 +81,16 @@ pub enum Cmd {
         safe: bool,
     },
 
+    /// Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch
+    #[command(
+        long_about = "Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.\n\nIf you append commits to the end of a local PR branch such as `user-spr/alpha`, run `spr absorb` while the stack branch is checked out. `spr` rebuilds the local stack so the new commits become part of the matching PR group. The PR-group order stays the same.\n\nThis command is local-only: it rewrites the current stack branch, creates a backup tag, and does not update GitHub. After checking the result, run `spr update`.\n\nOnly exact local branches named `prefix + tag` are considered.\n\nExample:\n- The current stack has three PR groups: `pr:alpha`, `pr:beta`, and `pr:gamma`.\n- Check out `user-spr/alpha` and append 2 commits.\n- Check out the stack branch.\n- Run `spr absorb`.\n- Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same.\n- Then run `spr update`.\n\nAdvanced:\n- By default, absorb blocks copied later commits when replaying the stack would become empty or ambiguous.\n- `--allow-replayed-duplicates` allows an earlier copied non-seed follow-up commit to coexist with its later replayed copy by keeping both commits in the rewritten stack."
+    )]
+    Absorb {
+        /// Allow replayed duplicates and keep both copies when the later replay is non-seed
+        #[arg(long)]
+        allow_replayed_duplicates: bool,
+    },
+
     /// Prepare PRs for landing (e.g., squash)
     Prep {
         // selection is provided via global --until/--exact flags
@@ -185,4 +195,39 @@ pub struct Cli {
     pub exact: Option<crate::selectors::GroupSelector>,
     #[command(subcommand)]
     pub cmd: Cmd,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Cmd};
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn absorb_override_flag_parses() {
+        let cli = Cli::try_parse_from(["spr", "absorb", "--allow-replayed-duplicates"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Absorb {
+                allow_replayed_duplicates,
+            } => assert!(allow_replayed_duplicates),
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn absorb_help_text_mentions_pr_groups_and_example_flow() {
+        let mut cli = Cli::command();
+        let absorb = cli.find_subcommand_mut("absorb").unwrap();
+        let long_about = absorb.get_long_about().unwrap().to_string();
+
+        assert!(long_about.contains(
+            "The current stack has three PR groups: `pr:alpha`, `pr:beta`, and `pr:gamma`."
+        ));
+        assert!(long_about.contains("Check out `user-spr/alpha` and append 2 commits."));
+        assert!(long_about.contains("Check out the stack branch."));
+        assert!(long_about.contains("Run `spr absorb`."));
+        assert!(long_about.contains(
+            "Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same."
+        ));
+    }
 }

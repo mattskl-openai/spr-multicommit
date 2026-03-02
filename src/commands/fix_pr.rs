@@ -143,7 +143,12 @@ pub fn fix_pr_tail(
 
     for sha in &new_order {
         // Cherry-pick the commit onto tmp
-        common::cherry_pick_commit(dry, &tmp_path, sha)?;
+        common::cherry_pick_commit(
+            dry,
+            &tmp_path,
+            sha,
+            common::CherryPickEmptyPolicy::StopOnEmpty,
+        )?;
     }
 
     // Point current branch to new tip
