@@ -9,6 +9,7 @@ mod git;
 mod github;
 mod limit;
 mod parsing;
+mod pr_labels;
 mod selectors;
 
 fn resolve_update_pr_limit(
@@ -36,7 +37,7 @@ fn resolve_update_pr_limit(
         }
     } else {
         Err(anyhow::anyhow!(
-            "`spr update pr` requires either `--to <N|pr:<label>>` or `--n <N>`."
+            "`spr update pr` requires either `--to <N|label|pr:<label>>` or `--n <N>`."
         ))
     }
 }

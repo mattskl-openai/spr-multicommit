@@ -5,7 +5,7 @@ pub enum Extent {
     /// Update the first N PRs (bottom-up)
     Pr {
         /// Limit updates through this local PR number or stable handle
-        #[arg(long, value_name = "N|pr:<label>", conflicts_with_all = ["n", "legacy_n"])]
+        #[arg(long, value_name = "N|label|pr:<label>", conflicts_with_all = ["n", "legacy_n"])]
         to: Option<crate::selectors::GroupSelector>,
         /// Legacy numeric-only limit
         #[arg(long, value_name = "N", conflicts_with_all = ["to", "legacy_n"])]
@@ -73,7 +73,7 @@ pub enum Cmd {
     /// Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base
     Restack {
         /// Keep groups through this selector in place and rebuild only the groups above it
-        #[arg(long, value_name = "N|0|bottom|top|last|all|pr:<label>")]
+        #[arg(long, value_name = "N|0|bottom|top|last|all|label|pr:<label>")]
         after: crate::selectors::AfterSelector,
 
         /// Create a local backup tag at current HEAD before rebasing
@@ -139,10 +139,10 @@ pub enum Cmd {
     /// Reorder local PR groups by moving one or a range to come after a target PR
     #[command(alias = "mv")]
     Move {
-        /// Position or range to move: either `A`, `A..B`, `pr:<label>`, or `pr:<a>..pr:<b>`
+        /// Position or range to move: `A`, `A..B`, `label`, `pr:<label>`, `a..b`, or `pr:<a>..pr:<b>`
         range: crate::selectors::GroupRangeSelector,
         /// Target PR position to come after: number, stable handle, or one of bottom/top/last/all
-        #[arg(long, value_name = "C|bottom|top|last|all|pr:<label>")]
+        #[arg(long, value_name = "C|bottom|top|last|all|label|pr:<label>")]
         after: crate::selectors::AfterSelector,
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
@@ -178,10 +178,10 @@ pub struct Cli {
     #[arg(long, global = true, visible_alias = "dr")]
     pub dry_run: bool,
     /// Global until (used by prep/land). Accepts 0, a local PR number, or a stable handle
-    #[arg(long, global = true, value_name = "N|0|pr:<label>")]
+    #[arg(long, global = true, value_name = "N|0|label|pr:<label>")]
     pub until: Option<crate::selectors::InclusiveSelector>,
     /// Global exact (used by prep). Accepts a local PR number or a stable handle
-    #[arg(long, global = true, value_name = "I|pr:<label>")]
+    #[arg(long, global = true, value_name = "I|label|pr:<label>")]
     pub exact: Option<crate::selectors::GroupSelector>,
     #[command(subcommand)]
     pub cmd: Cmd,

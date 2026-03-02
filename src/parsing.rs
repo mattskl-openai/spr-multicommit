@@ -6,7 +6,6 @@
 
 use crate::git::git_ro;
 use anyhow::{bail, Result};
-use regex::Regex;
 use std::collections::HashSet;
 use tracing::warn;
 
@@ -32,8 +31,10 @@ pub struct Group {
 impl Group {
     pub fn pr_title(&self) -> Result<String> {
         if let Some(s) = self.subjects.first() {
-            let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
-            let t = re.replace_all(s, "").trim().to_string();
+            let t = crate::pr_labels::valid_marker_regex()
+                .replace_all(s, "")
+                .trim()
+                .to_string();
             if !t.is_empty() {
                 return Ok(t);
             }
@@ -43,8 +44,7 @@ impl Group {
     pub fn squash_commit_message(&self) -> Result<String> {
         if let Some(full) = &self.first_message {
             // Validate the first commit contains the expected pr:<tag> marker
-            let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
-            if let Some(cap) = re.captures(full) {
+            if let Some(cap) = crate::pr_labels::valid_marker_regex().captures(full) {
                 let found = cap.get(1).unwrap().as_str();
                 if !found.eq_ignore_ascii_case(&self.tag) {
                     bail!(
@@ -74,8 +74,7 @@ impl Group {
         } else {
             String::new()
         };
-        let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
-        let cleaned = re
+        let cleaned = crate::pr_labels::valid_marker_regex()
             .replace_all(&base_body, "")
             .to_string()
             .trim()
@@ -97,8 +96,7 @@ impl Group {
         } else {
             String::new()
         };
-        let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
-        Ok(re
+        Ok(crate::pr_labels::valid_marker_regex()
             .replace_all(&base_body, "")
             .to_string()
             .trim()
@@ -164,7 +162,6 @@ pub fn parse_groups(raw: &str, ignore_tag: &str) -> Result<Vec<Group>> {
 ///
 /// Returns an error if any commit message contains more than one `pr:<tag>` marker.
 pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<String>, Vec<Group>)> {
-    let re = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
     let mut groups: Vec<Group> = vec![];
     let mut current: Option<Group> = None;
     let mut ignoring = false;
@@ -201,14 +198,18 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
         let message = parts.next().unwrap_or_default().to_string();
         let subj = message.lines().next().unwrap_or_default().to_string();
 
-        let tag_matches = re.captures_iter(&message).count();
-        if tag_matches > 1 {
+        let tags: Vec<String> = crate::pr_labels::candidate_marker_regex()
+            .captures_iter(&message)
+            .map(|cap| cap.get(1).unwrap().as_str().to_string())
+            .collect();
+        if tags.len() > 1 {
             bail!("Multiple pr:<tag> markers found in commit {sha}");
         }
 
-        if tag_matches == 1 {
-            let cap = re.captures(&message).unwrap();
-            let tag = cap.get(1).unwrap().as_str().to_string();
+        if let Some(tag) = tags.first() {
+            if let Err(err) = crate::pr_labels::validate_label(tag) {
+                bail!("Commit {sha} has invalid PR tag `pr:{tag}`: {err}");
+            }
             if tag == ignore_tag {
                 flush_current(&mut current, &mut groups);
                 ignoring = true;
@@ -221,7 +222,7 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
             }
             flush_current(&mut current, &mut groups);
             current = Some(Group {
-                tag,
+                tag: tag.clone(),
                 subjects: vec![subj.clone()],
                 commits: vec![sha],
                 first_message: Some(message.clone()),
@@ -422,6 +423,22 @@ mod tests {
         let message = format!("{err:#}");
         assert!(
             message.contains("Duplicate outstanding PR group tag `pr:alpha`"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_groups_rejects_digit_prefixed_tag() {
+        let raw = make_log(&[("a1", "feat: invalid start pr:1alpha")]);
+
+        let err = parse_groups(&raw, "ignore").unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Commit a1 has invalid PR tag `pr:1alpha`"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("must start with an ASCII letter"),
             "unexpected error: {message}"
         );
     }

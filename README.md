@@ -42,11 +42,12 @@ spr list pr
 spr list commit
 ```
 
-`pr:<tag>` is the stable handle for a PR group. `LPR #N` is only the current
-local position in the outstanding stack and may renumber after lower groups
-land or are removed. Commands that target groups can use either form, for
-example `spr land flatten --until pr:beta` or `spr move pr:beta --after
-pr:gamma`.
+`pr:<tag>` is the stable handle for a PR group, and `<tag>` must start with an
+ASCII letter. Commands that target groups accept either a bare label like
+`beta` or the explicit `pr:beta` form. `LPR #N` is only the current local
+position in the outstanding stack and may renumber after lower groups land or
+are removed. For example, `spr land flatten --until beta` and `spr move beta
+--after gamma` both target stable PR-group labels.
 
 Configuration
 -------------
@@ -73,6 +74,7 @@ land: flatten
 
 # Tag used to ignore commits between PR groups
 # Commit with pr:ignore_tag starts ignore mode until the next pr:<tag>
+# Must start with an ASCII letter
 ignore_tag: ignore
 
 # How `spr update` manages PR descriptions from commit messages
@@ -106,8 +108,8 @@ Global flags
  - `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
 - `--dry-run` (alias: `--dr`): print state-changing commands instead of executing
-- `--until <N|0|pr:<label>>`: target range used by `prep` and `land` (`0` means all)
-- `--exact <I|pr:<label>>`: used by `prep` to select exactly one PR group
+- `--until <N|0|label|pr:<label>>`: target range used by `prep` and `land` (`0` means all)
+- `--exact <I|label|pr:<label>>`: used by `prep` to select exactly one PR group
 - `--verbose`: enable verbose logging of underlying git/gh commands
 
 Commands
@@ -128,7 +130,7 @@ Key options:
 - `--pr-description-mode <overwrite|stack_only>`: override `pr_description_mode` for this update run
 - `--allow-branch-reuse`: bypass the recent closed-or-merged branch-name reuse guard
 - Extent (optional subcommand):
-  - `pr --to <N|pr:<label>>`: canonical selector for limiting updates to the first N PRs from the bottom
+  - `pr --to <N|label|pr:<label>>`: canonical selector for limiting updates to the first N PRs from the bottom
   - `pr --n <N>`: legacy numeric-only form
   - `pr <N>`: backward-compatible positional numeric form
   - `commits --n <N>`: limit to first N commits (untested)
@@ -152,10 +154,10 @@ Restack the local stack by rebuilding commits after the bottom N PR groups onto 
 
 Options:
 
-- `--after <N|0|bottom|top|last|all|pr:<label>>`: keep groups through this selector in place, then rebase only the groups above it onto `--base`
+- `--after <N|0|bottom|top|last|all|label|pr:<label>>`: keep groups through this selector in place, then rebase only the groups above it onto `--base`
   - `0` or `bottom`: restack all groups (moves everything after merge-base)
   - `top` or `last` or `all`: skip all PRs; ignored commits (pr:ignore blocks) are preserved, so the branch may remain ahead of base
-  - `pr:<label>`: keep that stable group and everything below it in place even if local PR numbers renumber
+  - `label` or `pr:<label>`: keep that stable group and everything below it in place even if local PR numbers renumber
 - `--safe`: create a local backup tag at current `HEAD` before rebasing
 
 Behavior:
@@ -217,8 +219,8 @@ Aliases:
 
 - `spr move A --after C`: move PR at position A to come after PR C (C ∈ [0..N])
 - `spr move A..B --after C`: move PRs A..B to come after PR C (requires A < B and C ∉ [A..B]; C ∈ [0..N])
-- `spr move pr:beta --after pr:gamma`: move a stable group handle without caring what its current local PR number is
-- `spr move pr:beta..pr:gamma --after pr:delta`: stable-handle range form
+- `spr move beta --after gamma`: move a stable group handle without caring what its current local PR number is
+- `spr move beta..gamma --after delta`: stable-handle range form
   - `--after bottom` is the same as `--after 0`
   - `--after top` is the same as `--after N`
 - `--safe`: create a local backup tag at current `HEAD` before rewriting
@@ -232,7 +234,7 @@ Land PRs using either flatten or per-pr strategy.
 
 Shared options (global):
 
-- `--until <N|0|pr:<label>>`: land bottom-up through this local position or stable handle (`0` means all)
+- `--until <N|0|label|pr:<label>>`: land bottom-up through this local position or stable handle (`0` means all)
 - `--no-restack`: do not automatically restack after landing
 
 Safety checks:
@@ -268,7 +270,7 @@ Default follow-up behavior:
 
 Prepare PRs for landing per-PR - squashes each PR's commits into a single commit.
 
-- Uses global `--until <N|0|pr:<label>>` / `--exact <I|pr:<label>>`
+- Uses global `--until <N|0|label|pr:<label>>` / `--exact <I|label|pr:<label>>`
 
 Behavior:
 
@@ -284,7 +286,7 @@ Aliases:
 
 - `spr fix N -t M`
 - `spr fix N` (equivalent to `spr fix N -t 1`)
-- `spr fix-pr pr:beta --tail M`
+- `spr fix-pr beta --tail M`
 
 Usage:
 
@@ -293,7 +295,7 @@ Usage:
 spr fix-pr 3
 
 # Move the top commit to the tail of the stable beta group
-spr fix-pr pr:beta
+spr fix-pr beta
 
 # Move the last 2 commits to the tail of PR 1
 spr fix-pr 1 --tail 2
@@ -362,13 +364,13 @@ Examples
 spr update
 
 # Update only through the stable beta group
-spr update pr --to pr:beta
+spr update pr --to beta
 
 # Prep the stack through the stable beta group
-spr prep --until pr:beta
+spr prep --until beta
 
 # Prep exactly the stable gamma group
-spr prep --exact pr:gamma
+spr prep --exact gamma
 
 # Prep the first 3 PRs from the bottom
 spr prep --until 3
@@ -383,13 +385,13 @@ spr restack --after 2
 spr restack --after 2 --safe
 
 # Restack only the groups above the stable beta group
-spr restack --after pr:beta
+spr restack --after beta
 
 # Land top PR only using config default mode (flatten by default)
 spr land --until 1
 
 # Land through the stable beta group
-spr land flatten --until pr:beta
+spr land flatten --until beta
 
 # Explicitly land first 2 PRs via flatten
 spr land flatten --until 2
@@ -401,7 +403,7 @@ spr land per-pr --until 2
 spr move 2..3 --after 4 --safe
 
 # Reorder stable groups without depending on local PR renumbering
-spr move pr:beta..pr:gamma --after pr:delta
+spr move beta..gamma --after delta
 
 # Fix PR base chain on GitHub to reflect local stack
 spr relink-prs

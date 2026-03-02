@@ -3,7 +3,9 @@
 //! These types separate user-facing selector syntax from the current local PR
 //! numbering. Command entrypoints parse into these enums once, then resolve
 //! them against the current `Vec<Group>` to recover the numeric boundary or
-//! local ordinal that existing command logic already understands.
+//! local ordinal that existing command logic already understands. Stable-label
+//! selectors accept either bare labels or the explicit `pr:<label>` form, while
+//! digits-only inputs remain local PR ordinals.
 
 use std::fmt::{self, Display};
 use std::str::FromStr;
@@ -73,29 +75,43 @@ fn has_pr_prefix(input: &str) -> bool {
     }
 }
 
+fn is_digits_only(input: &str) -> bool {
+    !input.is_empty() && input.chars().all(|ch| ch.is_ascii_digit())
+}
+
 fn parse_handle(input: &str) -> std::result::Result<StableHandle, String> {
     let trimmed = input.trim();
-    if !has_pr_prefix(trimmed) {
-        Err(format!("`{trimmed}` must start with `pr:`"))
-    } else if let Some(tag) = trimmed.get(3..) {
-        if tag.is_empty() {
-            Err(format!(
-                "stable selector `{trimmed}` is missing the label after `pr:`"
-            ))
-        } else if tag
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-        {
-            Ok(StableHandle {
-                tag: tag.to_string(),
-            })
+    let tag = if has_pr_prefix(trimmed) {
+        if let Some(tag) = trimmed.get(3..) {
+            if tag.is_empty() {
+                return Err(format!(
+                    "stable selector `{trimmed}` is missing the label after `pr:`"
+                ));
+            } else {
+                tag
+            }
         } else {
-            Err(format!(
-                "stable selector `{trimmed}` must use only [A-Za-z0-9._-] after `pr:`"
-            ))
+            return Err(format!(
+                "stable selector `{trimmed}` is missing the label after `pr:`"
+            ));
         }
     } else {
-        Err(format!("`{trimmed}` must start with `pr:`"))
+        trimmed
+    };
+
+    if let Err(err) = crate::pr_labels::validate_label(tag) {
+        match err {
+            crate::pr_labels::LabelValidationError::MustStartWithLetter => Err(format!(
+                "stable selector `{trimmed}` must start with an ASCII letter"
+            )),
+            crate::pr_labels::LabelValidationError::InvalidCharacters => Err(format!(
+                "stable selector `{trimmed}` must use only ASCII letters, digits, `.`, `_`, or `-` after the first letter"
+            )),
+        }
+    } else {
+        Ok(StableHandle {
+            tag: tag.to_string(),
+        })
     }
 }
 
@@ -118,8 +134,10 @@ impl FromStr for GroupSelector {
         let trimmed = input.trim();
         if has_pr_prefix(trimmed) {
             parse_handle(trimmed).map(Self::Stable)
-        } else {
+        } else if is_digits_only(trimmed) {
             parse_local_pr(trimmed).map(Self::LocalPr)
+        } else {
+            parse_handle(trimmed).map(Self::Stable)
         }
     }
 }
@@ -133,15 +151,19 @@ impl FromStr for InclusiveSelector {
             parse_handle(trimmed)
                 .map(GroupSelector::Stable)
                 .map(Self::Group)
-        } else {
+        } else if is_digits_only(trimmed) {
             let parsed = trimmed.parse::<usize>().map_err(|_| {
-                format!("`{trimmed}` must be 0, a local PR number, or `pr:<label>`")
+                format!("`{trimmed}` must be 0, a local PR number, a label, or `pr:<label>`")
             })?;
             if parsed == 0 {
                 Ok(Self::All)
             } else {
                 Ok(Self::Group(GroupSelector::LocalPr(parsed)))
             }
+        } else {
+            parse_handle(trimmed)
+                .map(GroupSelector::Stable)
+                .map(Self::Group)
         }
     }
 }
@@ -160,10 +182,10 @@ impl FromStr for AfterSelector {
             parse_handle(trimmed)
                 .map(GroupSelector::Stable)
                 .map(Self::Group)
-        } else {
+        } else if is_digits_only(trimmed) {
             let parsed = trimmed.parse::<usize>().map_err(|_| {
                 format!(
-                    "`{trimmed}` must be 0, a local PR number, `bottom`, `top`, `last`, `all`, or `pr:<label>`"
+                    "`{trimmed}` must be 0, a local PR number, `bottom`, `top`, `last`, `all`, a label, or `pr:<label>`"
                 )
             })?;
             if parsed == 0 {
@@ -171,6 +193,10 @@ impl FromStr for AfterSelector {
             } else {
                 Ok(Self::Group(GroupSelector::LocalPr(parsed)))
             }
+        } else {
+            parse_handle(trimmed)
+                .map(GroupSelector::Stable)
+                .map(Self::Group)
         }
     }
 }
@@ -287,6 +313,12 @@ mod tests {
                 tag: "Beta".to_string()
             })
         );
+        assert_eq!(
+            "beta".parse::<GroupSelector>().unwrap(),
+            GroupSelector::Stable(StableHandle {
+                tag: "beta".to_string()
+            })
+        );
     }
 
     #[test]
@@ -294,6 +326,12 @@ mod tests {
         assert_eq!(
             "0".parse::<InclusiveSelector>().unwrap(),
             InclusiveSelector::All
+        );
+        assert_eq!(
+            "beta".parse::<InclusiveSelector>().unwrap(),
+            InclusiveSelector::Group(GroupSelector::Stable(StableHandle {
+                tag: "beta".to_string()
+            }))
         );
     }
 
@@ -310,12 +348,18 @@ mod tests {
                 tag: "beta".to_string()
             }))
         );
+        assert_eq!(
+            "beta".parse::<AfterSelector>().unwrap(),
+            AfterSelector::Group(GroupSelector::Stable(StableHandle {
+                tag: "beta".to_string()
+            }))
+        );
     }
 
     #[test]
     fn group_range_selector_parses_single_and_range_forms() {
         assert_eq!(
-            "pr:beta..3".parse::<GroupRangeSelector>().unwrap(),
+            "beta..3".parse::<GroupRangeSelector>().unwrap(),
             GroupRangeSelector::Inclusive {
                 start: GroupSelector::Stable(StableHandle {
                     tag: "beta".to_string()
@@ -327,12 +371,62 @@ mod tests {
             "2".parse::<GroupRangeSelector>().unwrap(),
             GroupRangeSelector::Single(GroupSelector::LocalPr(2))
         );
+        assert_eq!(
+            "beta..gamma".parse::<GroupRangeSelector>().unwrap(),
+            GroupRangeSelector::Inclusive {
+                start: GroupSelector::Stable(StableHandle {
+                    tag: "beta".to_string()
+                }),
+                end: GroupSelector::Stable(StableHandle {
+                    tag: "gamma".to_string()
+                })
+            }
+        );
     }
 
     #[test]
     fn malformed_stable_handle_is_rejected() {
-        let err = "pr:beta!oops".parse::<GroupSelector>().unwrap_err();
-        assert!(err.contains("[A-Za-z0-9._-]"), "unexpected error: {err}");
+        let err = "beta!oops".parse::<GroupSelector>().unwrap_err();
+        assert!(
+            err.contains("ASCII letters, digits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn digit_prefixed_stable_handle_is_rejected() {
+        let err = "1beta".parse::<GroupSelector>().unwrap_err();
+        assert!(
+            err.contains("must start with an ASCII letter"),
+            "unexpected error: {err}"
+        );
+        let prefixed = "pr:1beta".parse::<GroupSelector>().unwrap_err();
+        assert!(
+            prefixed.contains("must start with an ASCII letter"),
+            "unexpected error: {prefixed}"
+        );
+    }
+
+    #[test]
+    fn prefixed_keyword_can_still_target_a_stable_handle() {
+        assert_eq!(
+            "pr:all".parse::<AfterSelector>().unwrap(),
+            AfterSelector::Group(GroupSelector::Stable(StableHandle {
+                tag: "all".to_string()
+            }))
+        );
+    }
+
+    #[test]
+    fn digits_only_selectors_remain_local_pr_ordinals() {
+        assert_eq!(
+            "2".parse::<InclusiveSelector>().unwrap(),
+            InclusiveSelector::Group(GroupSelector::LocalPr(2))
+        );
+        assert_eq!(
+            "2".parse::<AfterSelector>().unwrap(),
+            AfterSelector::Group(GroupSelector::LocalPr(2))
+        );
     }
 
     #[test]

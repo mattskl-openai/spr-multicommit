@@ -1,7 +1,6 @@
 //! Adjust the tail of a PR group while preserving ignore blocks.
 
 use anyhow::{anyhow, bail, Result};
-use regex::Regex;
 use std::collections::HashSet;
 use tracing::info;
 
@@ -65,11 +64,10 @@ pub fn fix_pr_tail(
     let top_commits: Vec<String> = all_commits.split_off(all_commits.len() - m);
 
     // Validate: moved commits must NOT contain pr:<tag> markers
-    let re_tag = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
     let mut offenders: Vec<String> = vec![];
     for sha in &top_commits {
         let msg = git_ro(["log", "-n", "1", "--format=%B", sha].as_slice())?;
-        if re_tag.is_match(&msg) {
+        if crate::pr_labels::candidate_marker_regex().is_match(&msg) {
             offenders.push(sha.clone());
         }
     }
