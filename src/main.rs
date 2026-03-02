@@ -287,6 +287,7 @@ fn main() -> Result<()> {
             set_dry_run_env(cli.dry_run, false);
             crate::commands::move_groups_after(
                 &base,
+                &prefix,
                 &ignore_tag,
                 &range,
                 &after,

@@ -22,6 +22,18 @@ pub struct PrInfo {
     pub base: String,
 }
 
+/// Open PR metadata used by stack guardrails that depend on auto-merge state.
+///
+/// `auto_merge_enabled` reflects whether GitHub currently has an `autoMergeRequest`
+/// on the PR. Callers should treat `false` as "auto-merge is not enabled right now",
+/// not as a promise about repository policy or mergeability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPrAutomergeInfo {
+    pub number: u64,
+    pub head: String,
+    pub auto_merge_enabled: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
     /// The head ref currently has an open pull request.
@@ -302,6 +314,58 @@ pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
     }
 
     Ok(out)
+}
+
+fn parse_open_pr_automerge_node(
+    node: &serde_json::Value,
+    requested_head: &str,
+) -> Result<OpenPrAutomergeInfo> {
+    let number = node["number"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("Open PR result missing number for {}", requested_head))?;
+    let head = node["headRefName"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Open PR result missing headRefName for {}", requested_head))?;
+
+    Ok(OpenPrAutomergeInfo {
+        number,
+        head: head.to_string(),
+        auto_merge_enabled: !node["autoMergeRequest"].is_null(),
+    })
+}
+
+/// Fetch the current open PR for `head`, including whether auto-merge is enabled.
+///
+/// Returns `Ok(None)` when no open PR exists for that head branch.
+pub fn get_open_pr_automerge_for_head(head: &str) -> Result<Option<OpenPrAutomergeInfo>> {
+    let (owner, name) = get_repo_owner_name()?;
+    let query = format!(
+        "query($owner:String!,$name:String!){{ repository(owner:$owner,name:$name){{ pr: pullRequests(headRefName:\"{}\", states:[OPEN], first:1) {{ nodes {{ number headRefName autoMergeRequest {{ enabledAt }} }} }} }} }}",
+        graphql_escape(head)
+    );
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", query),
+            "-F",
+            &format!("owner={}", owner),
+            "-F",
+            &format!("name={}", name),
+        ]
+        .as_slice(),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let maybe_node = value["data"]["repository"]["pr"]["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.first());
+
+    if let Some(node) = maybe_node {
+        parse_open_pr_automerge_node(node, head).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Parse a GitHub GraphQL `DateTime` string and attach head-specific error context.
@@ -707,8 +771,40 @@ pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{select_latest_terminal_pr, TerminalPrState};
+    use super::{parse_open_pr_automerge_node, select_latest_terminal_pr, TerminalPrState};
     use serde_json::json;
+
+    #[test]
+    fn parse_open_pr_automerge_node_detects_enabled_automerge() {
+        let node = json!({
+            "number": 17,
+            "headRefName": "dank-spr/example",
+            "autoMergeRequest": {
+                "enabledAt": "2026-03-01T12:00:00Z"
+            }
+        });
+
+        let info = parse_open_pr_automerge_node(&node, "dank-spr/example").unwrap();
+
+        assert_eq!(info.number, 17);
+        assert_eq!(info.head, "dank-spr/example");
+        assert!(info.auto_merge_enabled);
+    }
+
+    #[test]
+    fn parse_open_pr_automerge_node_detects_disabled_automerge() {
+        let node = json!({
+            "number": 18,
+            "headRefName": "dank-spr/example",
+            "autoMergeRequest": null
+        });
+
+        let info = parse_open_pr_automerge_node(&node, "dank-spr/example").unwrap();
+
+        assert_eq!(info.number, 18);
+        assert_eq!(info.head, "dank-spr/example");
+        assert!(!info.auto_merge_enabled);
+    }
 
     #[test]
     // Verifies: terminal PR selection uses the most recent close-or-merge timestamp across states.
