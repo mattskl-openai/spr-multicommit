@@ -132,9 +132,7 @@ impl FromStr for GroupSelector {
 
     fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
         let trimmed = input.trim();
-        if has_pr_prefix(trimmed) {
-            parse_handle(trimmed).map(Self::Stable)
-        } else if is_digits_only(trimmed) {
+        if is_digits_only(trimmed) {
             parse_local_pr(trimmed).map(Self::LocalPr)
         } else {
             parse_handle(trimmed).map(Self::Stable)
@@ -147,11 +145,7 @@ impl FromStr for InclusiveSelector {
 
     fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
         let trimmed = input.trim();
-        if has_pr_prefix(trimmed) {
-            parse_handle(trimmed)
-                .map(GroupSelector::Stable)
-                .map(Self::Group)
-        } else if is_digits_only(trimmed) {
+        if is_digits_only(trimmed) {
             let parsed = trimmed.parse::<usize>().map_err(|_| {
                 format!("`{trimmed}` must be 0, a local PR number, a label, or `pr:<label>`")
             })?;
@@ -174,15 +168,7 @@ impl FromStr for AfterSelector {
     fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
         let trimmed = input.trim();
         let lowered = trimmed.to_ascii_lowercase();
-        if lowered == "bottom" {
-            Ok(Self::Bottom)
-        } else if lowered == "top" || lowered == "last" || lowered == "all" {
-            Ok(Self::Top)
-        } else if has_pr_prefix(trimmed) {
-            parse_handle(trimmed)
-                .map(GroupSelector::Stable)
-                .map(Self::Group)
-        } else if is_digits_only(trimmed) {
+        if is_digits_only(trimmed) {
             let parsed = trimmed.parse::<usize>().map_err(|_| {
                 format!(
                     "`{trimmed}` must be 0, a local PR number, `bottom`, `top`, `last`, `all`, a label, or `pr:<label>`"
@@ -193,6 +179,10 @@ impl FromStr for AfterSelector {
             } else {
                 Ok(Self::Group(GroupSelector::LocalPr(parsed)))
             }
+        } else if lowered == "bottom" {
+            Ok(Self::Bottom)
+        } else if lowered == "top" || lowered == "last" || lowered == "all" {
+            Ok(Self::Top)
         } else {
             parse_handle(trimmed)
                 .map(GroupSelector::Stable)
