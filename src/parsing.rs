@@ -31,10 +31,7 @@ pub struct Group {
 impl Group {
     pub fn pr_title(&self) -> Result<String> {
         if let Some(s) = self.subjects.first() {
-            let t = crate::pr_labels::valid_marker_regex()
-                .replace_all(s, "")
-                .trim()
-                .to_string();
+            let t = crate::pr_labels::strip_valid_markers(s).trim().to_string();
             if !t.is_empty() {
                 return Ok(t);
             }
@@ -44,8 +41,7 @@ impl Group {
     pub fn squash_commit_message(&self) -> Result<String> {
         if let Some(full) = &self.first_message {
             // Validate the first commit contains the expected pr:<tag> marker
-            if let Some(cap) = crate::pr_labels::valid_marker_regex().captures(full) {
-                let found = cap.get(1).unwrap().as_str();
+            if let Some(found) = crate::pr_labels::first_valid_marker_label(full) {
                 if !found.eq_ignore_ascii_case(&self.tag) {
                     bail!(
                         "First commit tag mismatch for group `{}`: expected `pr:{}`, found `pr:{}`",
@@ -74,9 +70,7 @@ impl Group {
         } else {
             String::new()
         };
-        let cleaned = crate::pr_labels::valid_marker_regex()
-            .replace_all(&base_body, "")
-            .to_string()
+        let cleaned = crate::pr_labels::strip_valid_markers(&base_body)
             .trim()
             .to_string();
         let sep = if cleaned.is_empty() { "" } else { "\n\n" };
@@ -96,9 +90,7 @@ impl Group {
         } else {
             String::new()
         };
-        Ok(crate::pr_labels::valid_marker_regex()
-            .replace_all(&base_body, "")
-            .to_string()
+        Ok(crate::pr_labels::strip_valid_markers(&base_body)
             .trim()
             .to_string())
     }
@@ -198,10 +190,7 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
         let message = parts.next().unwrap_or_default().to_string();
         let subj = message.lines().next().unwrap_or_default().to_string();
 
-        let tags: Vec<String> = crate::pr_labels::candidate_marker_regex()
-            .captures_iter(&message)
-            .map(|cap| cap.get(1).unwrap().as_str().to_string())
-            .collect();
+        let tags = crate::pr_labels::candidate_marker_labels(&message);
         if tags.len() > 1 {
             bail!("Multiple pr:<tag> markers found in commit {sha}");
         }
@@ -533,6 +522,59 @@ mod tests {
         let message = format!("{err:#}");
         assert!(
             message.contains("Commit a1 has invalid PR tag `pr:1alpha`"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("must start with an ASCII letter"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_groups_accepts_labels_with_trailing_dash_and_dot() {
+        let raw = make_log(&[
+            ("a1", "feat: alpha start pr:alpha-"),
+            ("b1", "feat: beta start pr:beta."),
+        ]);
+
+        let groups = parse_groups(&raw, "ignore").unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].tag, "alpha-");
+        assert_eq!(groups[0].pr_title().unwrap(), "feat: alpha start");
+        assert_eq!(
+            groups[0].squash_commit_message().unwrap(),
+            "feat: alpha start pr:alpha-"
+        );
+        assert_eq!(groups[1].tag, "beta.");
+        assert_eq!(groups[1].pr_title().unwrap(), "feat: beta start");
+    }
+
+    #[test]
+    fn parse_groups_rejects_invalid_trailing_characters() {
+        let raw = make_log(&[("a1", "feat: invalid punctuation pr:alpha!oops")]);
+
+        let err = parse_groups(&raw, "ignore").unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Commit a1 has invalid PR tag `pr:alpha!oops`"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(
+                "must use only ASCII letters, digits, `.`, `_`, or `-` after the first letter"
+            ),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_groups_rejects_missing_label_after_marker() {
+        let raw = make_log(&[("a1", "feat: missing label pr:")]);
+
+        let err = parse_groups(&raw, "ignore").unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Commit a1 has invalid PR tag `pr:`"),
             "unexpected error: {message}"
         );
         assert!(

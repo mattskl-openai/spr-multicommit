@@ -1,3 +1,4 @@
+pub mod absorb;
 pub mod cleanup;
 pub mod common;
 pub mod fix_pr;
@@ -9,6 +10,7 @@ pub mod relink_prs;
 pub mod restack;
 pub mod update;
 
+pub use absorb::{absorb_branch_tails, AbsorbOptions, CopiedLaterStackCommitPolicy};
 pub use cleanup::cleanup_remote_branches;
 pub use fix_pr::fix_pr_tail;
 pub use land::{land_flatten_until, land_per_pr_until};
