@@ -18,7 +18,13 @@ fn resolve_update_pr_limit(
     n: Option<usize>,
     legacy_n: Option<usize>,
 ) -> Result<crate::limit::Limit> {
-    if let Some(to) = to {
+    let provided_limit_count =
+        usize::from(to.is_some()) + usize::from(n.is_some()) + usize::from(legacy_n.is_some());
+    if provided_limit_count > 1 {
+        Err(anyhow::anyhow!(
+            "`spr update pr` accepts only one limit selector: `--to <N|label|pr:<label>>`, `--n <N>`, or the positional `N`."
+        ))
+    } else if let Some(to) = to {
         let count = crate::selectors::resolve_group_ordinal(groups, &to)?;
         Ok(crate::limit::Limit::ByPr(count))
     } else if let Some(n) = n {
@@ -287,4 +293,43 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_update_pr_limit;
+    use crate::parsing::Group;
+    use crate::selectors::{GroupSelector, StableHandle};
+
+    fn group(tag: &str) -> Group {
+        Group {
+            tag: tag.to_string(),
+            subjects: vec![format!("feat: {tag}")],
+            commits: vec![format!("{tag}1")],
+            first_message: Some(format!("feat: {tag} pr:{tag}")),
+            ignored_after: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_update_pr_limit_rejects_conflicting_selectors() {
+        let groups = vec![group("alpha")];
+        let result = resolve_update_pr_limit(
+            &groups,
+            Some(GroupSelector::Stable(StableHandle {
+                tag: "alpha".to_string(),
+            })),
+            Some(1),
+            None,
+        );
+        let err = match result {
+            Ok(_) => panic!("expected conflicting selector inputs to fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("accepts only one limit selector"),
+            "unexpected error: {err}"
+        );
+    }
 }
