@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
 use crate::commands::common::{self, CherryPickEmptyPolicy, CherryPickOp};
+use crate::config::DirtyWorktreePolicy;
 use crate::git::{
     git_commit_message, git_commit_parent_count, git_commit_tree, git_is_ancestor,
     git_local_branch_tip, git_merge_base, git_patch_ids_for_commits, git_rev_list_range,
@@ -42,6 +43,7 @@ pub fn absorb_branch_tails(
     prefix: &str,
     ignore_tag: &str,
     dry: bool,
+    dirty_worktree_policy: DirtyWorktreePolicy,
     options: AbsorbOptions,
 ) -> Result<()> {
     let (_stack_head, plan) = build_plan_for_current_stack(base, prefix, ignore_tag, options)?;
@@ -62,7 +64,9 @@ pub fn absorb_branch_tails(
             info!("No absorbable branch tails found; nothing to rewrite.");
             Ok(())
         }
-        AbsorbPlanValidation::ReadyToRewrite => execute_absorb_plan(&plan, dry),
+        AbsorbPlanValidation::ReadyToRewrite => {
+            execute_absorb_plan(&plan, dry, dirty_worktree_policy)
+        }
     }
 }
 
@@ -937,40 +941,46 @@ fn cleanup_temp_worktree_best_effort(dry: bool, tmp_path: &str, tmp_branch: &str
 
 /// Executes a validated absorb rewrite plan by rebuilding the current stack in
 /// a temporary worktree and resetting the checked-out branch to the new tip.
-fn execute_absorb_plan(plan: &RewritePlan, dry: bool) -> Result<()> {
+fn execute_absorb_plan(
+    plan: &RewritePlan,
+    dry: bool,
+    dirty_worktree_policy: DirtyWorktreePolicy,
+) -> Result<()> {
     emit_rewrite_plan(plan);
-    if dry {
-        info!("Dry run complete. No local git state or GitHub state was changed.");
-        info!("Run `spr absorb` without `--dry-run` to apply the rewrite.");
-        info!("After inspecting the rewritten stack, run `spr update`.");
-        Ok(())
-    } else {
-        let (cur_branch, short) = common::get_current_branch_and_short()?;
-        let _backup_tag = common::create_backup_tag(dry, "absorb", &cur_branch, &short)?;
-        let (tmp_path, tmp_branch) =
-            common::create_temp_worktree(dry, "absorb", &plan.merge_base, &short)?;
-        for op in &plan.operations {
-            if let Err(err) = op.run(dry, &tmp_path) {
-                return Err(err).with_context(|| {
-                    format!(
-                        "absorb rewrite failed in temp worktree {} on branch {}",
-                        tmp_path, tmp_branch
-                    )
-                });
+    common::with_dirty_worktree_policy(dry, "spr absorb", dirty_worktree_policy, || {
+        if dry {
+            info!("Dry run complete. No local git state or GitHub state was changed.");
+            info!("Run `spr absorb` without `--dry-run` to apply the rewrite.");
+            info!("After inspecting the rewritten stack, run `spr update`.");
+            Ok(())
+        } else {
+            let (cur_branch, short) = common::get_current_branch_and_short()?;
+            let _backup_tag = common::create_backup_tag(dry, "absorb", &cur_branch, &short)?;
+            let (tmp_path, tmp_branch) =
+                common::create_temp_worktree(dry, "absorb", &plan.merge_base, &short)?;
+            for op in &plan.operations {
+                if let Err(err) = op.run(dry, &tmp_path) {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "absorb rewrite failed in temp worktree {} on branch {}",
+                            tmp_path, tmp_branch
+                        )
+                    });
+                }
             }
+            let new_tip = common::tip_of_tmp(&tmp_path)?;
+            info!(
+                "Updating current branch {} to new tip {} (absorbed branch tails)...",
+                cur_branch, new_tip
+            );
+            common::reset_current_branch_to(dry, &new_tip)?;
+            cleanup_temp_worktree_best_effort(dry, &tmp_path, &tmp_branch);
+            info!(
+                "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
+            );
+            Ok(())
         }
-        let new_tip = common::tip_of_tmp(&tmp_path)?;
-        info!(
-            "Updating current branch {} to new tip {} (absorbed branch tails)...",
-            cur_branch, new_tip
-        );
-        common::reset_current_branch_to(dry, &new_tip)?;
-        cleanup_temp_worktree_best_effort(dry, &tmp_path, &tmp_branch);
-        info!(
-            "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
-        );
-        Ok(())
-    }
+    })
 }
 
 fn emit_absorb_summary(plan: &RewritePlan) {
@@ -1050,37 +1060,13 @@ mod tests {
     };
     use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp};
     use crate::parsing::{derive_local_groups_with_ignored, Group};
+    use crate::test_support::{lock_cwd, DirGuard};
     use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard};
     use tempfile::TempDir;
-
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_cwd() -> MutexGuard<'static, ()> {
-        CWD_LOCK.lock().unwrap_or_else(|err| err.into_inner())
-    }
-
-    struct DirGuard {
-        original: PathBuf,
-    }
-
-    impl DirGuard {
-        fn change_to(path: &Path) -> Self {
-            let original = env::current_dir().expect("current dir available");
-            env::set_current_dir(path).expect("set current dir to temp repo");
-            Self { original }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            env::set_current_dir(&self.original).expect("restore original current dir");
-        }
-    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -1902,6 +1888,7 @@ mod tests {
                 &repo.prefix,
                 &repo.ignore_tag,
                 false,
+                crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
         };
@@ -1971,6 +1958,7 @@ mod tests {
                 &repo.prefix,
                 &repo.ignore_tag,
                 false,
+                crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
         };
@@ -2010,6 +1998,7 @@ mod tests {
                 &repo.prefix,
                 &repo.ignore_tag,
                 false,
+                crate::config::DirtyWorktreePolicy::Discard,
                 absorb_override_options(),
             )
             .unwrap();
@@ -2105,6 +2094,7 @@ mod tests {
                 &repo.prefix,
                 &repo.ignore_tag,
                 false,
+                crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
             .unwrap();
@@ -2206,6 +2196,7 @@ mod tests {
                 &repo.prefix,
                 &repo.ignore_tag,
                 false,
+                crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
             .expect("cleanup failure after reset should not fail absorb");
@@ -2242,6 +2233,7 @@ mod tests {
                 &repo.prefix,
                 &repo.ignore_tag,
                 false,
+                crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
             .unwrap();
@@ -2276,6 +2268,7 @@ mod tests {
                 &repo.prefix,
                 &repo.ignore_tag,
                 true,
+                crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
             .unwrap();

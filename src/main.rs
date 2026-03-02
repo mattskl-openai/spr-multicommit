@@ -11,6 +11,8 @@ mod limit;
 mod parsing;
 mod pr_labels;
 mod selectors;
+#[cfg(test)]
+mod test_support;
 
 fn resolve_update_pr_limit(
     groups: &[crate::parsing::Group],
@@ -140,6 +142,7 @@ fn main() -> Result<()> {
         resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone())?;
     let pr_description_mode = cfg.pr_description_mode;
     let restack_conflict_policy = cfg.restack_conflict;
+    let dirty_worktree_policy = cfg.dirty_worktree;
     let list_order = cfg.list_order;
     let branch_reuse_guard_days = cfg.branch_reuse_guard_days;
     match cli.cmd {
@@ -206,6 +209,7 @@ fn main() -> Result<()> {
                 safe,
                 cli.dry_run,
                 restack_conflict_policy,
+                dirty_worktree_policy,
             )?;
         }
         crate::cli::Cmd::Absorb {
@@ -224,6 +228,7 @@ fn main() -> Result<()> {
                 &prefix,
                 &ignore_tag,
                 cli.dry_run,
+                dirty_worktree_policy,
                 options,
             )?;
         }
@@ -305,6 +310,7 @@ fn main() -> Result<()> {
                     false,
                     cli.dry_run,
                     restack_conflict_policy,
+                    dirty_worktree_policy,
                 )?;
             }
         }
@@ -318,7 +324,15 @@ fn main() -> Result<()> {
         }
         crate::cli::Cmd::FixPr { target, tail, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            crate::commands::fix_pr_tail(&base, &ignore_tag, &target, tail, safe, cli.dry_run)?;
+            crate::commands::fix_pr_tail(
+                &base,
+                &ignore_tag,
+                &target,
+                tail,
+                safe,
+                cli.dry_run,
+                dirty_worktree_policy,
+            )?;
         }
         crate::cli::Cmd::Move { range, after, safe } => {
             set_dry_run_env(cli.dry_run, false);
@@ -328,8 +342,11 @@ fn main() -> Result<()> {
                 &ignore_tag,
                 &range,
                 &after,
-                safe,
-                cli.dry_run,
+                crate::commands::MoveExecutionOptions {
+                    safe,
+                    dry: cli.dry_run,
+                    dirty_worktree_policy,
+                },
             )?;
         }
     }
