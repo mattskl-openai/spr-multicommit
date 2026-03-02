@@ -16,6 +16,29 @@ fn resolve_land_take_count(
     resolve_inclusive_count(groups, until)
 }
 
+fn resolve_landed_pr_segment<'a>(
+    groups: &[crate::parsing::Group],
+    prefix: &str,
+    prs: &'a [crate::github::PrInfo],
+    until: &InclusiveSelector,
+) -> Result<(usize, Vec<&'a crate::github::PrInfo>)> {
+    let take_n = resolve_land_take_count(groups, until)?;
+    let mut segment: Vec<&crate::github::PrInfo> = Vec::with_capacity(take_n);
+    for g in &groups[..take_n] {
+        let head_branch = format!("{}{}", prefix, g.tag);
+        if let Some(pr) = prs.iter().find(|p| p.head == head_branch) {
+            segment.push(pr);
+        } else {
+            bail!(
+                "No open PR found for local group '{}' (branch '{}')",
+                g.tag,
+                head_branch
+            );
+        }
+    }
+    Ok((take_n, segment))
+}
+
 pub fn land_until(
     base: &str,
     prefix: &str,
@@ -30,7 +53,8 @@ pub fn land_until(
     if groups.is_empty() {
         bail!("No local groups found; nothing to land.");
     }
-    let heads: Vec<String> = groups
+    let take_n = resolve_land_take_count(&groups, until)?;
+    let heads: Vec<String> = groups[..take_n]
         .iter()
         .map(|g| format!("{}{}", prefix, g.tag))
         .collect();
@@ -38,21 +62,8 @@ pub fn land_until(
     if prs.is_empty() {
         bail!("No open PRs with head starting with `{prefix}`.");
     }
-    let mut ordered: Vec<&crate::github::PrInfo> = vec![];
-    for g in &groups {
-        let head_branch = format!("{}{}", prefix, g.tag);
-        if let Some(pr) = prs.iter().find(|p| p.head == head_branch) {
-            ordered.push(pr);
-        } else {
-            bail!(
-                "No open PR found for local group '{}' (branch '{}')",
-                g.tag,
-                head_branch
-            );
-        }
-    }
-    let take_n = resolve_land_take_count(&groups, until)?;
-    let segment = &ordered[..take_n];
+    let (_, ordered) = resolve_landed_pr_segment(&groups, prefix, &prs, until)?;
+    let segment = ordered.as_slice();
 
     // Safety validation: CI and Reviews must be passing/approved for all PRs being landed
     let numbers: Vec<u64> = segment.iter().map(|p| p.number).collect();
@@ -260,7 +271,8 @@ pub fn land_flatten_until(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_land_take_count;
+    use super::{resolve_land_take_count, resolve_landed_pr_segment};
+    use crate::github::PrInfo;
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
 
@@ -276,6 +288,14 @@ mod tests {
             .collect()
     }
 
+    fn pr(number: u64, head: &str) -> PrInfo {
+        PrInfo {
+            number,
+            head: head.to_string(),
+            base: "main".to_string(),
+        }
+    }
+
     #[test]
     fn land_until_resolves_stable_handle_as_inclusive_prefix() {
         let groups = groups(&["alpha", "beta", "gamma"]);
@@ -284,5 +304,34 @@ mod tests {
         }));
 
         assert_eq!(resolve_land_take_count(&groups, &until).unwrap(), 2);
+    }
+
+    #[test]
+    fn land_until_only_requires_open_prs_for_landed_prefix() {
+        let groups = groups(&["rho", "sigma"]);
+        let prs = vec![pr(14, "skilltest/rho")];
+        let until = InclusiveSelector::Group(GroupSelector::LocalPr(1));
+
+        let (take_n, ordered) =
+            resolve_landed_pr_segment(&groups, "skilltest/", &prs, &until).unwrap();
+
+        assert_eq!(take_n, 1);
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].number, 14);
+        assert_eq!(ordered[0].head, "skilltest/rho");
+    }
+
+    #[test]
+    fn land_until_still_requires_prs_for_every_group_being_landed() {
+        let groups = groups(&["rho", "sigma"]);
+        let prs = vec![pr(14, "skilltest/rho")];
+        let until = InclusiveSelector::Group(GroupSelector::LocalPr(2));
+
+        let err = resolve_landed_pr_segment(&groups, "skilltest/", &prs, &until).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "No open PR found for local group 'sigma' (branch 'skilltest/sigma')"
+        );
     }
 }
