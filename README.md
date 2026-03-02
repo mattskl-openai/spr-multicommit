@@ -103,6 +103,15 @@ list_order: recent_on_bottom
 # How `spr restack` behaves on cherry-pick conflicts: "rollback" (default) or "halt"
 restack_conflict: rollback
 
+# How branch-rewriting commands handle local changes in the checked-out worktree
+# This applies to `spr restack`, `spr move`, `spr fix-pr`, and `spr absorb`.
+# - `discard` preserves the historical behavior: tracked changes may be lost,
+#   while untracked files remain in place
+# - `stash` stashes tracked, staged, and untracked changes and reapplies them
+#   with `git stash apply --index`
+# - `halt` (default) refuses to rewrite until the worktree is clean
+dirty_worktree: halt
+
 # Blocks PR recreation when the same head branch had a recently merged
 # or closed PR within the configured window. Set to 0 to disable the guard.
 branch_reuse_guard_days: 180
@@ -112,7 +121,7 @@ Precedence for defaults:
 
 - CLI flag > repo YAML > home YAML > git discovery (`origin/HEAD`)
 - Base has no built-in fallback; if discovery fails, set `base` explicitly
-- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `list_order = recent_on_bottom`, `restack_conflict = rollback`
+- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `list_order = recent_on_bottom`, `restack_conflict = rollback`, `dirty_worktree = halt`
 
 Global flags
 ------------
@@ -182,6 +191,7 @@ Behavior:
 - Updates the current branch to the rebuilt tip
 - With `--safe`, a backup tag named like `backup/restack/<current-branch>-<short-sha>` is created first
 - Conflict handling is controlled by `restack_conflict` in config.
+- Before rewriting the checked-out branch, `spr restack` follows the `dirty_worktree` config.
 - `rollback` (default) aborts the restack and attempts to clean up the temp restack worktree and branch (cleanup failures may require manual cleanup).
 - `halt` stops on conflict, leaves the temp restack worktree and branch in place, and prints manual rollback/continue instructions.
 - When using `halt`, resolve conflicts inside the printed temp worktree path; resolving in your original worktree will not advance the halted cherry-pick.
@@ -201,6 +211,7 @@ Behavior:
 - Rebuilds the current stack from its existing `merge-base(base, HEAD)` rather than restacking onto the latest base tip
 - Inserts absorbed commits after the group's real commits and before that group's trailing ignored block
 - Creates a local backup tag before rewriting the stack
+- Before rewriting the checked-out branch, `spr absorb` follows the `dirty_worktree` config.
 - Does not update GitHub; inspect the rewritten stack first, then run `spr update`
 
 Typical workflow:
@@ -279,6 +290,7 @@ Aliases:
   - `--after top` is the same as `--after N`
 - `--safe`: create a local backup tag at current `HEAD` before rewriting
 - Ignore blocks (`pr:ignore`) stay attached to the preceding PR group and move with it
+- Before rewriting the checked-out branch, `spr move` follows the `dirty_worktree` config.
 
 Prints an explicit plan, e.g.: `2..3→4: [1,2,3,4,5,6] → [1,4,2,3,5,6]`.
 
@@ -360,6 +372,7 @@ Behavior:
 - Rewrites local history to move the tail M commits after PR N’s tail commit
 - `--safe`: create a local backup tag at current `HEAD` before executing
 - Ignore blocks (`pr:ignore`) are preserved and cannot be moved; the command aborts if the tail intersects an ignore block
+- Before rewriting the checked-out branch, `spr fix-pr` follows the `dirty_worktree` config.
 
 ### spr cleanup
 
