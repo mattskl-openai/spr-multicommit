@@ -78,6 +78,10 @@ list_order: recent_on_bottom
 
 # How `spr restack` behaves on cherry-pick conflicts: "rollback" (default) or "halt"
 restack_conflict: rollback
+
+# Blocks PR recreation when the same head branch had a recently merged
+# or closed PR within the configured window. Set to 0 to disable the guard.
+branch_reuse_guard_days: 180
 ```
 
 Precedence for defaults:
@@ -112,6 +116,7 @@ Key options:
 - `--from <REF>`: commit range upper bound when parsing tags (default `HEAD`) (untested)
 - `--no-pr`: only (re)create branches; skip PR creation/updates (untested)
 - `--pr-description-mode <overwrite|stack_only>`: override `pr_description_mode` for this update run
+- `--allow-branch-reuse`: bypass the recent closed-or-merged branch-name reuse guard
 - Extent (optional subcommand):
   - `pr --n <N>`: limit to first N PRs from the bottom
   - `commits --n <N>`: limit to first N commits (untested)
@@ -120,6 +125,8 @@ Behavior:
 
 - Parses `pr:<tag>` markers from `merge-base(base, from)..from` (commits between `pr:ignore` and the next `pr:<tag>` are ignored)
 - Creates/updates per-PR branches and GitHub PRs
+- Before creating a PR for a branch head without an open PR, checks whether the same branch name
+  had a recently merged or closed PR and halts within `branch_reuse_guard_days`
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
   - When `pr_description_mode` is `stack_only`, only the stack block (between markers) is updated; the rest of the body is preserved
   - May temporarily set existing PR bases to the repo base while pushing, then re-chain them to match the local stack
