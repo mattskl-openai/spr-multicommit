@@ -141,8 +141,8 @@ fn main() -> Result<()> {
                     "`spr update --restack` is deprecated. Use `spr restack --after N` instead."
                 ));
             } else {
-                let (_merge_base, groups) =
-                    crate::parsing::derive_groups_between(&base, &from, &ignore_tag)?;
+                let (_merge_base, leading_ignored, groups) =
+                    crate::parsing::derive_groups_between_with_ignored(&base, &from, &ignore_tag)?;
                 if groups.is_empty() {
                     return Err(anyhow::anyhow!(
                         "No pr:<tag> markers found between {} and {}. Use `spr restack --after N`.",
@@ -165,6 +165,7 @@ fn main() -> Result<()> {
                 crate::commands::build_from_groups(
                     &base,
                     &prefix,
+                    &leading_ignored,
                     no_pr,
                     cli.dry_run,
                     pr_description_mode,

@@ -31,6 +31,10 @@ git commit -m "wip: spike cleanup"
 git commit -m "feat: new API pr:beta" -m "Body explaining the change"
 ```
 
+Ignored blocks are local-only. If an ignored block sits below later `pr:<tag>`
+groups, `spr update` warns and leaves those later groups local-only instead of
+publishing PRs whose GitHub diffs would include the ignored commits.
+
 2. Configure defaults (optional) in `.spr_multicommit_cfg.yml` (see below), then:
 
 ```bash
@@ -139,6 +143,7 @@ Behavior:
 
 - Parses `pr:<tag>` markers from `merge-base(base, from)..from` (commits between `pr:ignore` and the next `pr:<tag>` are ignored)
 - Creates/updates per-PR branches and GitHub PRs
+- Warns and skips any PR groups above an ignored block, because GitHub would include the ignored commits in those higher PRs
 - When a PR is first created, `spr` always seeds it from the bottom commit in that PR group:
   the PR title comes from the first line of that commit message, and the PR description comes
   from the rest of that same commit message, regardless of `pr_description_mode`
