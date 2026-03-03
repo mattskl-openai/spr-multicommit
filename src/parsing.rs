@@ -245,6 +245,38 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
     Ok((leading_ignored, groups))
 }
 
+/// Split parsed groups into the publishable update prefix and the local-only suffix.
+///
+/// Once an ignored block appears, later `pr:<tag>` groups stay local-only because
+/// publishing them would include the ignored commits in GitHub diffs. The returned
+/// handle list is already formatted for user-facing warnings.
+pub fn split_groups_for_update(
+    leading_ignored: &[String],
+    groups: Vec<Group>,
+) -> (Vec<Group>, Vec<String>) {
+    let first_local_only_group_idx = if !leading_ignored.is_empty() {
+        0
+    } else if let Some(group_idx) = groups
+        .iter()
+        .position(|group| !group.ignored_after.is_empty())
+    {
+        group_idx + 1
+    } else {
+        groups.len()
+    };
+
+    let skipped_handles: Vec<String> = groups
+        .iter()
+        .skip(first_local_only_group_idx)
+        .map(|group| format!("pr:{}", group.tag))
+        .collect();
+    let pushable_groups: Vec<Group> = groups
+        .into_iter()
+        .take(first_local_only_group_idx)
+        .collect();
+    (pushable_groups, skipped_handles)
+}
+
 /// Derive PR groups from `merge-base(base, to)..to` in oldest→newest order.
 ///
 /// Returns the computed merge base alongside the parsed groups, using `ignore_tag`
@@ -318,7 +350,7 @@ pub fn derive_local_groups_with_ignored(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_groups, parse_groups_with_ignored};
+    use super::{parse_groups, parse_groups_with_ignored, split_groups_for_update};
 
     fn make_log(entries: &[(&str, &str)]) -> String {
         let mut out = String::new();
@@ -395,6 +427,72 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].tag, "alpha");
         assert!(groups[0].ignored_after.is_empty());
+    }
+
+    #[test]
+    fn split_groups_for_update_keeps_full_stack_without_ignored_boundary() {
+        let raw = make_log(&[
+            ("a1", "feat: alpha start pr:alpha"),
+            ("a2", "feat: alpha follow-up"),
+            ("b1", "feat: beta start pr:beta"),
+        ]);
+        let (leading, groups) =
+            parse_groups_with_ignored(&raw, "ignore").expect("parse_groups_with_ignored ok");
+
+        let (pushable, skipped) = split_groups_for_update(&leading, groups);
+
+        assert!(leading.is_empty());
+        assert_eq!(
+            pushable
+                .iter()
+                .map(|group| group.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn split_groups_for_update_stops_after_ignored_block() {
+        let raw = make_log(&[
+            ("a1", "feat: alpha start pr:alpha"),
+            ("a2", "feat: alpha follow-up"),
+            ("i1", "chore: experiments pr:ignore"),
+            ("i2", "wip: local spike"),
+            ("b1", "feat: beta start pr:beta"),
+            ("g1", "feat: gamma start pr:gamma"),
+        ]);
+        let (leading, groups) =
+            parse_groups_with_ignored(&raw, "ignore").expect("parse_groups_with_ignored ok");
+
+        let (pushable, skipped) = split_groups_for_update(&leading, groups);
+
+        assert!(leading.is_empty());
+        assert_eq!(
+            pushable
+                .iter()
+                .map(|group| group.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+        assert_eq!(skipped, vec!["pr:beta".to_string(), "pr:gamma".to_string()]);
+    }
+
+    #[test]
+    fn split_groups_for_update_skips_all_groups_after_leading_ignored_block() {
+        let raw = make_log(&[
+            ("i1", "chore: experiments pr:ignore"),
+            ("i2", "wip: local spike"),
+            ("a1", "feat: alpha start pr:alpha"),
+            ("b1", "feat: beta start pr:beta"),
+        ]);
+        let (leading, groups) =
+            parse_groups_with_ignored(&raw, "ignore").expect("parse_groups_with_ignored ok");
+
+        let (pushable, skipped) = split_groups_for_update(&leading, groups);
+
+        assert!(pushable.is_empty());
+        assert_eq!(skipped, vec!["pr:alpha".to_string(), "pr:beta".to_string()]);
     }
 
     #[test]

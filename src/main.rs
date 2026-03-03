@@ -141,15 +141,17 @@ fn main() -> Result<()> {
                     "`spr update --restack` is deprecated. Use `spr restack --after N` instead."
                 ));
             } else {
-                let (_merge_base, leading_ignored, groups) =
+                let (_merge_base, leading_ignored, all_groups) =
                     crate::parsing::derive_groups_between_with_ignored(&base, &from, &ignore_tag)?;
-                if groups.is_empty() {
+                if all_groups.is_empty() {
                     return Err(anyhow::anyhow!(
                         "No pr:<tag> markers found between {} and {}. Use `spr restack --after N`.",
                         base,
                         from
                     ));
                 }
+                let (groups, skipped_handles) =
+                    crate::parsing::split_groups_for_update(&leading_ignored, all_groups);
                 let limit = if let Some(extent) = extent {
                     match extent {
                         crate::cli::Extent::Pr { to, n, legacy_n } => {
@@ -165,7 +167,7 @@ fn main() -> Result<()> {
                 crate::commands::build_from_groups(
                     &base,
                     &prefix,
-                    &leading_ignored,
+                    &skipped_handles,
                     no_pr,
                     cli.dry_run,
                     pr_description_mode,
@@ -330,6 +332,29 @@ mod tests {
 
         assert!(
             err.to_string().contains("accepts only one limit selector"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_update_pr_limit_rejects_local_only_group_selector() {
+        let groups = vec![group("alpha")];
+        let result = resolve_update_pr_limit(
+            &groups,
+            Some(GroupSelector::Stable(StableHandle {
+                tag: "beta".to_string(),
+            })),
+            None,
+            None,
+        );
+        let err = match result {
+            Ok(_) => panic!("expected local-only selector to fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("No outstanding PR group matches stable handle `pr:beta`"),
             "unexpected error: {err}"
         );
     }

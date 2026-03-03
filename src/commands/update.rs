@@ -13,7 +13,7 @@ use crate::github::{
     list_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
 };
 use crate::limit::{apply_limit_groups, Limit};
-use crate::parsing::{derive_groups_between_with_ignored, Group};
+use crate::parsing::{derive_groups_between_with_ignored, split_groups_for_update, Group};
 
 /// Replace the existing spr stack block with `new_block`, or append it if missing.
 ///
@@ -282,40 +282,6 @@ fn run_update_mutations(
     Ok(())
 }
 
-fn first_blocked_group_idx_after_ignored(
-    leading_ignored: &[String],
-    groups: &[Group],
-) -> Option<usize> {
-    if !leading_ignored.is_empty() {
-        Some(0)
-    } else {
-        groups
-            .iter()
-            .position(|group| !group.ignored_after.is_empty())
-            .map(|group_idx| group_idx + 1)
-    }
-}
-
-fn split_pushable_groups(
-    leading_ignored: &[String],
-    groups: Vec<Group>,
-) -> (Vec<Group>, Vec<String>) {
-    if let Some(first_blocked_group_idx) =
-        first_blocked_group_idx_after_ignored(leading_ignored, &groups)
-    {
-        let skipped_handles: Vec<String> = groups
-            .iter()
-            .skip(first_blocked_group_idx)
-            .map(|group| format!("pr:{}", group.tag))
-            .collect();
-        let pushable_groups: Vec<Group> =
-            groups.into_iter().take(first_blocked_group_idx).collect();
-        (pushable_groups, skipped_handles)
-    } else {
-        (groups, Vec::new())
-    }
-}
-
 fn ignored_boundary_warning(skipped_handles: &[String]) -> String {
     format!(
         "Skipping PR groups above the ignored block. GitHub PRs above an ignored block include the ignored commits, which defeats the point of `pr:ignore`. These groups stay local-only: {}",
@@ -335,7 +301,7 @@ fn ignored_boundary_warning(skipped_handles: &[String]) -> String {
 pub fn build_from_groups(
     base: &str,
     prefix: &str,
-    leading_ignored: &[String],
+    skipped_handles: &[String],
     no_pr: bool,
     dry: bool,
     pr_description_mode: PrDescriptionMode,
@@ -346,16 +312,19 @@ pub fn build_from_groups(
     branch_reuse_guard_days: u32,
 ) -> Result<()> {
     if groups.is_empty() {
-        info!("No groups discovered; nothing to do.");
+        if skipped_handles.is_empty() {
+            info!("No groups discovered; nothing to do.");
+        } else {
+            warn!("{}", ignored_boundary_warning(skipped_handles));
+            info!("No pushable groups remain after applying the ignored-block rule.");
+        }
         return Ok(());
     }
 
     // Apply extent limits
     groups = apply_limit_groups(groups, limit)?;
-    let (pushable_groups, skipped_handles) = split_pushable_groups(leading_ignored, groups);
-    groups = pushable_groups;
     if !skipped_handles.is_empty() {
-        warn!("{}", ignored_boundary_warning(&skipped_handles));
+        warn!("{}", ignored_boundary_warning(skipped_handles));
     }
     if groups.is_empty() {
         if skipped_handles.is_empty() {
@@ -790,10 +759,11 @@ pub fn build_from_tags(
 ) -> Result<()> {
     let (_merge_base, leading_ignored, groups): (String, Vec<String>, Vec<Group>) =
         derive_groups_between_with_ignored(base, from, ignore_tag)?;
+    let (groups, skipped_handles) = split_groups_for_update(&leading_ignored, groups);
     build_from_groups(
         base,
         prefix,
-        &leading_ignored,
+        &skipped_handles,
         no_pr,
         dry,
         pr_description_mode,
@@ -809,69 +779,13 @@ pub fn build_from_tags(
 mod tests {
     use super::{
         branch_reuse_guard_window, ignored_boundary_warning, parse_github_timestamp_rfc3339,
-        recent_pr_age, recent_pr_age_blocks_recreation, split_pushable_groups, terminal_pr_action,
+        recent_pr_age, recent_pr_age_blocks_recreation, terminal_pr_action,
     };
-    use crate::{github::TerminalPrState, parsing::Group};
+    use crate::github::TerminalPrState;
     use time::{Duration as TimeDuration, OffsetDateTime};
 
     fn fixed_now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
-    }
-
-    fn group(tag: &str, ignored_after: &[&str]) -> Group {
-        Group {
-            tag: tag.to_string(),
-            subjects: vec![format!("feat: {tag}")],
-            commits: vec![format!("{tag}1")],
-            first_message: Some(format!("feat: {tag} pr:{tag}")),
-            ignored_after: ignored_after.iter().map(|sha| (*sha).to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn split_pushable_groups_keeps_full_stack_without_ignored_boundary() {
-        let groups = vec![group("alpha", &[]), group("beta", &[]), group("gamma", &[])];
-
-        let (pushable, skipped) = split_pushable_groups(&[], groups);
-
-        assert_eq!(
-            pushable
-                .iter()
-                .map(|group| group.tag.as_str())
-                .collect::<Vec<_>>(),
-            vec!["alpha", "beta", "gamma"]
-        );
-        assert!(skipped.is_empty());
-    }
-
-    #[test]
-    fn split_pushable_groups_skips_groups_above_ignored_block() {
-        let groups = vec![
-            group("alpha", &["i1", "i2"]),
-            group("beta", &[]),
-            group("gamma", &[]),
-        ];
-
-        let (pushable, skipped) = split_pushable_groups(&[], groups);
-
-        assert_eq!(
-            pushable
-                .iter()
-                .map(|group| group.tag.as_str())
-                .collect::<Vec<_>>(),
-            vec!["alpha"]
-        );
-        assert_eq!(skipped, vec!["pr:beta".to_string(), "pr:gamma".to_string()]);
-    }
-
-    #[test]
-    fn split_pushable_groups_skips_all_groups_after_leading_ignored_block() {
-        let groups = vec![group("alpha", &[]), group("beta", &[])];
-
-        let (pushable, skipped) = split_pushable_groups(&["i1".to_string()], groups);
-
-        assert!(pushable.is_empty());
-        assert_eq!(skipped, vec!["pr:alpha".to_string(), "pr:beta".to_string()]);
     }
 
     #[test]
