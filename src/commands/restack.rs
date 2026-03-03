@@ -19,6 +19,7 @@ use crate::commands::common;
 use crate::config::RestackConflictPolicy;
 use crate::git::git_rw;
 use crate::parsing::{derive_local_groups_with_ignored, Group};
+use crate::selectors::{resolve_after_count, AfterSelector};
 
 /// A single planned cherry-pick step used to rebuild the restacked history.
 ///
@@ -193,6 +194,95 @@ fn emit_halt_instructions(
     info!("  spr update");
 }
 
+fn resolve_restack_after_count(groups: &[Group], after: &AfterSelector) -> Result<usize> {
+    resolve_after_count(groups, after)
+}
+
+fn restack_after_resolved(
+    base: &str,
+    leading_ignored: Vec<String>,
+    groups: Vec<Group>,
+    after: usize,
+    safe: bool,
+    dry: bool,
+    conflict_policy: RestackConflictPolicy,
+) -> Result<()> {
+    let (cur_branch, short) = common::get_current_branch_and_short()?;
+    let after = std::cmp::min(after, groups.len());
+    let kept_ignored: Vec<String> = leading_ignored
+        .into_iter()
+        .chain(
+            groups
+                .iter()
+                .take(after)
+                .flat_map(|group| group.ignored_after.iter().cloned()),
+        )
+        .collect();
+    let remaining = &groups[after..];
+    if remaining.is_empty() && kept_ignored.is_empty() {
+        if safe {
+            let _ = common::create_backup_tag(dry, "restack", &cur_branch, &short)?;
+        }
+        info!(
+            "Skipping all {} PR(s); syncing current branch {} to {}",
+            groups.len(),
+            cur_branch,
+            base
+        );
+        common::reset_current_branch_to(dry, base)?;
+        Ok(())
+    } else {
+        let backup_tag = if safe {
+            Some(common::create_backup_tag(
+                dry,
+                "restack",
+                &cur_branch,
+                &short,
+            )?)
+        } else {
+            None
+        };
+
+        let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "restack", base, &short)?;
+        let ops = build_cherry_pick_plan(&kept_ignored, remaining);
+        for (idx, op) in ops.iter().enumerate() {
+            if let Err(err) = op.run(dry, &tmp_path) {
+                let conflict = cherry_pick_head_exists(&tmp_path);
+                if conflict && conflict_policy == RestackConflictPolicy::Halt {
+                    emit_halt_instructions(
+                        &cur_branch,
+                        backup_tag.as_deref(),
+                        base,
+                        &tmp_path,
+                        &tmp_branch,
+                        idx,
+                        &ops,
+                    );
+                    return Err(anyhow!(
+                        "restack halted due to conflict; resolve in temp worktree and continue manually"
+                    ));
+                }
+
+                if conflict {
+                    abort_cherry_pick_best_effort(dry, &tmp_path);
+                }
+                cleanup_temp_worktree_best_effort(dry, &tmp_path, &tmp_branch);
+                return Err(err).context("restack failed; temp restack state was cleaned up");
+            }
+        }
+
+        let new_tip = common::tip_of_tmp(&tmp_path)?;
+        info!(
+            "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
+            after, cur_branch, base
+        );
+        common::reset_current_branch_to(dry, &new_tip)?;
+        cleanup_temp_worktree_best_effort(dry, &tmp_path, &tmp_branch);
+
+        Ok(())
+    }
+}
+
 /// Restack the local stack by rebasing commits after the first `after` PRs onto `base`.
 ///
 /// This preserves ignored commits (`pr:ignore` blocks) by carrying them into the
@@ -215,90 +305,85 @@ fn emit_halt_instructions(
 pub fn restack_after(
     base: &str,
     ignore_tag: &str,
-    after: usize,
+    after: &AfterSelector,
     safe: bool,
     dry: bool,
     conflict_policy: RestackConflictPolicy,
 ) -> Result<()> {
-    // Ensure we operate against the latest remote state
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
     let (_merge_base, leading_ignored, groups) =
         derive_local_groups_with_ignored(base, ignore_tag)?;
     if groups.is_empty() {
         info!("No local PR groups found; nothing to restack.");
-        return Ok(());
-    }
-    let (cur_branch, short) = common::get_current_branch_and_short()?;
-    // Clamp 'after' to the number of groups; if equal, there is nothing to move
-    let after = std::cmp::min(after, groups.len());
-    let mut kept_ignored: Vec<String> = leading_ignored;
-    for g in groups.iter().take(after) {
-        kept_ignored.extend(g.ignored_after.iter().cloned());
-    }
-    let remaining = &groups[after..];
-    if remaining.is_empty() && kept_ignored.is_empty() {
-        // Nothing to move; sync current branch to base
-        if safe {
-            let _ = common::create_backup_tag(dry, "restack", &cur_branch, &short)?;
-        }
-        info!(
-            "Skipping all {} PR(s); syncing current branch {} to {}",
-            groups.len(),
-            cur_branch,
-            base
-        );
-        common::reset_current_branch_to(dry, base)?;
-        return Ok(());
-    }
-
-    // Create a local backup tag pointing to current HEAD before rewriting
-    let backup_tag = if safe {
-        Some(common::create_backup_tag(
-            dry,
-            "restack",
-            &cur_branch,
-            &short,
-        )?)
+        Ok(())
     } else {
-        None
-    };
+        let after = resolve_restack_after_count(&groups, after)?;
+        restack_after_resolved(
+            base,
+            leading_ignored,
+            groups,
+            after,
+            safe,
+            dry,
+            conflict_policy,
+        )
+    }
+}
 
-    let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "restack", base, &short)?;
-    let ops = build_cherry_pick_plan(&kept_ignored, remaining);
-    for (idx, op) in ops.iter().enumerate() {
-        if let Err(err) = op.run(dry, &tmp_path) {
-            let conflict = cherry_pick_head_exists(&tmp_path);
-            if conflict && conflict_policy == RestackConflictPolicy::Halt {
-                emit_halt_instructions(
-                    &cur_branch,
-                    backup_tag.as_deref(),
-                    base,
-                    &tmp_path,
-                    &tmp_branch,
-                    idx,
-                    &ops,
-                );
-                return Err(anyhow!(
-                    "restack halted due to conflict; resolve in temp worktree and continue manually"
-                ));
-            }
+/// Restack the local stack by keeping the first `after` groups in place.
+pub fn restack_after_count(
+    base: &str,
+    ignore_tag: &str,
+    after: usize,
+    safe: bool,
+    dry: bool,
+    conflict_policy: RestackConflictPolicy,
+) -> Result<()> {
+    git_rw(dry, ["fetch", "origin"].as_slice())?;
 
-            if conflict {
-                abort_cherry_pick_best_effort(dry, &tmp_path);
-            }
-            cleanup_temp_worktree_best_effort(dry, &tmp_path, &tmp_branch);
-            return Err(err).context("restack failed; temp restack state was cleaned up");
-        }
+    let (_merge_base, leading_ignored, groups) =
+        derive_local_groups_with_ignored(base, ignore_tag)?;
+    if groups.is_empty() {
+        Ok(())
+    } else {
+        restack_after_resolved(
+            base,
+            leading_ignored,
+            groups,
+            after,
+            safe,
+            dry,
+            conflict_policy,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_restack_after_count;
+    use crate::parsing::Group;
+    use crate::selectors::{AfterSelector, GroupSelector, StableHandle};
+
+    fn groups(tags: &[&str]) -> Vec<Group> {
+        tags.iter()
+            .map(|tag| Group {
+                tag: tag.to_string(),
+                subjects: vec![format!("feat: {tag}")],
+                commits: vec![format!("{tag}1")],
+                first_message: Some(format!("feat: {tag} pr:{tag}")),
+                ignored_after: Vec::new(),
+            })
+            .collect()
     }
 
-    let new_tip = common::tip_of_tmp(&tmp_path)?;
-    info!(
-        "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
-        after, cur_branch, base
-    );
-    common::reset_current_branch_to(dry, &new_tip)?;
-    cleanup_temp_worktree_best_effort(dry, &tmp_path, &tmp_branch);
+    #[test]
+    fn restack_after_stable_handle_keeps_that_group_and_lower_groups() {
+        let groups = groups(&["alpha", "beta", "gamma"]);
+        let after = AfterSelector::Group(GroupSelector::Stable(StableHandle {
+            tag: "beta".to_string(),
+        }));
 
-    Ok(())
+        assert_eq!(resolve_restack_after_count(&groups, &after).unwrap(), 2);
+    }
 }

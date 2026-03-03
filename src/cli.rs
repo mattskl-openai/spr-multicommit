@@ -1,17 +1,27 @@
 use clap::{Parser, Subcommand};
 
-#[derive(Subcommand, Debug, Clone, Copy)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum Extent {
     /// Update the first N PRs (bottom-up)
-    Pr { n: usize },
+    Pr {
+        /// Limit updates through this local PR number or stable handle
+        #[arg(long, value_name = "N|label|pr:<label>", conflicts_with_all = ["n", "legacy_n"])]
+        to: Option<crate::selectors::GroupSelector>,
+        /// Legacy numeric-only limit
+        #[arg(long, value_name = "N", conflicts_with_all = ["to", "legacy_n"])]
+        n: Option<usize>,
+        /// Backward-compatible positional numeric limit
+        #[arg(value_name = "N", hide = true, conflicts_with_all = ["to", "n"])]
+        legacy_n: Option<usize>,
+    },
     /// Update only the first N commits from base..from (push partial groups if needed)
     Commits { n: usize },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum PrepSelection {
-    Until(usize),
-    Exact(usize),
+    Until(crate::selectors::InclusiveSelector),
+    Exact(crate::selectors::GroupSelector),
     All,
 }
 
@@ -62,9 +72,9 @@ pub enum Cmd {
 
     /// Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base
     Restack {
-        /// Ignore the bottom N PRs; rebase the remaining commits onto base. Accepts a number, or keywords: bottom|top|last
-        #[arg(long, value_name = "N|bottom|top|last")]
-        after: String,
+        /// Keep groups through this selector in place and rebuild only the groups above it
+        #[arg(long, value_name = "N|0|bottom|top|last|all|label|pr:<label>")]
+        after: crate::selectors::AfterSelector,
 
         /// Create a local backup tag at current HEAD before rebasing
         #[arg(long)]
@@ -116,8 +126,8 @@ pub enum Cmd {
     /// Move the last M commits (top of stack) to the tail of PR N (1-based, bottom→top)
     #[command(visible_alias = "fix")]
     FixPr {
-        /// Target PR number (1-based, bottom→top)
-        n: usize,
+        /// Target local PR number or stable handle
+        target: crate::selectors::GroupSelector,
         /// Number of top commits to move to PR N's tail
         #[arg(short = 't', long = "tail", default_value_t = 1)]
         tail: usize,
@@ -129,11 +139,11 @@ pub enum Cmd {
     /// Reorder local PR groups by moving one or a range to come after a target PR
     #[command(alias = "mv")]
     Move {
-        /// Position or range to move: either `A` or `A..B` (1-based, bottom→top)
-        range: String,
-        /// Target PR position to come after: number (0..=N), or one of: bottom, top. Must not be in [A..B]
-        #[arg(long, value_name = "C|bottom|top")]
-        after: String,
+        /// Position or range to move: `A`, `A..B`, `label`, `pr:<label>`, `a..b`, or `pr:<a>..pr:<b>`
+        range: crate::selectors::GroupRangeSelector,
+        /// Target PR position to come after: number, stable handle, or one of bottom/top/last/all
+        #[arg(long, value_name = "C|bottom|top|last|all|label|pr:<label>")]
+        after: crate::selectors::AfterSelector,
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
@@ -167,12 +177,12 @@ pub struct Cli {
     /// Global dry-run flag (applies to all subcommands)
     #[arg(long, global = true, visible_alias = "dr")]
     pub dry_run: bool,
-    /// Global until (used by prep/land). 0 means all
-    #[arg(long, global = true)]
-    pub until: Option<usize>,
-    /// Global exact (used by prep)
-    #[arg(long, global = true)]
-    pub exact: Option<usize>,
+    /// Global until (used by prep/land). Accepts 0, a local PR number, or a stable handle
+    #[arg(long, global = true, value_name = "N|0|label|pr:<label>")]
+    pub until: Option<crate::selectors::InclusiveSelector>,
+    /// Global exact (used by prep). Accepts a local PR number or a stable handle
+    #[arg(long, global = true, value_name = "I|label|pr:<label>")]
+    pub exact: Option<crate::selectors::GroupSelector>,
     #[command(subcommand)]
     pub cmd: Cmd,
 }

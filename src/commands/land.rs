@@ -7,16 +7,24 @@ use crate::github::{
     fetch_pr_bodies_graphql, fetch_pr_ci_review_status, graphql_escape, list_open_prs_for_heads,
 };
 use crate::parsing::derive_local_groups;
+use crate::selectors::{resolve_inclusive_count, InclusiveSelector};
+
+fn resolve_land_take_count(
+    groups: &[crate::parsing::Group],
+    until: &InclusiveSelector,
+) -> Result<usize> {
+    resolve_inclusive_count(groups, until)
+}
 
 pub fn land_until(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
-    n: usize,
+    until: &InclusiveSelector,
     dry: bool,
     mode: LandCmd,
     bypass_safety: bool,
-) -> Result<()> {
+) -> Result<usize> {
     // Local stack is the source of truth: derive order from local groups
     let (_merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
@@ -43,11 +51,7 @@ pub fn land_until(
             );
         }
     }
-    let take_n = if n == 0 {
-        ordered.len()
-    } else {
-        n.min(ordered.len())
-    };
+    let take_n = resolve_land_take_count(&groups, until)?;
     let segment = &ordered[..take_n];
 
     // Safety validation: CI and Reviews must be passing/approved for all PRs being landed
@@ -210,7 +214,7 @@ pub fn land_until(
         ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
     )?;
 
-    Ok(())
+    Ok(take_n)
 }
 
 /// Per-PR: land N PRs bottom-up, each PR as its own commit using rebase merge.
@@ -219,15 +223,15 @@ pub fn land_per_pr_until(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
-    n: usize,
+    until: &InclusiveSelector,
     dry: bool,
     bypass_safety: bool,
-) -> Result<()> {
+) -> Result<usize> {
     land_until(
         base,
         prefix,
         ignore_tag,
-        n,
+        until,
         dry,
         LandCmd::PerPr,
         bypass_safety,
@@ -239,17 +243,46 @@ pub fn land_flatten_until(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
-    n: usize,
+    until: &InclusiveSelector,
     dry: bool,
     bypass_safety: bool,
-) -> Result<()> {
+) -> Result<usize> {
     land_until(
         base,
         prefix,
         ignore_tag,
-        n,
+        until,
         dry,
         LandCmd::Flatten,
         bypass_safety,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_land_take_count;
+    use crate::parsing::Group;
+    use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
+
+    fn groups(tags: &[&str]) -> Vec<Group> {
+        tags.iter()
+            .map(|tag| Group {
+                tag: tag.to_string(),
+                subjects: vec![format!("feat: {tag}")],
+                commits: vec![format!("{tag}1")],
+                first_message: Some(format!("feat: {tag} pr:{tag}")),
+                ignored_after: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn land_until_resolves_stable_handle_as_inclusive_prefix() {
+        let groups = groups(&["alpha", "beta", "gamma"]);
+        let until = InclusiveSelector::Group(GroupSelector::Stable(StableHandle {
+            tag: "beta".to_string(),
+        }));
+
+        assert_eq!(resolve_land_take_count(&groups, &until).unwrap(), 2);
+    }
 }

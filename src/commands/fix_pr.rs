@@ -1,13 +1,20 @@
 //! Adjust the tail of a PR group while preserving ignore blocks.
 
 use anyhow::{anyhow, bail, Result};
-use regex::Regex;
 use std::collections::HashSet;
 use tracing::info;
 
 use crate::commands::common;
 use crate::git::git_ro;
 use crate::parsing::derive_local_groups_with_ignored;
+use crate::selectors::{resolve_group_ordinal, GroupSelector};
+
+fn resolve_fix_pr_target(
+    groups: &[crate::parsing::Group],
+    target: &GroupSelector,
+) -> Result<usize> {
+    resolve_group_ordinal(groups, target)
+}
 
 /// Move the last `tail_count` commits (top-of-stack) to become the tail of PR `n` (1-based, bottom→top).
 ///
@@ -22,7 +29,7 @@ use crate::parsing::derive_local_groups_with_ignored;
 pub fn fix_pr_tail(
     base: &str,
     ignore_tag: &str,
-    n: usize,
+    target: &GroupSelector,
     tail_count: usize,
     safe: bool,
     dry: bool,
@@ -38,15 +45,7 @@ pub fn fix_pr_tail(
         return Ok(());
     }
 
-    // Validate target PR index (1-based)
-    if n == 0 || n > total_groups {
-        return Err(anyhow!(
-            "Target PR N={} out of bounds (1..={})",
-            n,
-            total_groups
-        ));
-    }
-    let target_n = n;
+    let target_n = resolve_fix_pr_target(&groups, target)?;
 
     // Flatten commits bottom→top
     let mut all_commits: Vec<String> = Vec::new();
@@ -65,11 +64,10 @@ pub fn fix_pr_tail(
     let top_commits: Vec<String> = all_commits.split_off(all_commits.len() - m);
 
     // Validate: moved commits must NOT contain pr:<tag> markers
-    let re_tag = Regex::new(r"(?i)\bpr:([A-Za-z0-9._\-]+)\b")?;
     let mut offenders: Vec<String> = vec![];
     for sha in &top_commits {
         let msg = git_ro(["log", "-n", "1", "--format=%B", sha].as_slice())?;
-        if re_tag.is_match(&msg) {
+        if crate::pr_labels::candidate_marker_regex().is_match(&msg) {
             offenders.push(sha.clone());
         }
     }
@@ -160,4 +158,33 @@ pub fn fix_pr_tail(
     common::cleanup_temp_worktree(dry, &tmp_path, &tmp_branch)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_fix_pr_target;
+    use crate::parsing::Group;
+    use crate::selectors::{GroupSelector, StableHandle};
+
+    fn groups(tags: &[&str]) -> Vec<Group> {
+        tags.iter()
+            .map(|tag| Group {
+                tag: tag.to_string(),
+                subjects: vec![format!("feat: {tag}")],
+                commits: vec![format!("{tag}1")],
+                first_message: Some(format!("feat: {tag} pr:{tag}")),
+                ignored_after: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fix_pr_resolves_stable_handle_to_current_local_ordinal() {
+        let groups = groups(&["alpha", "beta", "gamma"]);
+        let target = GroupSelector::Stable(StableHandle {
+            tag: "beta".to_string(),
+        });
+
+        assert_eq!(resolve_fix_pr_target(&groups, &target).unwrap(), 2);
+    }
 }

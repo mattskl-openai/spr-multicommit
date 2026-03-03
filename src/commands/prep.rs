@@ -1,10 +1,28 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use tracing::info;
 
 use crate::git::{git_ro, git_rw};
 use crate::github::{append_warning_to_pr, list_open_prs_for_heads};
 use crate::limit::Limit;
 use crate::parsing::derive_local_groups;
+use crate::selectors::{resolve_group_ordinal, resolve_inclusive_count};
+
+fn resolve_prep_window(
+    groups: &[crate::parsing::Group],
+    selection: &crate::cli::PrepSelection,
+) -> Result<(usize, usize)> {
+    match selection {
+        crate::cli::PrepSelection::All => Ok((0, groups.len())),
+        crate::cli::PrepSelection::Until(selector) => {
+            let end = resolve_inclusive_count(groups, selector)?;
+            Ok((0, end.min(groups.len())))
+        }
+        crate::cli::PrepSelection::Exact(selector) => {
+            let ordinal = resolve_group_ordinal(groups, selector)?;
+            Ok((ordinal - 1, ordinal))
+        }
+    }
+}
 
 /// Squash PRs according to selection; operate locally then run update for the affected groups.
 ///
@@ -27,16 +45,7 @@ pub fn prep_squash(
     }
 
     // Determine selected range of groups to prep (squash)
-    let (start_idx, end_idx_exclusive) = match selection {
-        crate::cli::PrepSelection::All => (0usize, groups.len()),
-        crate::cli::PrepSelection::Until(n) => (0usize, n.min(groups.len())),
-        crate::cli::PrepSelection::Exact(i) => {
-            if i == 0 || i > groups.len() {
-                bail!("--exact out of range (1..={})", groups.len());
-            }
-            (i - 1, (i - 1) + 1)
-        }
-    };
+    let (start_idx, end_idx_exclusive) = resolve_prep_window(&groups, &selection)?;
 
     // Start rebuilding history from just before the selected window
     let mut parent_sha = if start_idx == 0 {
@@ -192,14 +201,18 @@ pub fn prep_squash(
     // Decide limit for pushing and whether to warn the next PR
     let (limit, next_idx_opt) = match selection {
         crate::cli::PrepSelection::All => (None, None),
-        crate::cli::PrepSelection::Until(n) => {
+        crate::cli::PrepSelection::Until(selector) => {
+            let n = resolve_inclusive_count(&groups, &selector)?;
             if n == 0 {
                 (None, None)
             } else {
                 (Some(Limit::ByPr(n)), Some(n))
             }
         }
-        crate::cli::PrepSelection::Exact(i) => (Some(Limit::ByPr(i)), Some(i)),
+        crate::cli::PrepSelection::Exact(selector) => {
+            let i = resolve_group_ordinal(&groups, &selector)?;
+            (Some(Limit::ByPr(i)), Some(i))
+        }
     };
 
     // Push updates for the selected scope (respect PR body overwrite config)
@@ -241,4 +254,46 @@ pub fn prep_squash(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_prep_window;
+    use crate::cli::PrepSelection;
+    use crate::parsing::Group;
+    use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
+
+    fn groups(tags: &[&str]) -> Vec<Group> {
+        tags.iter()
+            .map(|tag| Group {
+                tag: tag.to_string(),
+                subjects: vec![format!("feat: {tag}")],
+                commits: vec![format!("{tag}1")],
+                first_message: Some(format!("feat: {tag} pr:{tag}")),
+                ignored_after: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prep_until_stable_handle_resolves_inclusive_window() {
+        let groups = groups(&["alpha", "beta", "gamma"]);
+        let selection = PrepSelection::Until(InclusiveSelector::Group(GroupSelector::Stable(
+            StableHandle {
+                tag: "beta".to_string(),
+            },
+        )));
+
+        assert_eq!(resolve_prep_window(&groups, &selection).unwrap(), (0, 2));
+    }
+
+    #[test]
+    fn prep_exact_stable_handle_resolves_single_group_window() {
+        let groups = groups(&["alpha", "beta", "gamma"]);
+        let selection = PrepSelection::Exact(GroupSelector::Stable(StableHandle {
+            tag: "beta".to_string(),
+        }));
+
+        assert_eq!(resolve_prep_window(&groups, &selection).unwrap(), (1, 2));
+    }
 }

@@ -68,6 +68,56 @@ fn summary_subject(subjects: &[String], _list_order: ListOrder) -> &str {
     subjects.first().map(|s| s.as_str()).unwrap_or("")
 }
 
+fn stable_handle_text(tag: &str) -> String {
+    format!("pr:{tag}")
+}
+
+struct PrSummaryLine<'a> {
+    ci_icon: &'a str,
+    rv_icon: &'a str,
+    local_pr_num: usize,
+    stable_handle: &'a str,
+    short: &'a str,
+    head_branch: &'a str,
+    pr_number: Option<u64>,
+    count: usize,
+}
+
+fn format_pr_summary_line(line: PrSummaryLine<'_>) -> String {
+    let remote_pr_num = if let Some(pr_number) = line.pr_number {
+        format!(" (#{pr_number})")
+    } else {
+        String::new()
+    };
+    let plural = if line.count == 1 { "commit" } else { "commits" };
+    format!(
+        "{}{} LPR #{} / {} - {} : {}{} - {} {}",
+        line.ci_icon,
+        line.rv_icon,
+        line.local_pr_num,
+        line.stable_handle,
+        line.short,
+        line.head_branch,
+        remote_pr_num,
+        line.count,
+        plural
+    )
+}
+
+fn format_commit_group_header(
+    local_pr_num: usize,
+    stable_handle: &str,
+    pr_number: Option<u64>,
+    head_branch: &str,
+) -> String {
+    let remote_pr_num = if let Some(pr_number) = pr_number {
+        format!(" (#{pr_number})")
+    } else {
+        String::new()
+    };
+    format!("===== Local PR #{local_pr_num} / {stable_handle}{remote_pr_num} : {head_branch} =====")
+}
+
 /// Print a per-PR summary for the current local stack.
 ///
 /// The local stack order is derived bottom-up from commits, so local PR numbers are based
@@ -120,22 +170,27 @@ pub fn list_prs_display(
         let num = pr.map(|p| p.number);
         let pr_state = pr.map(|p| p.state);
         let count = g.commits.len();
-        let plural = if count == 1 { "commit" } else { "commits" };
         let first_sha = g.commits.first().map(|s| s.as_str()).unwrap_or("");
         let short = if first_sha.len() >= 8 {
             &first_sha[..8]
         } else {
             first_sha
         };
-        let remote_pr_num_str = match num {
-            Some(n) => format!(" (#{})", n),
-            None => "".to_string(),
-        };
         let (ci_icon, rv_icon) = status_icons(pr_state, num, &status_map);
         let local_pr_num = group_idx + 1;
+        let stable_handle = stable_handle_text(&g.tag);
         info!(
-            "{}{} LPR #{} - {} : {}{} - {} {}",
-            ci_icon, rv_icon, local_pr_num, short, head_branch, remote_pr_num_str, count, plural
+            "{}",
+            format_pr_summary_line(PrSummaryLine {
+                ci_icon,
+                rv_icon,
+                local_pr_num,
+                stable_handle: &stable_handle,
+                short,
+                head_branch: &head_branch,
+                pr_number: num,
+                count,
+            })
         );
         let first_subject = summary_subject(&g.subjects, list_order);
         info!(
@@ -188,17 +243,12 @@ pub fn list_commits_display(
         let g = &groups[group_idx];
         let head_branch = format!("{}{}", prefix, g.tag);
         let num = prs.iter().find(|p| p.head == head_branch).map(|p| p.number);
-        let remote_pr_num_str = match num {
-            Some(n) => format!(" (#{})", n),
-            None => String::new(),
-        };
+        let stable_handle = stable_handle_text(&g.tag);
 
         // Group separator with local PR number
         info!(
-            "===== Local PR #{}{} : {} =====",
-            group_idx + 1,
-            remote_pr_num_str,
-            head_branch
+            "{}",
+            format_commit_group_header(group_idx + 1, &stable_handle, num, &head_branch)
         );
 
         let start_idx = group_start_idx[group_idx];
@@ -273,6 +323,37 @@ mod tests {
         assert_eq!(
             summary_subject(&subjects, ListOrder::RecentOnTop),
             "oldest commit subject"
+        );
+    }
+
+    #[test]
+    fn pr_summary_line_includes_stable_handle() {
+        let line = format_pr_summary_line(PrSummaryLine {
+            ci_icon: "✓",
+            rv_icon: "✓",
+            local_pr_num: 2,
+            stable_handle: "pr:beta",
+            short: "abcdef12",
+            head_branch: "dank-spr/beta",
+            pr_number: Some(17),
+            count: 3,
+        });
+
+        assert_eq!(
+            line,
+            "✓✓ LPR #2 / pr:beta - abcdef12 : dank-spr/beta (#17) - 3 commits"
+        );
+    }
+
+    #[test]
+    fn commit_group_header_includes_stable_handle_for_any_display_order() {
+        assert_eq!(
+            format_commit_group_header(2, "pr:beta", Some(17), "dank-spr/beta"),
+            "===== Local PR #2 / pr:beta (#17) : dank-spr/beta ====="
+        );
+        assert_eq!(
+            format_commit_group_header(2, "pr:beta", None, "dank-spr/beta"),
+            "===== Local PR #2 / pr:beta : dank-spr/beta ====="
         );
     }
 }
