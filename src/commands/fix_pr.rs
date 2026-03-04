@@ -464,7 +464,8 @@ mod tests {
         .expect("fix-pr should suspend");
         let mut current = outcome;
         let mut last_resume_path = None;
-        while let RewriteCommandOutcome::Suspended { resume_path } = current {
+        while let RewriteCommandOutcome::Suspended(state) = current {
+            let resume_path = state.resume_path.clone();
             let resume_state: RewriteResumeState =
                 serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
                     .expect("parse resume state");

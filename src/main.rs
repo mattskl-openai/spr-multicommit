@@ -9,6 +9,7 @@ mod format;
 mod git;
 mod github;
 mod limit;
+mod machine_output;
 mod parsing;
 mod pr_labels;
 mod selectors;
@@ -66,6 +67,12 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
         | crate::cli::Cmd::Cleanup {}
         | crate::cli::Cmd::Move { .. } => true,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    Human,
+    Json,
 }
 
 fn init_tools(needs_gh: bool) -> Result<()> {
@@ -127,60 +134,75 @@ fn resolve_base_prefix(
 }
 
 fn ensure_rewrite_completed(
+    mode: OutputMode,
     command_name: &str,
+    machine_command: crate::machine_output::MachineCommand,
     outcome: crate::commands::RewriteCommandOutcome,
-) -> Result<()> {
+) -> Result<crate::machine_output::MachineOutput> {
     if outcome == crate::commands::RewriteCommandOutcome::Completed {
-        Ok(())
-    } else if let crate::commands::RewriteCommandOutcome::Suspended { resume_path } = outcome {
-        Err(anyhow::anyhow!(
-            "{} suspended due to a cherry-pick conflict. Resolve the conflict in the temp worktree, stage the resolution, and run `spr resume {}`.",
-            command_name,
-            resume_path.display()
+        Ok(crate::machine_output::MachineOutput::completed(
+            machine_command,
         ))
+    } else if let crate::commands::RewriteCommandOutcome::Suspended(state) = outcome {
+        if mode == OutputMode::Json {
+            Ok(crate::machine_output::MachineOutput::suspended(
+                machine_command,
+                *state,
+                None,
+            ))
+        } else {
+            Err(anyhow::anyhow!(
+                "{} suspended due to a cherry-pick conflict. Resolve the conflict in the temp worktree, stage the resolution, and run `spr resume {}`.",
+                command_name,
+                state.resume_path.display()
+            ))
+        }
     } else {
-        Ok(())
+        Ok(crate::machine_output::MachineOutput::completed(
+            machine_command,
+        ))
     }
 }
 
-fn ensure_resume_completed(outcome: crate::commands::RewriteCommandOutcome) -> Result<()> {
+fn ensure_resume_completed(
+    mode: OutputMode,
+    outcome: crate::commands::RewriteCommandOutcome,
+) -> Result<crate::machine_output::MachineOutput> {
     if outcome == crate::commands::RewriteCommandOutcome::Completed {
-        Ok(())
-    } else if let crate::commands::RewriteCommandOutcome::Suspended { resume_path } = outcome {
-        Err(anyhow::anyhow!(
-            "`spr resume` hit another cherry-pick conflict. Resolve the next conflict in the temp worktree, stage the resolution, and rerun `spr resume {}`.",
-            resume_path.display()
+        Ok(crate::machine_output::MachineOutput::completed(
+            crate::machine_output::MachineCommand::Resume,
         ))
+    } else if let crate::commands::RewriteCommandOutcome::Suspended(state) = outcome {
+        if mode == OutputMode::Json {
+            Ok(crate::machine_output::MachineOutput::suspended(
+                crate::machine_output::MachineCommand::Resume,
+                *state,
+                None,
+            ))
+        } else {
+            Err(anyhow::anyhow!(
+                "`spr resume` hit another cherry-pick conflict. Resolve the next conflict in the temp worktree, stage the resolution, and rerun `spr resume {}`.",
+                state.resume_path.display()
+            ))
+        }
     } else {
-        Ok(())
+        Ok(crate::machine_output::MachineOutput::completed(
+            crate::machine_output::MachineCommand::Resume,
+        ))
     }
 }
 
-fn main() -> Result<()> {
-    let cli = crate::cli::Cli::parse();
+fn run_cli(
+    cli: crate::cli::Cli,
+    output_mode: OutputMode,
+) -> Result<crate::machine_output::MachineOutput> {
     apply_working_directory_override(cli.cd.as_deref())?;
-    if cli.verbose {
-        tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .with_target(false)
-            .with_level(false)
-            .compact()
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .with_target(false)
-            .with_level(false)
-            .without_time()
-            .compact()
-            .init();
-    }
-    if cli.verbose {
-        std::env::set_var("SPR_VERBOSE", "1");
-    }
     init_tools(command_requires_gh(&cli.cmd))?;
-    if let crate::cli::Cmd::Resume { path } = &cli.cmd {
-        return ensure_resume_completed(crate::commands::resume_rewrite(cli.dry_run, path)?);
+    if let crate::cli::Cmd::Resume { path, .. } = &cli.cmd {
+        return ensure_resume_completed(
+            output_mode,
+            crate::commands::resume_rewrite(cli.dry_run, path)?,
+        );
     }
 
     let cfg = crate::config::load_config()?;
@@ -204,9 +226,9 @@ fn main() -> Result<()> {
             set_dry_run_env(cli.dry_run, assume_existing_prs);
             let pr_description_mode = pr_description_mode_override.unwrap_or(pr_description_mode);
             if restack {
-                return Err(anyhow::anyhow!(
+                Err(anyhow::anyhow!(
                     "`spr update --restack` is deprecated. Use `spr restack --after N` instead."
-                ));
+                ))
             } else {
                 let (_merge_base, leading_ignored, all_groups) =
                     crate::parsing::derive_groups_between_with_ignored(&base, &from, &ignore_tag)?;
@@ -244,12 +266,21 @@ fn main() -> Result<()> {
                     allow_branch_reuse,
                     branch_reuse_guard_days,
                 )?;
+                Ok(crate::machine_output::MachineOutput::completed(
+                    crate::machine_output::MachineCommand::Restack,
+                ))
             }
         }
-        crate::cli::Cmd::Restack { after, safe } => {
+        crate::cli::Cmd::Restack {
+            after,
+            safe,
+            json: _,
+        } => {
             set_dry_run_env(cli.dry_run, false);
             ensure_rewrite_completed(
+                output_mode,
                 "spr restack",
+                crate::machine_output::MachineCommand::Restack,
                 crate::commands::restack_after(
                     &base,
                     &ignore_tag,
@@ -259,10 +290,11 @@ fn main() -> Result<()> {
                     restack_conflict_policy,
                     dirty_worktree_policy,
                 )?,
-            )?;
+            )
         }
         crate::cli::Cmd::Absorb {
             allow_replayed_duplicates,
+            json: _,
         } => {
             set_dry_run_env(cli.dry_run, false);
             let options = crate::commands::AbsorbOptions {
@@ -273,7 +305,9 @@ fn main() -> Result<()> {
                 },
             };
             ensure_rewrite_completed(
+                output_mode,
                 "spr absorb",
+                crate::machine_output::MachineCommand::Absorb,
                 crate::commands::absorb_branch_tails(
                     &base,
                     &prefix,
@@ -282,7 +316,7 @@ fn main() -> Result<()> {
                     dirty_worktree_policy,
                     options,
                 )?,
-            )?;
+            )
         }
         crate::cli::Cmd::Prep {} => {
             set_dry_run_env(cli.dry_run, false);
@@ -309,23 +343,35 @@ fn main() -> Result<()> {
                 selection,
                 cli.dry_run,
             )?;
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
         }
-        crate::cli::Cmd::List { what } => match what {
-            crate::cli::ListWhat::Pr => {
-                crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
+        crate::cli::Cmd::List { what } => {
+            match what {
+                crate::cli::ListWhat::Pr => {
+                    crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?;
+                }
+                crate::cli::ListWhat::Commit => {
+                    crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?;
+                }
             }
-            crate::cli::ListWhat::Commit => {
-                crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?
-            }
-        },
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
+        }
         crate::cli::Cmd::Status {} => {
             // alias for `spr list pr`
-            crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
+            crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?;
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
         }
         crate::cli::Cmd::Land {
             which,
             r#unsafe,
             no_restack,
+            json: _,
         } => {
             set_dry_run_env(cli.dry_run, false);
             let mode = which.unwrap_or(match cfg.land.as_str() {
@@ -364,26 +410,54 @@ fn main() -> Result<()> {
                     restack_conflict_policy,
                     dirty_worktree_policy,
                 )?;
-                if let crate::commands::RewriteCommandOutcome::Suspended { resume_path } = outcome {
-                    return Err(anyhow::anyhow!(
-                        "GitHub landing already succeeded, but the follow-on restack suspended due to a cherry-pick conflict. Resolve the conflict in the temp worktree, stage the resolution, and run `spr resume {}` instead of rerunning `spr land`.",
-                        resume_path.display()
-                    ));
+                if let crate::commands::RewriteCommandOutcome::Suspended(state) = outcome {
+                    let post_success_hint = Some(
+                        "GitHub landing already succeeded; resolve the local restack conflict and run the printed `spr resume <path>` command instead of rerunning `spr land`."
+                            .to_string(),
+                    );
+                    if output_mode == OutputMode::Json {
+                        return Ok(crate::machine_output::MachineOutput::suspended(
+                            crate::machine_output::MachineCommand::Land,
+                            *state,
+                            post_success_hint,
+                        ));
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "GitHub landing already succeeded, but the follow-on restack suspended due to a cherry-pick conflict. Resolve the conflict in the temp worktree, stage the resolution, and run `spr resume {}` instead of rerunning `spr land`.",
+                            state.resume_path.display()
+                        ));
+                    }
                 }
             }
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Land,
+            ))
         }
         crate::cli::Cmd::RelinkPrs {} => {
             set_dry_run_env(cli.dry_run, false);
             crate::commands::relink_prs(&base, &prefix, &ignore_tag, cli.dry_run)?;
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
         }
         crate::cli::Cmd::Cleanup {} => {
             set_dry_run_env(cli.dry_run, false);
             crate::commands::cleanup_remote_branches(&prefix, cli.dry_run)?;
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
         }
-        crate::cli::Cmd::FixPr { target, tail, safe } => {
+        crate::cli::Cmd::FixPr {
+            target,
+            tail,
+            safe,
+            json: _,
+        } => {
             set_dry_run_env(cli.dry_run, false);
             ensure_rewrite_completed(
+                output_mode,
                 "spr fix-pr",
+                crate::machine_output::MachineCommand::FixPr,
                 crate::commands::fix_pr_tail(
                     &base,
                     &ignore_tag,
@@ -393,12 +467,19 @@ fn main() -> Result<()> {
                     cli.dry_run,
                     dirty_worktree_policy,
                 )?,
-            )?;
+            )
         }
-        crate::cli::Cmd::Move { range, after, safe } => {
+        crate::cli::Cmd::Move {
+            range,
+            after,
+            safe,
+            json: _,
+        } => {
             set_dry_run_env(cli.dry_run, false);
             ensure_rewrite_completed(
+                output_mode,
                 "spr move",
+                crate::machine_output::MachineCommand::Move,
                 crate::commands::move_groups_after(
                     &base,
                     &prefix,
@@ -411,11 +492,81 @@ fn main() -> Result<()> {
                         dirty_worktree_policy,
                     },
                 )?,
-            )?;
+            )
         }
         crate::cli::Cmd::Resume { .. } => unreachable!("handled before config loading"),
     }
-    Ok(())
+}
+
+fn init_logging(verbose: bool, output_mode: OutputMode) {
+    if output_mode == OutputMode::Json {
+        return;
+    }
+    if verbose {
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_target(false)
+            .with_level(false)
+            .compact()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_target(false)
+            .with_level(false)
+            .without_time()
+            .compact()
+            .init();
+    }
+    if verbose {
+        std::env::set_var("SPR_VERBOSE", "1");
+    }
+}
+
+fn main() {
+    let cli = crate::cli::Cli::parse();
+    let output_mode = if cli.cmd.json_mode() {
+        OutputMode::Json
+    } else {
+        OutputMode::Human
+    };
+    init_logging(cli.verbose, output_mode);
+    let command = machine_command_for_cli(&cli.cmd);
+    match run_cli(cli, output_mode) {
+        Ok(output) => {
+            if output_mode == OutputMode::Json {
+                println!("{}", serde_json::to_string(&output).unwrap());
+                std::process::exit(output.exit_code());
+            }
+        }
+        Err(err) => {
+            if output_mode == OutputMode::Json {
+                let output =
+                    crate::machine_output::MachineOutput::error(command, format!("{err:#}"));
+                println!("{}", serde_json::to_string(&output).unwrap());
+            } else {
+                eprintln!("Error: {err:#}");
+            }
+            std::process::exit(crate::machine_output::EXIT_FAILURE);
+        }
+    }
+}
+
+fn machine_command_for_cli(cmd: &crate::cli::Cmd) -> crate::machine_output::MachineCommand {
+    match cmd {
+        crate::cli::Cmd::Restack { .. } => crate::machine_output::MachineCommand::Restack,
+        crate::cli::Cmd::Absorb { .. } => crate::machine_output::MachineCommand::Absorb,
+        crate::cli::Cmd::Resume { .. } => crate::machine_output::MachineCommand::Resume,
+        crate::cli::Cmd::Land { .. } => crate::machine_output::MachineCommand::Land,
+        crate::cli::Cmd::FixPr { .. } => crate::machine_output::MachineCommand::FixPr,
+        crate::cli::Cmd::Move { .. } => crate::machine_output::MachineCommand::Move,
+        crate::cli::Cmd::Update { .. }
+        | crate::cli::Cmd::Prep {}
+        | crate::cli::Cmd::List { .. }
+        | crate::cli::Cmd::Status {}
+        | crate::cli::Cmd::RelinkPrs {}
+        | crate::cli::Cmd::Cleanup {} => crate::machine_output::MachineCommand::Restack,
+    }
 }
 
 #[cfg(test)]
@@ -506,6 +657,7 @@ mod tests {
     fn absorb_is_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::Absorb {
             allow_replayed_duplicates: false,
+            json: false,
         }));
     }
 
@@ -513,6 +665,7 @@ mod tests {
     fn resume_is_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::Resume {
             path: std::path::PathBuf::from(".git/spr/resume/example.json"),
+            json: false,
         }));
     }
 

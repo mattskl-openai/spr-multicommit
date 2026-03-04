@@ -1906,7 +1906,7 @@ mod tests {
         };
         let resume_path = match outcome {
             RewriteCommandOutcome::Completed => panic!("expected suspended absorb"),
-            RewriteCommandOutcome::Suspended { resume_path } => resume_path,
+            RewriteCommandOutcome::Suspended(state) => state.resume_path.clone(),
         };
         let resume_state: RewriteResumeState =
             serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))

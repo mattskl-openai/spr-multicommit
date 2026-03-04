@@ -83,6 +83,10 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rebasing
         #[arg(long)]
         safe: bool,
+
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch
@@ -93,6 +97,10 @@ pub enum Cmd {
         /// Allow replayed duplicates and keep both copies when the later replay is non-seed
         #[arg(long)]
         allow_replayed_duplicates: bool,
+
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// Prepare PRs for landing (e.g., squash)
@@ -108,6 +116,10 @@ pub enum Cmd {
         /// Explicit path to the suspended rewrite's resume-state JSON file
         #[arg(value_name = "PATH")]
         path: PathBuf,
+
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// List entities
@@ -134,6 +146,9 @@ pub enum Cmd {
         /// Skip automatic restack after landing (default: restack remaining commits with `--after N`)
         #[arg(long = "no-restack")]
         no_restack: bool,
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// Relink PR stack to match local commit stack
@@ -158,6 +173,9 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// Reorder local PR groups by moving one or a range to come after a target PR
@@ -171,7 +189,29 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
+}
+
+impl Cmd {
+    pub fn json_mode(&self) -> bool {
+        match self {
+            Self::Restack { json, .. }
+            | Self::Absorb { json, .. }
+            | Self::Resume { json, .. }
+            | Self::Land { json, .. }
+            | Self::FixPr { json, .. }
+            | Self::Move { json, .. } => *json,
+            Self::Update { .. }
+            | Self::Prep {}
+            | Self::List { .. }
+            | Self::Status {}
+            | Self::RelinkPrs {}
+            | Self::Cleanup {} => false,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -227,6 +267,7 @@ mod tests {
         match cli.cmd {
             Cmd::Absorb {
                 allow_replayed_duplicates,
+                json: _,
             } => assert!(allow_replayed_duplicates),
             other => panic!("unexpected command: {:?}", other),
         }
@@ -252,12 +293,18 @@ mod tests {
 
     #[test]
     fn resume_command_parses_explicit_path() {
-        let cli =
-            Cli::try_parse_from(["spr", "resume", ".git/spr/resume/restack-example.json"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "spr",
+            "resume",
+            "--json",
+            ".git/spr/resume/restack-example.json",
+        ])
+        .unwrap();
 
         match cli.cmd {
-            Cmd::Resume { path } => {
+            Cmd::Resume { path, json } => {
                 assert_eq!(path, PathBuf::from(".git/spr/resume/restack-example.json"));
+                assert!(json);
             }
             other => panic!("unexpected command: {:?}", other),
         }
@@ -272,6 +319,18 @@ mod tests {
         assert!(long_about.contains("resolve the conflict"));
         assert!(long_about.contains("spr resume <path>"));
         assert!(long_about.contains("common Git directory"));
+    }
+
+    #[test]
+    fn rewrite_commands_report_json_mode() {
+        let restack = Cli::try_parse_from(["spr", "restack", "--after", "1", "--json"]).unwrap();
+        assert!(restack.cmd.json_mode());
+
+        let land = Cli::try_parse_from(["spr", "land", "--json"]).unwrap();
+        assert!(land.cmd.json_mode());
+
+        let list = Cli::try_parse_from(["spr", "list", "pr"]).unwrap();
+        assert!(!list.cmd.json_mode());
     }
 
     #[test]

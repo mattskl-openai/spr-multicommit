@@ -259,6 +259,51 @@ Behavior:
 - Tolerates one accidental manual `git cherry-pick --continue` for the paused step, then resumes the remaining replay under `spr`
 - Rejects broader manual replay edits, unknown resume-file schema versions, missing temp worktrees, or unresolved conflicts that are still staged as unmerged
 
+Machine-readable `--json` mode:
+
+- Supported on `spr restack`, `spr absorb`, `spr move`, `spr fix-pr`, `spr land`, and `spr resume`
+- In `--json` mode, stdout is exactly one JSON object and stderr is normally empty
+- Exit codes are:
+  - `0` for completed
+  - `1` for hard error
+  - `2` for suspended rewrite awaiting conflict resolution
+- The suspended JSON payload includes the fields an agent needs to resolve and resume:
+  - `original_worktree_root`
+  - `original_branch`
+  - `temp_branch`
+  - `temp_worktree`
+  - `resume_file`
+  - `resume_argv`
+  - `paused_source_sha`
+  - `conflicted_paths`
+  - `post_success_hint`
+
+Example suspend payload:
+
+```json
+{
+  "schema_version": 1,
+  "result": "suspended",
+  "command": "restack",
+  "rewrite_command_kind": "restack",
+  "original_worktree_root": "/path/to/repo",
+  "original_branch": "stack",
+  "temp_branch": "spr/tmp-restack-717b9d8",
+  "temp_worktree": "/tmp/spr-restack-717b9d8",
+  "resume_file": "/path/to/repo/.git/spr/resume/restack-stack-717b9d8.json",
+  "resume_argv": [
+    "spr",
+    "resume",
+    "/path/to/repo/.git/spr/resume/restack-stack-717b9d8.json"
+  ],
+  "paused_source_sha": "717b9d83bcdbea33286496800c76e65c62f795ed",
+  "conflicted_paths": [
+    "story.txt"
+  ],
+  "post_success_hint": null
+}
+```
+
 Mental model:
 
 - `spr` is not running `git rebase`; it is running a local rewrite engine that replays planned commits as individual cherry-picks in a temp worktree

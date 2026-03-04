@@ -30,7 +30,20 @@ pub enum RewriteConflictPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewriteCommandOutcome {
     Completed,
-    Suspended { resume_path: PathBuf },
+    Suspended(Box<RewriteSuspendedState>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteSuspendedState {
+    pub command_kind: RewriteCommandKind,
+    pub original_worktree_root: String,
+    pub original_branch: String,
+    pub temp_branch: String,
+    pub temp_worktree_path: String,
+    pub resume_path: PathBuf,
+    pub paused_source_sha: String,
+    pub conflicted_paths: Vec<String>,
+    pub post_success_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,9 +292,9 @@ fn continue_rewrite(
                 state.suspended_step_index = next_index;
                 write_resume_state(resume_path, &state)?;
                 emit_suspend_instructions(resume_path, &state);
-                return Ok(RewriteCommandOutcome::Suspended {
-                    resume_path: resume_path.to_path_buf(),
-                });
+                return Ok(RewriteCommandOutcome::Suspended(Box::new(
+                    suspended_state_from_resume_state(resume_path, &state)?,
+                )));
             }
 
             if conflict {
@@ -327,6 +340,36 @@ fn emit_suspend_instructions(resume_path: &Path, state: &RewriteResumeState) {
     for line in suspend_instruction_lines(resume_path, state) {
         info!("{line}");
     }
+}
+
+fn suspended_state_from_resume_state(
+    resume_path: &Path,
+    state: &RewriteResumeState,
+) -> Result<RewriteSuspendedState> {
+    let conflicted_paths =
+        conflicted_paths_from_status_lines(&worktree_status_lines(&state.temp_worktree_path)?);
+    let paused_source_sha = state
+        .steps
+        .get(state.suspended_step_index)
+        .map(|step| step.source_sha.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "resume state refers to missing step {} out of {} replay steps",
+                state.suspended_step_index,
+                state.steps.len()
+            )
+        })?;
+    Ok(RewriteSuspendedState {
+        command_kind: state.command_kind,
+        original_worktree_root: state.original_worktree_root.clone(),
+        original_branch: state.original_branch.clone(),
+        temp_branch: state.temp_branch.clone(),
+        temp_worktree_path: state.temp_worktree_path.clone(),
+        resume_path: resume_path.to_path_buf(),
+        paused_source_sha,
+        conflicted_paths,
+        post_success_hint: state.post_success_hint.clone(),
+    })
 }
 
 fn suspend_instruction_lines(resume_path: &Path, state: &RewriteResumeState) -> Vec<String> {
@@ -607,6 +650,16 @@ fn worktree_status_lines(tmp_path: &str) -> Result<Vec<String>> {
     )
 }
 
+fn conflicted_paths_from_status_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| status_line_has_conflict(line))
+        .filter_map(|line| line.get(3..).map(str::trim))
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn status_line_has_conflict(line: &str) -> bool {
     let bytes = line.as_bytes();
     if bytes.len() < 2 {
@@ -671,10 +724,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        build_replay_steps, default_resume_path, resume_rewrite, run_rewrite_session,
-        sanitize_branch_for_filename, suspend_instruction_lines, RewriteCommandKind,
-        RewriteCommandOutcome, RewriteConflictPolicy, RewriteResumeState, RewriteSession,
-        REWRITE_RESUME_SCHEMA_VERSION,
+        build_replay_steps, conflicted_paths_from_status_lines, default_resume_path,
+        resume_rewrite, run_rewrite_session, sanitize_branch_for_filename,
+        suspend_instruction_lines, RewriteCommandKind, RewriteCommandOutcome,
+        RewriteConflictPolicy, RewriteResumeState, RewriteSession, REWRITE_RESUME_SCHEMA_VERSION,
     };
     use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp};
     use crate::test_support::{lock_cwd, DirGuard};
@@ -768,7 +821,7 @@ mod tests {
         let outcome = run_rewrite_session(false, session).expect("run rewrite session");
         let resume_path = match outcome {
             RewriteCommandOutcome::Completed => panic!("expected suspended rewrite"),
-            RewriteCommandOutcome::Suspended { resume_path } => resume_path,
+            RewriteCommandOutcome::Suspended(state) => state.resume_path.clone(),
         };
 
         (dir, repo, resume_path)
@@ -988,6 +1041,20 @@ mod tests {
         assert!(
             lines.contains(&"Original branch: stack".to_string()),
             "expected original branch in suspend output: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn conflicted_paths_from_status_lines_filters_conflicts() {
+        let lines = vec![
+            "UU story.txt".to_string(),
+            " M untouched.txt".to_string(),
+            "AA both-added.txt".to_string(),
+        ];
+
+        assert_eq!(
+            conflicted_paths_from_status_lines(&lines),
+            vec!["story.txt".to_string(), "both-added.txt".to_string()]
         );
     }
 }

@@ -21,5 +21,7 @@ pub use prep::prep_squash;
 pub use r#move::{move_groups_after, MoveExecutionOptions};
 pub use relink_prs::relink_prs;
 pub use restack::{restack_after, restack_after_count};
-pub use rewrite_resume::{resume_rewrite, RewriteCommandOutcome};
+pub use rewrite_resume::{
+    resume_rewrite, RewriteCommandKind, RewriteCommandOutcome, RewriteSuspendedState,
+};
 pub use update::{build_from_groups, build_from_tags};
