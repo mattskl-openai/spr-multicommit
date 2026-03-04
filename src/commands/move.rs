@@ -39,9 +39,20 @@ fn cherry_pick_block(dry: bool, tmp_path: &str, commits: &[String]) -> Result<()
     let first = commits.first().expect("commits not empty");
     let last = commits.last().expect("commits not empty");
     if commits.len() == 1 {
-        common::cherry_pick_commit(dry, tmp_path, first)
+        common::cherry_pick_commit(
+            dry,
+            tmp_path,
+            first,
+            common::CherryPickEmptyPolicy::StopOnEmpty,
+        )
     } else {
-        common::cherry_pick_range(dry, tmp_path, first, last)
+        common::cherry_pick_range(
+            dry,
+            tmp_path,
+            first,
+            last,
+            common::CherryPickEmptyPolicy::StopOnEmpty,
+        )
     }
 }
 
@@ -209,7 +220,13 @@ pub fn move_groups_after(
     for idx in &new_order {
         let g = &groups[*idx - 1];
         if let (Some(first), Some(last)) = (g.commits.first(), g.commits.last()) {
-            common::cherry_pick_range(dry, &tmp_path, first, last)?;
+            common::cherry_pick_range(
+                dry,
+                &tmp_path,
+                first,
+                last,
+                common::CherryPickEmptyPolicy::StopOnEmpty,
+            )?;
         }
         cherry_pick_block(dry, &tmp_path, &g.ignored_after)?;
     }

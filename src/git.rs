@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use tracing::{error, info};
 
@@ -246,6 +247,163 @@ pub fn git_is_ancestor(ancestor: &str, descendant: &str) -> Result<bool> {
         .status()
         .with_context(|| "failed to run git merge-base --is-ancestor")?;
     Ok(status.success())
+}
+
+/// Resolves a revision to its full object id.
+pub fn git_rev_parse(revision: &str) -> Result<String> {
+    Ok(git_ro(["rev-parse", revision].as_slice())?
+        .trim()
+        .to_string())
+}
+
+/// Resolves the tree object id at a commit or tree-ish revision.
+pub fn git_commit_tree(revision: &str) -> Result<String> {
+    let tree_revision = format!("{revision}^{{tree}}");
+    git_rev_parse(&tree_revision)
+}
+
+/// Returns the merge-base object id of two revisions.
+pub fn git_merge_base(left: &str, right: &str) -> Result<String> {
+    Ok(git_ro(["merge-base", left, right].as_slice())?
+        .trim()
+        .to_string())
+}
+
+/// Returns the tip SHA of an exact local branch name, if it exists.
+pub fn git_local_branch_tip(branch: &str) -> Result<Option<String>> {
+    let reference = format!("refs/heads/{branch}^{{commit}}");
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &reference])
+        .output()
+        .with_context(|| format!("failed to inspect local branch {}", branch))?;
+    if out.status.success() {
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(Some(sha))
+    } else if out.status.code() == Some(1) {
+        Ok(None)
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        bail!(
+            "failed to inspect local branch {} via {}: {}",
+            branch,
+            reference,
+            stderr
+        );
+    }
+}
+
+/// Returns the commits in `from_exclusive..to_inclusive`, oldest first.
+pub fn git_rev_list_range(from_exclusive: &str, to_inclusive: &str) -> Result<Vec<String>> {
+    let range = format!("{from_exclusive}..{to_inclusive}");
+    let out = git_ro(["rev-list", "--reverse", &range].as_slice())?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+/// Returns the number of parents on the given commit.
+pub fn git_commit_parent_count(sha: &str) -> Result<usize> {
+    let out = git_ro(["rev-list", "--parents", "-n", "1", sha].as_slice())?;
+    let count = out.split_whitespace().count().saturating_sub(1);
+    Ok(count)
+}
+
+/// Returns the full commit message for `sha`.
+pub fn git_commit_message(sha: &str) -> Result<String> {
+    git_ro(["log", "-n", "1", "--format=%B", sha].as_slice())
+}
+
+/// Returns a verbatim patch fingerprint for each commit, keyed by commit SHA.
+///
+/// The fingerprint matches clean cherry-picks and rebases of the same patch
+/// even when the commit SHA differs. Commits that produce no patch output get
+/// a synthetic per-commit fallback so callers can still classify them without
+/// failing the whole lookup.
+pub fn git_patch_ids_for_commits(commits: &[String]) -> Result<HashMap<String, String>> {
+    if commits.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut diff_tree = Command::new("git")
+        .args(["diff-tree", "--stdin", "-p", "--root"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| "failed to spawn git diff-tree --stdin -p --root")?;
+    {
+        let mut stdin = diff_tree
+            .stdin
+            .take()
+            .with_context(|| "failed to open git diff-tree stdin")?;
+        for commit in commits {
+            writeln!(stdin, "{commit}")
+                .with_context(|| format!("failed to queue commit {commit} for patch-id lookup"))?;
+        }
+    }
+    let diff_output = diff_tree
+        .wait_with_output()
+        .with_context(|| "failed to collect git diff-tree output")?;
+    if !diff_output.status.success() {
+        let stdout = String::from_utf8_lossy(&diff_output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&diff_output.stderr).to_string();
+        bail!(
+            "command failed: git diff-tree --stdin -p --root\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+    }
+
+    let mut patch_id = Command::new("git")
+        .args(["patch-id", "--verbatim"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| "failed to spawn git patch-id --verbatim")?;
+    {
+        let mut stdin = patch_id
+            .stdin
+            .take()
+            .with_context(|| "failed to open git patch-id stdin")?;
+        stdin
+            .write_all(&diff_output.stdout)
+            .with_context(|| "failed to feed patch data into git patch-id")?;
+    }
+    let patch_output = patch_id
+        .wait_with_output()
+        .with_context(|| "failed to collect git patch-id output")?;
+    if !patch_output.status.success() {
+        let stdout = String::from_utf8_lossy(&patch_output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&patch_output.stderr).to_string();
+        bail!(
+            "command failed: git patch-id --verbatim\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+    }
+
+    let mut patch_ids = HashMap::new();
+    let patch_stdout = String::from_utf8_lossy(&patch_output.stdout);
+    for line in patch_stdout.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(patch_id) = fields.next() else {
+            continue;
+        };
+        let Some(commit) = fields.next() else {
+            continue;
+        };
+        patch_ids.insert(commit.to_string(), patch_id.to_string());
+    }
+    for commit in commits {
+        patch_ids
+            .entry(commit.clone())
+            .or_insert_with(|| format!("empty:{commit}"));
+    }
+    Ok(patch_ids)
 }
 
 pub fn list_remote_branches_with_prefix(prefix: &str) -> Result<Vec<String>> {

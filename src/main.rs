@@ -48,9 +48,27 @@ fn resolve_update_pr_limit(
     }
 }
 
-fn init_tools() -> Result<()> {
+fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
+    match cmd {
+        crate::cli::Cmd::Restack { .. }
+        | crate::cli::Cmd::Absorb { .. }
+        | crate::cli::Cmd::FixPr { .. } => false,
+        crate::cli::Cmd::Update { .. }
+        | crate::cli::Cmd::Prep {}
+        | crate::cli::Cmd::List { .. }
+        | crate::cli::Cmd::Status {}
+        | crate::cli::Cmd::Land { .. }
+        | crate::cli::Cmd::RelinkPrs {}
+        | crate::cli::Cmd::Cleanup {}
+        | crate::cli::Cmd::Move { .. } => true,
+    }
+}
+
+fn init_tools(needs_gh: bool) -> Result<()> {
     crate::git::ensure_tool("git")?;
-    crate::git::ensure_tool("gh")?;
+    if needs_gh {
+        crate::git::ensure_tool("gh")?;
+    }
     Ok(())
 }
 
@@ -116,7 +134,7 @@ fn main() -> Result<()> {
     if cli.verbose {
         std::env::set_var("SPR_VERBOSE", "1");
     }
-    init_tools()?;
+    init_tools(command_requires_gh(&cli.cmd))?;
     let cfg = crate::config::load_config()?;
     let (base, prefix, ignore_tag) =
         resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone())?;
@@ -188,6 +206,25 @@ fn main() -> Result<()> {
                 safe,
                 cli.dry_run,
                 restack_conflict_policy,
+            )?;
+        }
+        crate::cli::Cmd::Absorb {
+            allow_replayed_duplicates,
+        } => {
+            set_dry_run_env(cli.dry_run, false);
+            let options = crate::commands::AbsorbOptions {
+                copied_later_stack_commit_policy: if allow_replayed_duplicates {
+                    crate::commands::CopiedLaterStackCommitPolicy::AllowKeepNonSeedDuplicates
+                } else {
+                    crate::commands::CopiedLaterStackCommitPolicy::Block
+                },
+            };
+            crate::commands::absorb_branch_tails(
+                &base,
+                &prefix,
+                &ignore_tag,
+                cli.dry_run,
+                options,
             )?;
         }
         crate::cli::Cmd::Prep {} => {
@@ -301,7 +338,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_update_pr_limit;
+    use super::{command_requires_gh, resolve_update_pr_limit};
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, StableHandle};
 
@@ -358,5 +395,17 @@ mod tests {
                 .contains("No outstanding PR group matches stable handle `pr:beta`"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn absorb_is_local_only_for_tool_checks() {
+        assert!(!command_requires_gh(&crate::cli::Cmd::Absorb {
+            allow_replayed_duplicates: false,
+        }));
+    }
+
+    #[test]
+    fn status_still_requires_github_cli() {
+        assert!(command_requires_gh(&crate::cli::Cmd::Status {}));
     }
 }
