@@ -431,10 +431,16 @@ mod tests {
             let resume_state: RewriteResumeState =
                 serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
                     .expect("parse resume state");
-            let paused_step = &resume_state.steps[resume_state.suspended_step_index];
             let paused_subject = git(
                 &repo,
-                ["log", "-n", "1", "--format=%s", &paused_step.source_sha].as_slice(),
+                [
+                    "log",
+                    "-n",
+                    "1",
+                    "--format=%s",
+                    &resume_state.paused_step.source_sha,
+                ]
+                .as_slice(),
             );
             let resolved_contents = if paused_subject.trim() == "feat: gamma pr:gamma" {
                 "gamma-1\n"

@@ -588,7 +588,7 @@ pub enum CherryPickEmptyPolicy {
     KeepRedundantCommits,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CherryPickOp {
     /// Cherry-pick exactly one commit.
     Commit {
