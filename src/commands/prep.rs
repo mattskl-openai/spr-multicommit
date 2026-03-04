@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use tracing::info;
 
+use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
 use crate::git::{git_ro, git_rw};
 use crate::github::{append_warning_to_pr, list_open_prs_for_heads};
 use crate::limit::Limit;
@@ -43,6 +44,7 @@ pub fn prep_squash(
         info!("Nothing to prep");
         return Ok(());
     }
+    let branch_identities = group_branch_identities(&groups, prefix)?;
 
     // Determine selected range of groups to prep (squash)
     let (start_idx, end_idx_exclusive) = resolve_prep_window(&groups, &selection)?;
@@ -231,9 +233,13 @@ pub fn prep_squash(
     // Add a warning to the first PR not included in the push
     if let Some(next_idx) = next_idx_opt {
         if next_idx < groups.len() {
-            let next_branch = format!("{}{}", prefix, groups[next_idx].tag);
+            let next_branch = branch_identities[next_idx].exact.clone();
             let prs = list_open_prs_for_heads(std::slice::from_ref(&next_branch))?;
-            if let Some(pr) = prs.iter().find(|p| p.head == next_branch) {
+            let next_key = canonical_branch_conflict_key(&next_branch);
+            if let Some(pr) = prs
+                .iter()
+                .find(|pr| canonical_branch_conflict_key(&pr.head) == next_key)
+            {
                 match pr_description_mode {
                     crate::config::PrDescriptionMode::Overwrite => {
                         append_warning_to_pr(

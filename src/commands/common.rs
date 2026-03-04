@@ -636,16 +636,22 @@ impl CherryPickOp {
     }
 }
 
-/// Build expected (head, base) chain bottom→top from local groups
-pub fn build_head_base_chain(base: &str, groups: &[Group], prefix: &str) -> Vec<(String, String)> {
+/// Build expected (head, base) chain bottom→top from local groups.
+///
+/// This validates that the current stack does not derive case-colliding
+/// synthetic branch names before returning any branch chain.
+pub fn build_head_base_chain(
+    base: &str,
+    groups: &[Group],
+    prefix: &str,
+) -> Result<Vec<(String, String)>> {
     let mut expected: Vec<(String, String)> = vec![];
     let mut parent = base.to_string();
-    for g in groups {
-        let head = format!("{}{}", prefix, g.tag);
-        expected.push((head.clone(), parent.clone()));
-        parent = head;
+    for identity in crate::branch_names::group_branch_identities(groups, prefix)? {
+        expected.push((identity.exact.clone(), parent.clone()));
+        parent = identity.exact;
     }
-    expected
+    Ok(expected)
 }
 
 #[cfg(test)]

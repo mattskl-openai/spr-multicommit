@@ -59,7 +59,12 @@ ASCII letter. Commands that target groups accept either a bare label like
 `beta` or the explicit `pr:beta` form. `LPR #N` is only the current local
 position in the outstanding stack and may renumber after lower groups land or
 are removed. For example, `spr land flatten --until beta` and `spr move beta
---after gamma` both target stable PR-group labels.
+--after gamma` both target stable PR-group labels. Stable handles remain
+exact-case. Synthetic branch-name conflict checks are separate and fold case on
+the full derived branch name.
+Any command that derives synthetic branch names from the live stack may halt
+before doing command-specific work if two outstanding groups would collide
+under that case-insensitive branch-name comparison.
 
 Configuration
 -------------
@@ -115,8 +120,9 @@ restack_conflict: halt
 # - `halt` (default) refuses to rewrite until the worktree is clean
 dirty_worktree: halt
 
-# Blocks PR recreation when the same head branch had a recently merged
-# or closed PR within the configured window. Set to 0 to disable the guard.
+# Blocks PR recreation when the same synthetic head branch, including
+# case-only variants, had a recently merged or closed PR within the configured
+# window. Set to 0 to disable the guard.
 branch_reuse_guard_days: 180
 ```
 
@@ -174,8 +180,11 @@ Behavior:
 - When a PR is first created, `spr` always seeds it from the bottom commit in that PR group:
   the PR title comes from the first line of that commit message, and the PR description comes
   from the rest of that same commit message, regardless of `pr_description_mode`
-- Before creating a PR for a branch head without an open PR, checks whether the same branch name
-  had a recently merged or closed PR and halts within `branch_reuse_guard_days`
+- Before creating a PR for a branch head without an open PR, checks whether the same synthetic
+  branch name, including case-only variants, had a recently merged or closed PR and halts within
+  `branch_reuse_guard_days`
+- Refuses to operate when two live PR groups would derive synthetic branch names that differ only
+  by case, because those names are unsafe on case-insensitive filesystems
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
   - When `pr_description_mode` is `stack_only`, only the stack block (between markers) is updated; the rest of the body is preserved
   - May temporarily set existing PR bases to the repo base while pushing, then re-chain them to match the local stack
@@ -357,6 +366,10 @@ Example summary line:
 ✓✓ LPR #2 / pr:beta - abcdef12 : dank-spr/beta (#17) - 3 commits
 ```
 
+Before listing, `spr list pr` validates that no two live PR groups derive
+synthetic branch names that collide under case-insensitive comparison. If they
+do, it halts before loading GitHub PR state.
+
 ### spr status
 
 Aliases:
@@ -365,9 +378,16 @@ Aliases:
 
 Alias for `spr list pr`.
 
+`spr status` runs the same early synthetic branch-collision validation as
+`spr list pr` before printing anything.
+
 ### spr list commit
 
 Lists commits in the current stack, grouped by local PR. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers and commit indices remain bottom → top, and each group header also shows its stable `pr:<label>` handle.
+
+Before listing, `spr list commit` validates that no two live PR groups derive
+synthetic branch names that collide under case-insensitive comparison. If they
+do, it halts before loading GitHub PR state.
 
 Aliases:
 
@@ -380,6 +400,11 @@ Reorder local PR groups by moving one or a range to come after a target PR.
 Requires authenticated GitHub CLI `gh` because `spr move` checks whether the
 current bottom PR has auto-merge enabled before allowing a rewrite that would
 move another PR below it.
+
+Before planning the move, `spr move` validates that no two live PR groups
+derive synthetic branch names that collide under case-insensitive comparison.
+If they do, it halts before the GitHub auto-merge lookup or any rewrite
+planning.
 
 Aliases:
 
@@ -406,6 +431,10 @@ Shared options (global):
 
 - `--until <N|0|label|pr:<label>>`: land bottom-up through this local position or stable handle (`0` means all)
 - `--no-restack`: do not automatically restack after landing
+
+Before any GitHub land work, `spr land` validates that no two live PR groups
+derive synthetic branch names that collide under case-insensitive comparison.
+If they do, it halts before resolving the PR segment to land.
 
 Safety checks:
 
@@ -442,6 +471,10 @@ Default follow-up behavior:
 Prepare PRs for landing per-PR - squashes each PR's commits into a single commit.
 
 - Uses global `--until <N|0|label|pr:<label>>` / `--exact <I|label|pr:<label>>`
+- Before rewriting or pushing, `spr prep` validates that no two live PR groups
+  derive synthetic branch names that collide under case-insensitive
+  comparison. If they do, it halts before the local squash or follow-on
+  `spr update`.
 
 Behavior:
 
@@ -513,6 +546,9 @@ Behavior:
 
 - Computes the expected bottom → top chain from local commits and updates each PR’s base to match.
 - Skips PRs that are already correct; warns for missing PRs.
+- Before comparing local and remote connectivity, `spr relink-prs` validates
+  that no two live PR groups derive synthetic branch names that collide under
+  case-insensitive comparison. If they do, it halts before any GitHub edit.
 
 Dry run behavior
 ----------------
