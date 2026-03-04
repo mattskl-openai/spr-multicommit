@@ -3,7 +3,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::commands::common;
 use crate::config::{ListOrder, PrDescriptionMode};
@@ -13,7 +13,7 @@ use crate::github::{
     list_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
 };
 use crate::limit::{apply_limit_groups, Limit};
-use crate::parsing::{derive_groups_between, Group};
+use crate::parsing::{derive_groups_between_with_ignored, split_groups_for_update, Group};
 
 /// Replace the existing spr stack block with `new_block`, or append it if missing.
 ///
@@ -282,16 +282,26 @@ fn run_update_mutations(
     Ok(())
 }
 
+fn ignored_boundary_warning(skipped_handles: &[String]) -> String {
+    format!(
+        "Skipping PR groups above the ignored block. GitHub PRs above an ignored block include the ignored commits, which defeats the point of `pr:ignore`. These groups stay local-only: {}",
+        skipped_handles.join(", ")
+    )
+}
+
 /// Bootstrap/refresh stack from already-parsed PR groups.
 ///
 /// `groups` must be in local stack order (bottom-up); that order is still used for base
 /// chaining and local PR numbering even when display is reversed. `list_order` controls
 /// the order in which groups are visited for rebuild logging and list output. If a caller
-/// shuffles `groups`, PR base updates will target the wrong branches.
+/// shuffles `groups`, PR base updates will target the wrong branches. Groups above the first
+/// ignored block are kept local-only because publishing them would drag the ignored commits
+/// into their GitHub diffs.
 #[allow(clippy::too_many_arguments)]
 pub fn build_from_groups(
     base: &str,
     prefix: &str,
+    skipped_handles: &[String],
     no_pr: bool,
     dry: bool,
     pr_description_mode: PrDescriptionMode,
@@ -302,12 +312,28 @@ pub fn build_from_groups(
     branch_reuse_guard_days: u32,
 ) -> Result<()> {
     if groups.is_empty() {
-        info!("No groups discovered; nothing to do.");
+        if skipped_handles.is_empty() {
+            info!("No groups discovered; nothing to do.");
+        } else {
+            warn!("{}", ignored_boundary_warning(skipped_handles));
+            info!("No pushable groups remain after applying the ignored-block rule.");
+        }
         return Ok(());
     }
 
     // Apply extent limits
     groups = apply_limit_groups(groups, limit)?;
+    if !skipped_handles.is_empty() {
+        warn!("{}", ignored_boundary_warning(skipped_handles));
+    }
+    if groups.is_empty() {
+        if skipped_handles.is_empty() {
+            info!("No groups selected; nothing to do.");
+        } else {
+            info!("No pushable groups remain after applying the ignored-block rule.");
+        }
+        return Ok(());
+    }
     let total_groups = groups.len();
 
     info!("Preparing {} group(s)…", groups.len());
@@ -731,11 +757,13 @@ pub fn build_from_tags(
     limit: Option<Limit>,
     list_order: ListOrder,
 ) -> Result<()> {
-    let (_merge_base, groups): (String, Vec<Group>) =
-        derive_groups_between(base, from, ignore_tag)?;
+    let (_merge_base, leading_ignored, groups): (String, Vec<String>, Vec<Group>) =
+        derive_groups_between_with_ignored(base, from, ignore_tag)?;
+    let (groups, skipped_handles) = split_groups_for_update(&leading_ignored, groups);
     build_from_groups(
         base,
         prefix,
+        &skipped_handles,
         no_pr,
         dry,
         pr_description_mode,
@@ -750,14 +778,22 @@ pub fn build_from_tags(
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_reuse_guard_window, parse_github_timestamp_rfc3339, recent_pr_age,
-        recent_pr_age_blocks_recreation, terminal_pr_action,
+        branch_reuse_guard_window, ignored_boundary_warning, parse_github_timestamp_rfc3339,
+        recent_pr_age, recent_pr_age_blocks_recreation, terminal_pr_action,
     };
     use crate::github::TerminalPrState;
     use time::{Duration as TimeDuration, OffsetDateTime};
 
     fn fixed_now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+
+    #[test]
+    fn ignored_boundary_warning_explains_skipped_groups() {
+        let warning = ignored_boundary_warning(&["pr:beta".to_string(), "pr:gamma".to_string()]);
+
+        assert!(warning.contains("GitHub PRs above an ignored block include the ignored commits"));
+        assert!(warning.contains("pr:beta, pr:gamma"));
     }
 
     #[test]
