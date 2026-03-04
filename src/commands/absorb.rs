@@ -10,11 +10,14 @@
 //! from the same stack merge-base and reach the same pre-tail tree as the
 //! canonical stack prefix.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::commands::common::{self, CherryPickEmptyPolicy, CherryPickOp};
+use crate::commands::rewrite_resume::{
+    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
+};
 use crate::config::DirtyWorktreePolicy;
 use crate::git::{
     git_commit_message, git_commit_parent_count, git_commit_tree, git_is_ancestor,
@@ -45,7 +48,7 @@ pub fn absorb_branch_tails(
     dry: bool,
     dirty_worktree_policy: DirtyWorktreePolicy,
     options: AbsorbOptions,
-) -> Result<()> {
+) -> Result<RewriteCommandOutcome> {
     let (_stack_head, plan) = build_plan_for_current_stack(base, prefix, ignore_tag, options)?;
     let validation = validate_absorb_plan(&plan);
     if !matches!(validation, AbsorbPlanValidation::NoGroups) {
@@ -54,7 +57,7 @@ pub fn absorb_branch_tails(
     match validation {
         AbsorbPlanValidation::NoGroups => {
             info!("No local PR groups found; nothing to absorb.");
-            Ok(())
+            Ok(RewriteCommandOutcome::Completed)
         }
         AbsorbPlanValidation::Blocked { lines } => Err(anyhow!(
             "Refusing to absorb branch tails until blocking branches are fixed:\n{}",
@@ -62,7 +65,7 @@ pub fn absorb_branch_tails(
         )),
         AbsorbPlanValidation::NoAbsorbableGroups => {
             info!("No absorbable branch tails found; nothing to rewrite.");
-            Ok(())
+            Ok(RewriteCommandOutcome::Completed)
         }
         AbsorbPlanValidation::ReadyToRewrite => {
             execute_absorb_plan(&plan, dry, dirty_worktree_policy)
@@ -441,8 +444,7 @@ fn build_preliminary_group_rewrite_plan(
     stack_merge_base: &str,
     stack_head: &str,
 ) -> Result<PreliminaryGroupRewritePlan> {
-    let source =
-        classify_source_branch_preliminary(&group, prefix, stack_merge_base, stack_head)?;
+    let source = classify_source_branch_preliminary(&group, prefix, stack_merge_base, stack_head)?;
     Ok(PreliminaryGroupRewritePlan { group, source })
 }
 
@@ -930,57 +932,60 @@ fn build_replay_ops_for_commits(
     ops
 }
 
-fn cleanup_temp_worktree_best_effort(dry: bool, tmp_path: &str, tmp_branch: &str) {
-    if let Err(err) = common::cleanup_temp_worktree(dry, tmp_path, tmp_branch) {
-        warn!(
-            "Failed to clean up temp absorb state ({} / {}): {}",
-            tmp_path, tmp_branch, err
-        );
-    }
-}
-
 /// Executes a validated absorb rewrite plan by rebuilding the current stack in
 /// a temporary worktree and resetting the checked-out branch to the new tip.
 fn execute_absorb_plan(
     plan: &RewritePlan,
     dry: bool,
     dirty_worktree_policy: DirtyWorktreePolicy,
-) -> Result<()> {
+) -> Result<RewriteCommandOutcome> {
     emit_rewrite_plan(plan);
-    common::with_dirty_worktree_policy(dry, "spr absorb", dirty_worktree_policy, || {
-        if dry {
-            info!("Dry run complete. No local git state or GitHub state was changed.");
-            info!("Run `spr absorb` without `--dry-run` to apply the rewrite.");
-            info!("After inspecting the rewritten stack, run `spr update`.");
-            Ok(())
-        } else {
-            let (cur_branch, short) = common::get_current_branch_and_short()?;
-            let _backup_tag = common::create_backup_tag(dry, "absorb", &cur_branch, &short)?;
-            let (tmp_path, tmp_branch) =
-                common::create_temp_worktree(dry, "absorb", &plan.merge_base, &short)?;
-            for op in &plan.operations {
-                if let Err(err) = op.run(dry, &tmp_path) {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "absorb rewrite failed in temp worktree {} on branch {}",
-                            tmp_path, tmp_branch
-                        )
-                    });
-                }
+    common::with_dirty_worktree_policy(
+        dry,
+        "spr absorb",
+        dirty_worktree_policy,
+        |deferred_dirty_worktree_restore| {
+            if dry {
+                info!("Dry run complete. No local git state or GitHub state was changed.");
+                info!("Run `spr absorb` without `--dry-run` to apply the rewrite.");
+                info!("After inspecting the rewritten stack, run `spr update`.");
+                Ok(RewriteCommandOutcome::Completed)
+            } else {
+                let (cur_branch, short) = common::get_current_branch_and_short()?;
+                let original_head = git_rev_parse("HEAD")?;
+                let original_worktree_root = rewrite_resume::current_repo_root()?;
+                let resume_path = rewrite_resume::prepare_resume_path_for_new_session(
+                    dry,
+                    RewriteCommandKind::Absorb,
+                    &cur_branch,
+                    &original_head,
+                )?;
+                let backup_tag = common::create_backup_tag(dry, "absorb", &cur_branch, &short)?;
+                let (tmp_path, tmp_branch) =
+                    common::create_temp_worktree(dry, "absorb", &plan.merge_base, &short)?;
+                rewrite_resume::run_rewrite_session(
+                dry,
+                RewriteSession {
+                    command_kind: RewriteCommandKind::Absorb,
+                    conflict_policy: RewriteConflictPolicy::Suspend,
+                    original_worktree_root,
+                    original_branch: cur_branch,
+                    original_head,
+                    resume_path,
+                    temp_branch: tmp_branch,
+                    temp_worktree_path: tmp_path,
+                    backup_tag: Some(backup_tag),
+                    operations: plan.operations.clone(),
+                    deferred_dirty_worktree_restore,
+                    post_success_hint: Some(
+                        "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
+                            .to_string(),
+                    ),
+                },
+            )
             }
-            let new_tip = common::tip_of_tmp(&tmp_path)?;
-            info!(
-                "Updating current branch {} to new tip {} (absorbed branch tails)...",
-                cur_branch, new_tip
-            );
-            common::reset_current_branch_to(dry, &new_tip)?;
-            cleanup_temp_worktree_best_effort(dry, &tmp_path, &tmp_branch);
-            info!(
-                "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
-            );
-            Ok(())
-        }
-    })
+        },
+    )
 }
 
 fn emit_absorb_summary(plan: &RewritePlan) {
@@ -1059,6 +1064,9 @@ mod tests {
         SourceBranchRecord,
     };
     use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp};
+    use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
+    use crate::commands::RewriteCommandOutcome;
+    use crate::config::DirtyWorktreePolicy;
     use crate::parsing::{derive_local_groups_with_ignored, Group};
     use crate::test_support::{lock_cwd, DirGuard};
     use std::env;
@@ -1422,6 +1430,39 @@ mod tests {
             alpha_tip,
             beta_tip: Some(beta_tip),
             gamma_tip: Some(gamma_tip),
+        }
+    }
+
+    fn setup_absorb_conflict_stack() -> StackRepo {
+        let dir = init_repo();
+        let repo = dir.path().to_path_buf();
+        let base_branch = "main".to_string();
+        let stack_branch = "stack".to_string();
+        let prefix = "dank-spr/".to_string();
+        let ignore_tag = "ignore".to_string();
+
+        git(&repo, ["checkout", "-b", &stack_branch].as_slice());
+        let alpha_tip = commit_file(
+            &repo,
+            "story.txt",
+            "alpha-1\n",
+            "feat: alpha seed\n\npr:alpha",
+        );
+        let beta_tip = commit_file(&repo, "story.txt", "beta-1\n", "feat: beta seed\n\npr:beta");
+
+        git(&repo, ["branch", "dank-spr/alpha", &alpha_tip].as_slice());
+        git(&repo, ["branch", "dank-spr/beta", &beta_tip].as_slice());
+
+        StackRepo {
+            dir,
+            repo,
+            stack_branch,
+            base_branch,
+            prefix,
+            ignore_tag,
+            alpha_tip,
+            beta_tip: Some(beta_tip),
+            gamma_tip: None,
         }
     }
 
@@ -2287,6 +2328,75 @@ mod tests {
             branches_with_pattern(&repo.repo, "spr/tmp-absorb-*").is_empty(),
             "dry-run absorb should not leave temp absorb branches behind"
         );
+    }
+
+    #[test]
+    fn absorb_suspends_and_resumes_conflict() {
+        let _lock = lock_cwd();
+        let repo = setup_absorb_conflict_stack();
+        let _keep_dir_alive = repo.dir.path();
+        let _alpha_branch_tip = append_commit_to_branch(
+            &repo.repo,
+            "dank-spr/alpha",
+            "story.txt",
+            "alpha-1\nalpha-branch\n",
+            "feat: alpha branch tail",
+        );
+        git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
+
+        let outcome = {
+            let _guard = DirGuard::change_to(&repo.repo);
+            absorb_branch_tails(
+                &repo.base_branch,
+                &repo.prefix,
+                &repo.ignore_tag,
+                false,
+                DirtyWorktreePolicy::Halt,
+                default_absorb_options(),
+            )
+            .expect("absorb should suspend")
+        };
+        let resume_path = match outcome {
+            RewriteCommandOutcome::Completed => panic!("expected suspended absorb"),
+            RewriteCommandOutcome::Suspended(state) => state.resume_path.clone(),
+        };
+        let resume_state: RewriteResumeState =
+            serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
+                .expect("parse resume state");
+        fs::write(
+            Path::new(&resume_state.temp_worktree_path).join("story.txt"),
+            "alpha-1\nalpha-branch\nbeta-1\n",
+        )
+        .expect("resolve absorb conflict");
+        git(
+            Path::new(&resume_state.temp_worktree_path),
+            ["add", "story.txt"].as_slice(),
+        );
+
+        {
+            let _guard = DirGuard::change_to(&repo.repo);
+            let resumed = resume_rewrite(false, &resume_path).expect("resume absorb");
+            assert_eq!(resumed, RewriteCommandOutcome::Completed);
+        }
+
+        assert!(
+            !resume_path.exists(),
+            "successful absorb resume should delete the resume file"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.repo.join("story.txt")).expect("read final file"),
+            "alpha-1\nalpha-branch\nbeta-1\n"
+        );
+        let _guard = DirGuard::change_to(&repo.repo);
+        let (_merge_base, _leading_ignored, groups) =
+            derive_local_groups_with_ignored(&repo.base_branch, &repo.ignore_tag).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].commits.len(),
+            2,
+            "alpha should absorb its branch tail"
+        );
+        assert_eq!(groups[1].commits.len(), 1, "beta should remain one group");
     }
 
     #[test]
