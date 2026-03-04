@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{error::ErrorKind, Parser};
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 mod cli;
@@ -523,8 +524,77 @@ fn init_logging(verbose: bool, output_mode: OutputMode) {
     }
 }
 
+fn raw_args_request_json(args: &[OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg.as_os_str() == OsStr::new("--json"))
+}
+
+fn machine_command_for_raw_args(args: &[OsString]) -> crate::machine_output::MachineCommand {
+    let mut skip_value = false;
+    for arg in args.iter().skip(1) {
+        if skip_value {
+            skip_value = false;
+        } else if let Some(arg) = arg.to_str() {
+            if arg == "--cd"
+                || arg == "--base"
+                || arg == "--prefix"
+                || arg == "--until"
+                || arg == "--exact"
+                || arg == "-b"
+            {
+                skip_value = true;
+            } else if arg == "restack" {
+                return crate::machine_output::MachineCommand::Restack;
+            } else if arg == "absorb" {
+                return crate::machine_output::MachineCommand::Absorb;
+            } else if arg == "move" || arg == "mv" {
+                return crate::machine_output::MachineCommand::Move;
+            } else if arg == "fix-pr" || arg == "fix" {
+                return crate::machine_output::MachineCommand::FixPr;
+            } else if arg == "resume" {
+                return crate::machine_output::MachineCommand::Resume;
+            } else if arg == "land" {
+                return crate::machine_output::MachineCommand::Land;
+            } else if !arg.starts_with('-') {
+                return crate::machine_output::MachineCommand::Cli;
+            }
+        }
+    }
+    crate::machine_output::MachineCommand::Cli
+}
+
+fn parse_failure_as_machine_output(
+    args: &[OsString],
+    err: &clap::Error,
+) -> Option<crate::machine_output::MachineOutput> {
+    let is_display_only = matches!(
+        err.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    );
+    if raw_args_request_json(args) && !is_display_only {
+        Some(crate::machine_output::MachineOutput::error(
+            machine_command_for_raw_args(args),
+            err.to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
 fn main() {
-    let cli = crate::cli::Cli::parse();
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match crate::cli::Cli::try_parse_from(raw_args.clone()) {
+        Ok(cli) => cli,
+        Err(err) => {
+            if let Some(output) = parse_failure_as_machine_output(&raw_args, &err) {
+                println!("{}", serde_json::to_string(&output).unwrap());
+                std::process::exit(crate::machine_output::EXIT_FAILURE);
+            } else {
+                err.exit();
+            }
+        }
+    };
     let output_mode = if cli.cmd.json_mode() {
         OutputMode::Json
     } else {
@@ -571,10 +641,16 @@ fn machine_command_for_cli(cmd: &crate::cli::Cmd) -> crate::machine_output::Mach
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_working_directory_override, command_requires_gh, resolve_update_pr_limit};
+    use super::{
+        apply_working_directory_override, command_requires_gh, machine_command_for_raw_args,
+        parse_failure_as_machine_output, resolve_update_pr_limit,
+    };
+    use crate::machine_output::{MachineCommand, MachinePayload};
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, StableHandle};
     use crate::test_support::lock_cwd;
+    use clap::Parser;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -697,5 +773,64 @@ mod tests {
         let actual_root = PathBuf::from(crate::git::repo_root().unwrap().unwrap());
 
         assert_eq!(fs::canonicalize(actual_root).unwrap(), expected_root);
+    }
+
+    #[test]
+    fn machine_command_for_raw_args_skips_global_option_values() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("--cd"),
+            OsString::from("/tmp/repo"),
+            OsString::from("resume"),
+            OsString::from("--json"),
+            OsString::from("state.json"),
+        ];
+
+        assert_eq!(machine_command_for_raw_args(&args), MachineCommand::Resume);
+    }
+
+    #[test]
+    fn parse_failure_with_json_returns_machine_error() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("restack"),
+            OsString::from("--json"),
+        ];
+        let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
+        let output = parse_failure_as_machine_output(&args, &err)
+            .expect("json parse failure should serialize");
+
+        match output.payload {
+            MachinePayload::Error {
+                command,
+                ref message,
+            } => {
+                assert_eq!(command, MachineCommand::Restack);
+                assert!(message.contains("--after"));
+            }
+            other => panic!("unexpected parse-failure payload: {:?}", other),
+        }
+        assert_eq!(output.exit_code(), crate::machine_output::EXIT_FAILURE);
+    }
+
+    #[test]
+    fn parse_failure_without_json_stays_human() {
+        let args = vec![OsString::from("spr"), OsString::from("restack")];
+        let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
+
+        assert!(parse_failure_as_machine_output(&args, &err).is_none());
+    }
+
+    #[test]
+    fn help_request_with_json_stays_human() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("restack"),
+            OsString::from("--json"),
+            OsString::from("--help"),
+        ];
+        let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected help output");
+
+        assert!(parse_failure_as_machine_output(&args, &err).is_none());
     }
 }

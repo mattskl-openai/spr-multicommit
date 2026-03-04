@@ -17,6 +17,7 @@ pub const EXIT_SUSPENDED: i32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MachineCommand {
+    Cli,
     Restack,
     Absorb,
     Move,
@@ -96,26 +97,45 @@ impl MachineOutput {
         suspended: RewriteSuspendedState,
         post_success_hint: Option<String>,
     ) -> Self {
-        let resume_file = suspended.resume_path.display().to_string();
+        let RewriteSuspendedState {
+            command_kind,
+            original_worktree_root,
+            original_branch,
+            temp_branch,
+            temp_worktree_path,
+            resume_path,
+            paused_source_sha,
+            conflicted_paths,
+            post_success_hint: suspended_post_success_hint,
+        } = suspended;
+        let resume_file = resume_path.display().to_string();
+        let resume_argv = vec![
+            "spr".to_string(),
+            "--cd".to_string(),
+            original_worktree_root.clone(),
+            "resume".to_string(),
+            "--json".to_string(),
+            resume_file.clone(),
+        ];
         let post_success_hint = if let Some(post_success_hint) = post_success_hint {
             Some(post_success_hint)
         } else {
-            suspended.post_success_hint.clone()
+            suspended_post_success_hint
         };
         Self {
             schema_version: MACHINE_OUTPUT_SCHEMA_VERSION,
             payload: MachinePayload::Suspended {
                 details: Box::new(MachineSuspendedPayload {
                     command,
-                    rewrite_command_kind: suspended.command_kind.into(),
-                    original_worktree_root: suspended.original_worktree_root,
-                    original_branch: suspended.original_branch,
-                    temp_branch: suspended.temp_branch,
-                    temp_worktree: suspended.temp_worktree_path,
+                    rewrite_command_kind: command_kind.into(),
+                    original_worktree_root,
+                    original_branch,
+                    temp_branch,
+                    temp_worktree: temp_worktree_path,
                     resume_file: resume_file.clone(),
-                    resume_argv: vec!["spr".to_string(), "resume".to_string(), resume_file],
-                    paused_source_sha: suspended.paused_source_sha,
-                    conflicted_paths: suspended.conflicted_paths,
+                    resume_argv,
+                    paused_source_sha,
+                    conflicted_paths,
                     post_success_hint,
                 }),
             },
@@ -183,7 +203,10 @@ mod tests {
                     resume_argv,
                     vec![
                         "spr".to_string(),
+                        "--cd".to_string(),
+                        "/tmp/repo".to_string(),
                         "resume".to_string(),
+                        "--json".to_string(),
                         "/tmp/repo/.git/spr/resume/restack-stack-abc1234.json".to_string()
                     ]
                 );

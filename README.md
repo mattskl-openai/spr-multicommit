@@ -265,7 +265,7 @@ Machine-readable `--json` mode:
 - In `--json` mode, stdout is exactly one JSON object and stderr is normally empty
 - Exit codes are:
   - `0` for completed
-  - `1` for hard error
+  - `1` for hard error, including CLI parse failures when `--json` was requested
   - `2` for suspended rewrite awaiting conflict resolution
 - The suspended JSON payload includes the fields an agent needs to resolve and resume:
   - `original_worktree_root`
@@ -293,7 +293,10 @@ Example suspend payload:
   "resume_file": "/path/to/repo/.git/spr/resume/restack-stack-717b9d8.json",
   "resume_argv": [
     "spr",
+    "--cd",
+    "/path/to/repo",
     "resume",
+    "--json",
     "/path/to/repo/.git/spr/resume/restack-stack-717b9d8.json"
   ],
   "paused_source_sha": "717b9d83bcdbea33286496800c76e65c62f795ed",
