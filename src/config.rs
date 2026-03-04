@@ -37,6 +37,30 @@ impl Default for RestackConflictPolicy {
     }
 }
 
+/// Behavior when a branch-rewriting command sees local changes.
+///
+/// This applies to commands that rebuild the checked-out branch and then move
+/// it to a rewritten tip, such as `spr restack`, `spr move`, `spr fix-pr`, and
+/// `spr absorb`.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DirtyWorktreePolicy {
+    /// Preserve the historical behavior: proceed and let the rewrite replace
+    /// tracked changes in the checked-out worktree.
+    Discard,
+    /// Stash tracked, staged, and untracked changes before the rewrite, then
+    /// reapply them with `git stash apply --index`.
+    Stash,
+    /// Refuse to rewrite until the worktree is clean.
+    Halt,
+}
+
+impl Default for DirtyWorktreePolicy {
+    fn default() -> Self {
+        Self::Halt
+    }
+}
+
 /// Output ordering for list-style displays.
 ///
 /// The local stack order remains bottom-up and continues to define local PR numbers and
@@ -91,6 +115,13 @@ pub struct FileConfig {
     /// - `rollback` (default): abort and clean up temp restack state
     /// - `halt`: stop and leave the temp worktree for manual resolution
     pub restack_conflict: Option<RestackConflictPolicy>,
+    /// Behavior when a branch-rewriting command sees local changes.
+    ///
+    /// Supported values:
+    /// - `discard`: preserve current behavior and continue the rewrite
+    /// - `stash`: stash tracked, staged, and untracked changes and reapply them
+    /// - `halt`: refuse to rewrite until the worktree is clean
+    pub dirty_worktree: Option<DirtyWorktreePolicy>,
     /// Block `spr update` from recreating a PR when the same branch name had a recently merged
     /// or closed PR within this many days.
     ///
@@ -111,6 +142,8 @@ pub struct Config {
     pub list_order: ListOrder,
     /// Behavior when `spr restack` encounters a cherry-pick conflict.
     pub restack_conflict: RestackConflictPolicy,
+    /// Behavior when a branch-rewriting command sees local changes.
+    pub dirty_worktree: DirtyWorktreePolicy,
     /// Threshold in days for blocking `spr update` from recreating a PR on a branch name that
     /// already had a recently merged or closed PR.
     ///
@@ -139,6 +172,7 @@ fn default_config() -> Config {
         pr_description_mode: PrDescriptionMode::Overwrite,
         list_order: ListOrder::RecentOnTop,
         restack_conflict: RestackConflictPolicy::Rollback,
+        dirty_worktree: DirtyWorktreePolicy::Halt,
         branch_reuse_guard_days: 180,
     }
 }
@@ -165,6 +199,9 @@ fn apply_overrides(config: &Config, overrides: FileConfig) -> Config {
     }
     if let Some(restack_conflict) = overrides.restack_conflict {
         merged.restack_conflict = restack_conflict;
+    }
+    if let Some(dirty_worktree) = overrides.dirty_worktree {
+        merged.dirty_worktree = dirty_worktree;
     }
     if let Some(branch_reuse_guard_days) = overrides.branch_reuse_guard_days {
         merged.branch_reuse_guard_days = branch_reuse_guard_days;
@@ -207,7 +244,10 @@ pub fn load_config() -> Result<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_overrides, default_config, read_config_file, FileConfig, PrDescriptionMode};
+    use super::{
+        apply_overrides, default_config, read_config_file, DirtyWorktreePolicy, FileConfig,
+        PrDescriptionMode,
+    };
     use std::fs;
     use tempfile::tempdir;
 
@@ -259,6 +299,32 @@ overwrite_pr_description: false
     }
 
     #[test]
+    fn read_config_file_parses_dirty_worktree_policy() {
+        let dir = tempdir().expect("tempdir");
+        let mut path = dir.path().to_path_buf();
+        path.push(".spr_multicommit_cfg.yml");
+        fs::write(
+            &path,
+            r#"
+dirty_worktree: stash
+"#,
+        )
+        .expect("write config");
+
+        let cfg = read_config_file(&path)
+            .expect("parse config")
+            .expect("config exists");
+        assert_eq!(cfg.dirty_worktree, Some(DirtyWorktreePolicy::Stash));
+    }
+
+    #[test]
+    fn default_config_uses_halt_for_dirty_worktree_policy() {
+        let cfg = default_config();
+
+        assert_eq!(cfg.dirty_worktree, DirtyWorktreePolicy::Halt);
+    }
+
+    #[test]
     // Verifies: YAML config parsing accepts an integer value for branch_reuse_guard_days.
     // Catches: regressions where the new config key is rejected or parsed with the wrong type.
     fn read_config_file_parses_branch_reuse_guard_days_integer() {
@@ -286,6 +352,7 @@ overwrite_pr_description: false
                 pr_description_mode: None,
                 list_order: None,
                 restack_conflict: None,
+                dirty_worktree: None,
                 branch_reuse_guard_days: Some(30),
             },
         );

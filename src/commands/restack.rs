@@ -17,10 +17,18 @@ use tracing::{info, warn};
 
 use crate::commands::common;
 use crate::commands::common::CherryPickOp;
-use crate::config::RestackConflictPolicy;
+use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
 use crate::git::git_rw;
 use crate::parsing::{derive_local_groups_with_ignored, Group};
 use crate::selectors::{resolve_after_count, AfterSelector};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestackExecutionOptions {
+    safe: bool,
+    dry: bool,
+    conflict_policy: RestackConflictPolicy,
+    dirty_worktree_policy: DirtyWorktreePolicy,
+}
 
 fn cherry_pick_head_exists(tmp_path: &str) -> bool {
     Command::new("git")
@@ -159,76 +167,84 @@ fn restack_after_resolved(
     leading_ignored: Vec<String>,
     groups: Vec<Group>,
     after: usize,
-    safe: bool,
-    dry: bool,
-    conflict_policy: RestackConflictPolicy,
+    options: RestackExecutionOptions,
 ) -> Result<()> {
-    let (cur_branch, short) = common::get_current_branch_and_short()?;
     let after = std::cmp::min(after, groups.len());
     let kept_ignored_segments = build_kept_ignored_segments(leading_ignored, &groups, after);
-    let remaining = &groups[after..];
-    if remaining.is_empty() && kept_ignored_segments.is_empty() {
-        if safe {
-            let _ = common::create_backup_tag(dry, "restack", &cur_branch, &short)?;
-        }
-        info!(
-            "Skipping all {} PR(s); syncing current branch {} to {}",
-            groups.len(),
-            cur_branch,
-            base
-        );
-        common::reset_current_branch_to(dry, base)?;
-        Ok(())
-    } else {
-        let backup_tag = if safe {
-            Some(common::create_backup_tag(
-                dry,
-                "restack",
-                &cur_branch,
-                &short,
-            )?)
-        } else {
-            None
-        };
+    let remaining = groups[after..].to_vec();
 
-        let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "restack", base, &short)?;
-        let ops = build_cherry_pick_plan(&kept_ignored_segments, remaining);
-        for (idx, op) in ops.iter().enumerate() {
-            if let Err(err) = op.run(dry, &tmp_path) {
-                let conflict = cherry_pick_head_exists(&tmp_path);
-                if conflict && conflict_policy == RestackConflictPolicy::Halt {
-                    emit_halt_instructions(
+    common::with_dirty_worktree_policy(
+        options.dry,
+        "spr restack",
+        options.dirty_worktree_policy,
+        || {
+            let (cur_branch, short) = common::get_current_branch_and_short()?;
+            if remaining.is_empty() && kept_ignored_segments.is_empty() {
+                if options.safe {
+                    let _ = common::create_backup_tag(options.dry, "restack", &cur_branch, &short)?;
+                }
+                info!(
+                    "Skipping all {} PR(s); syncing current branch {} to {}",
+                    groups.len(),
+                    cur_branch,
+                    base
+                );
+                common::reset_current_branch_to(options.dry, base)?;
+                Ok(())
+            } else {
+                let backup_tag = if options.safe {
+                    Some(common::create_backup_tag(
+                        options.dry,
+                        "restack",
                         &cur_branch,
-                        backup_tag.as_deref(),
-                        base,
-                        &tmp_path,
-                        &tmp_branch,
-                        idx,
-                        &ops,
-                    );
-                    return Err(anyhow!(
-                        "restack halted due to conflict; resolve in temp worktree and continue manually"
-                    ));
+                        &short,
+                    )?)
+                } else {
+                    None
+                };
+
+                let (tmp_path, tmp_branch) =
+                    common::create_temp_worktree(options.dry, "restack", base, &short)?;
+                let ops = build_cherry_pick_plan(&kept_ignored_segments, &remaining);
+                for (idx, op) in ops.iter().enumerate() {
+                    if let Err(err) = op.run(options.dry, &tmp_path) {
+                        let conflict = cherry_pick_head_exists(&tmp_path);
+                        if conflict && options.conflict_policy == RestackConflictPolicy::Halt {
+                            emit_halt_instructions(
+                                &cur_branch,
+                                backup_tag.as_deref(),
+                                base,
+                                &tmp_path,
+                                &tmp_branch,
+                                idx,
+                                &ops,
+                            );
+                            return Err(anyhow!(
+                                "restack halted due to conflict; resolve in temp worktree and continue manually"
+                            ));
+                        }
+
+                        if conflict {
+                            abort_cherry_pick_best_effort(options.dry, &tmp_path);
+                        }
+                        cleanup_temp_worktree_best_effort(options.dry, &tmp_path, &tmp_branch);
+                        return Err(err)
+                            .context("restack failed; temp restack state was cleaned up");
+                    }
                 }
 
-                if conflict {
-                    abort_cherry_pick_best_effort(dry, &tmp_path);
-                }
-                cleanup_temp_worktree_best_effort(dry, &tmp_path, &tmp_branch);
-                return Err(err).context("restack failed; temp restack state was cleaned up");
+                let new_tip = common::tip_of_tmp(&tmp_path)?;
+                info!(
+                    "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
+                    after, cur_branch, base
+                );
+                common::reset_current_branch_to(options.dry, &new_tip)?;
+                cleanup_temp_worktree_best_effort(options.dry, &tmp_path, &tmp_branch);
+
+                Ok(())
             }
-        }
-
-        let new_tip = common::tip_of_tmp(&tmp_path)?;
-        info!(
-            "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
-            after, cur_branch, base
-        );
-        common::reset_current_branch_to(dry, &new_tip)?;
-        cleanup_temp_worktree_best_effort(dry, &tmp_path, &tmp_branch);
-
-        Ok(())
-    }
+        },
+    )
 }
 
 /// Restack the local stack by rebasing commits after the first `after` PRs onto `base`.
@@ -257,6 +273,7 @@ pub fn restack_after(
     safe: bool,
     dry: bool,
     conflict_policy: RestackConflictPolicy,
+    dirty_worktree_policy: DirtyWorktreePolicy,
 ) -> Result<()> {
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
@@ -272,9 +289,12 @@ pub fn restack_after(
             leading_ignored,
             groups,
             after,
-            safe,
-            dry,
-            conflict_policy,
+            RestackExecutionOptions {
+                safe,
+                dry,
+                conflict_policy,
+                dirty_worktree_policy,
+            },
         )
     }
 }
@@ -287,6 +307,7 @@ pub fn restack_after_count(
     safe: bool,
     dry: bool,
     conflict_policy: RestackConflictPolicy,
+    dirty_worktree_policy: DirtyWorktreePolicy,
 ) -> Result<()> {
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
@@ -300,9 +321,12 @@ pub fn restack_after_count(
             leading_ignored,
             groups,
             after,
-            safe,
-            dry,
-            conflict_policy,
+            RestackExecutionOptions {
+                safe,
+                dry,
+                conflict_policy,
+                dirty_worktree_policy,
+            },
         )
     }
 }
