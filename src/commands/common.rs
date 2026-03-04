@@ -26,6 +26,7 @@
 //! user; callers should not rely on them being immutable.
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -249,7 +250,7 @@ pub fn cherry_pick_range(
     last: &str,
     empty_policy: CherryPickEmptyPolicy,
 ) -> Result<()> {
-    let range = format!("{}^..{}", first, last);
+    let range = format!("{first}^..{last}");
     let args = cherry_pick_args(tmp_path, empty_policy, &[range.as_str()]);
     let _ = git_rw(dry, args.as_slice())?;
     Ok(())
@@ -272,11 +273,61 @@ pub fn cleanup_temp_worktree(dry: bool, tmp_path: &str, tmp_branch: &str) -> Res
     Ok(())
 }
 
+/// Deferred dirty-worktree restoration that can survive a suspended rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DeferredDirtyWorktreeRestore {
+    #[default]
+    Noop,
+    Stash {
+        stash_commit: String,
+    },
+}
+
+impl DeferredDirtyWorktreeRestore {
+    pub fn restore_after_success(
+        self,
+        dry: bool,
+        command_name: &str,
+        worktree_root: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Noop => Ok(()),
+            Self::Stash { stash_commit } => restore_stash_in_worktree(
+                dry,
+                command_name,
+                worktree_root,
+                &stash_commit,
+                RewriteOutcome::Succeeded,
+            ),
+        }
+    }
+
+    pub fn discard_instruction_lines(&self, worktree_root: &str) -> Vec<String> {
+        match self {
+            Self::Noop => Vec::new(),
+            Self::Stash { stash_commit } => vec![
+                "  # optional: restore the deferred auto-stash before deleting the resume file"
+                    .to_string(),
+                format!(
+                    "  git -C {} stash apply --index {}",
+                    worktree_root, stash_commit
+                ),
+                "  # optional: drop the matching stash entry from `git stash list` after recovery"
+                    .to_string(),
+            ],
+        }
+    }
+}
+
+pub trait DirtyWorktreeOutcome {
+    fn keeps_dirty_worktree_restore_deferred(&self) -> bool;
+}
+
 #[derive(Debug)]
 enum DirtyWorktreeRestore {
     Noop,
     PlannedStash,
-    Stashed { stash_ref: String },
+    Stashed { stash_commit: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,7 +399,6 @@ fn prepare_dirty_worktree(
         Ok(DirtyWorktreeRestore::PlannedStash)
     } else {
         let message = format!("spr auto-stash before {}", command_name);
-        let stash_ref = "stash@{0}".to_string();
         let _ = git_rw(
             false,
             [
@@ -360,13 +410,16 @@ fn prepare_dirty_worktree(
             ]
             .as_slice(),
         )?;
+        let stash_commit = git_ro(["rev-parse", "stash@{0}"].as_slice())?
+            .trim()
+            .to_string();
         let remaining = worktree_status_lines()?;
         if remaining.is_empty() {
             info!(
                 "Stashed local changes before {} because dirty_worktree=stash",
                 command_name
             );
-            Ok(DirtyWorktreeRestore::Stashed { stash_ref })
+            Ok(DirtyWorktreeRestore::Stashed { stash_commit })
         } else {
             bail!(
                 "{} stashed local changes but the worktree is still dirty:\n{}",
@@ -378,6 +431,15 @@ fn prepare_dirty_worktree(
 }
 
 impl DirtyWorktreeRestore {
+    fn deferred_restore(&self) -> DeferredDirtyWorktreeRestore {
+        match self {
+            Self::Noop | Self::PlannedStash => DeferredDirtyWorktreeRestore::Noop,
+            Self::Stashed { stash_commit } => DeferredDirtyWorktreeRestore::Stash {
+                stash_commit: stash_commit.clone(),
+            },
+        }
+    }
+
     fn restore(self, dry: bool, command_name: &str, outcome: RewriteOutcome) -> Result<()> {
         match self {
             Self::Noop => Ok(()),
@@ -390,34 +452,83 @@ impl DirtyWorktreeRestore {
                 }
                 Ok(())
             }
-            Self::Stashed { stash_ref } => {
-                let _ = git_rw(false, ["stash", "apply", "--index", &stash_ref].as_slice())
-                    .with_context(|| {
-                        format!(
-                            "{} {} but failed to restore stashed changes from {}; the stash entry was kept for manual recovery",
-                            command_name,
-                            outcome.verb(),
-                            stash_ref
-                        )
-                    })?;
-                if let Err(err) = git_rw(false, ["stash", "drop", &stash_ref].as_slice()) {
-                    warn!(
-                        "Restored stashed local changes after {}, but failed to drop {}: {}",
-                        command_name, stash_ref, err
-                    );
-                }
-                if dry {
-                    info!(
-                        "DRY-RUN: restored stashed local changes after {}",
-                        command_name
-                    );
-                } else {
-                    info!("Restored stashed local changes after {}", command_name);
-                }
-                Ok(())
+            Self::Stashed { stash_commit } => {
+                restore_stash_in_worktree(dry, command_name, ".", &stash_commit, outcome)
             }
         }
     }
+}
+
+fn restore_stash_in_worktree(
+    dry: bool,
+    command_name: &str,
+    worktree_root: &str,
+    stash_commit: &str,
+    outcome: RewriteOutcome,
+) -> Result<()> {
+    let _ = git_rw(
+        false,
+        [
+            "-C",
+            worktree_root,
+            "stash",
+            "apply",
+            "--index",
+            stash_commit,
+        ]
+        .as_slice(),
+    )
+    .with_context(|| {
+        format!(
+            "{} {} but failed to restore stashed changes from {}; the stash entry was kept for manual recovery",
+            command_name,
+            outcome.verb(),
+            stash_commit
+        )
+    })?;
+    match stash_ref_for_commit_in_worktree(worktree_root, stash_commit)? {
+        Some(stash_ref) => {
+            if let Err(err) = git_rw(
+                false,
+                ["-C", worktree_root, "stash", "drop", &stash_ref].as_slice(),
+            ) {
+                warn!(
+                    "Restored stashed local changes after {}, but failed to drop {}: {}",
+                    command_name, stash_ref, err
+                );
+            }
+        }
+        None => {
+            warn!(
+                "Restored stashed local changes after {}, but could not find a live stash ref for {}; leaving any matching stash entry in place",
+                command_name, stash_commit
+            );
+        }
+    }
+    if dry {
+        info!(
+            "DRY-RUN: restored stashed local changes after {}",
+            command_name
+        );
+    } else {
+        info!("Restored stashed local changes after {}", command_name);
+    }
+    Ok(())
+}
+
+fn stash_ref_for_commit_in_worktree(
+    worktree_root: &str,
+    stash_commit: &str,
+) -> Result<Option<String>> {
+    let out = git_ro(["-C", worktree_root, "stash", "list", "--format=%H%x00%gd"].as_slice())?;
+    Ok(out.lines().find_map(|line| {
+        let (sha, stash_ref) = line.split_once('\0')?;
+        if sha.trim() == stash_commit {
+            Some(stash_ref.trim().to_string())
+        } else {
+            None
+        }
+    }))
 }
 
 /// Run a branch rewrite under the configured dirty-worktree policy.
@@ -431,16 +542,25 @@ pub fn with_dirty_worktree_policy<T, F>(
     rewrite: F,
 ) -> Result<T>
 where
-    F: FnOnce() -> Result<T>,
+    T: DirtyWorktreeOutcome,
+    F: FnOnce(DeferredDirtyWorktreeRestore) -> Result<T>,
 {
     let restore = prepare_dirty_worktree(dry, command_name, policy)?;
-    let rewrite_result = rewrite();
-    let outcome = if rewrite_result.is_ok() {
-        RewriteOutcome::Succeeded
+    let deferred_restore = restore.deferred_restore();
+    let rewrite_result = rewrite(deferred_restore);
+    let restore_result = if rewrite_result
+        .as_ref()
+        .is_ok_and(DirtyWorktreeOutcome::keeps_dirty_worktree_restore_deferred)
+    {
+        Ok(())
     } else {
-        RewriteOutcome::Failed
+        let outcome = if rewrite_result.is_ok() {
+            RewriteOutcome::Succeeded
+        } else {
+            RewriteOutcome::Failed
+        };
+        restore.restore(dry, command_name, outcome)
     };
-    let restore_result = restore.restore(dry, command_name, outcome);
 
     match (rewrite_result, restore_result) {
         (Ok(value), Ok(())) => Ok(value),
@@ -460,7 +580,7 @@ where
 /// `Range` represents an inclusive `first^..last` cherry-pick over a contiguous
 /// commit interval. Callers must supply commits that already reflect the
 /// intended replay order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CherryPickEmptyPolicy {
     /// Stop when a replay becomes empty because earlier history already applied it.
     StopOnEmpty,
@@ -512,47 +632,6 @@ impl CherryPickOp {
             }
         } else {
             None
-        }
-    }
-
-    /// Executes the operation in the temp worktree at `tmp_path`.
-    pub fn run(&self, dry: bool, tmp_path: &str) -> Result<()> {
-        match self {
-            Self::Commit { sha, empty_policy } => {
-                cherry_pick_commit(dry, tmp_path, sha, *empty_policy)
-            }
-            Self::Range {
-                first,
-                last,
-                empty_policy,
-            } => cherry_pick_range(dry, tmp_path, first, last, *empty_policy),
-        }
-    }
-
-    /// Renders the matching `git cherry-pick` command for human continuation.
-    pub fn command_for_user(&self, tmp_path: &str) -> String {
-        match self {
-            Self::Commit { sha, empty_policy } => {
-                if *empty_policy == CherryPickEmptyPolicy::KeepRedundantCommits {
-                    format!("git -C {} cherry-pick --empty=keep {}", tmp_path, sha)
-                } else {
-                    format!("git -C {} cherry-pick {}", tmp_path, sha)
-                }
-            }
-            Self::Range {
-                first,
-                last,
-                empty_policy,
-            } => {
-                if *empty_policy == CherryPickEmptyPolicy::KeepRedundantCommits {
-                    format!(
-                        "git -C {} cherry-pick --empty=keep {}^..{}",
-                        tmp_path, first, last
-                    )
-                } else {
-                    format!("git -C {} cherry-pick {}^..{}", tmp_path, first, last)
-                }
-            }
         }
     }
 }
