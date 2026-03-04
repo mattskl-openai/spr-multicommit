@@ -3,7 +3,7 @@
 //! Configuration is loaded from `$HOME/.spr_multicommit_cfg.yml` and then
 //! overridden by `<repo-root>/.spr_multicommit_cfg.yml` when present.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
 use serde::Deserialize;
 use std::fs;
@@ -151,6 +151,19 @@ pub struct Config {
     pub branch_reuse_guard_days: u32,
 }
 
+/// Normalize a configured branch prefix and reject values outside the ASCII-only conflict domain.
+pub fn normalize_prefix(prefix: &str) -> Result<String> {
+    let mut normalized = prefix.trim_end_matches('/').to_string();
+    if !normalized.is_ascii() {
+        return Err(anyhow!(
+            "Branch prefix must be ASCII because synthetic branch conflict checks only support ASCII prefixes: {:?}",
+            prefix
+        ));
+    }
+    normalized.push('/');
+    Ok(normalized)
+}
+
 fn read_config_file(path: &PathBuf) -> Result<Option<FileConfig>> {
     if !path.exists() {
         return Ok(None);
@@ -209,13 +222,12 @@ fn apply_overrides(config: &Config, overrides: FileConfig) -> Config {
     merged
 }
 
-fn normalize_config(config: &mut Config) {
-    let mut prefix = config.prefix.trim_end_matches('/').to_string();
-    prefix.push('/');
-    config.prefix = prefix;
+fn normalize_config(config: &mut Config) -> Result<()> {
+    config.prefix = normalize_prefix(&config.prefix)?;
     if config.ignore_tag.trim().is_empty() {
         config.ignore_tag = "ignore".to_string();
     }
+    Ok(())
 }
 
 pub fn load_config() -> Result<Config> {
@@ -238,15 +250,15 @@ pub fn load_config() -> Result<Config> {
         }
     }
 
-    normalize_config(&mut merged);
+    normalize_config(&mut merged)?;
     Ok(merged)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_overrides, default_config, read_config_file, DirtyWorktreePolicy, FileConfig,
-        PrDescriptionMode, RestackConflictPolicy,
+        apply_overrides, default_config, normalize_config, normalize_prefix, read_config_file,
+        DirtyWorktreePolicy, FileConfig, PrDescriptionMode, RestackConflictPolicy,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -384,5 +396,23 @@ restack_conflict: rollback
         );
 
         assert_eq!(merged.branch_reuse_guard_days, 30);
+    }
+
+    #[test]
+    fn normalize_config_rejects_non_ascii_prefix() {
+        let mut cfg = default_config();
+        cfg.prefix = "dank-spr/".to_string();
+        normalize_config(&mut cfg).unwrap();
+
+        cfg.prefix = "dänk-spr".to_string();
+        let err = normalize_config(&mut cfg).unwrap_err();
+
+        assert!(err.to_string().contains("Branch prefix must be ASCII"));
+    }
+
+    #[test]
+    fn normalize_prefix_adds_one_trailing_slash() {
+        assert_eq!(normalize_prefix("dank-spr").unwrap(), "dank-spr/");
+        assert_eq!(normalize_prefix("dank-spr/").unwrap(), "dank-spr/");
     }
 }

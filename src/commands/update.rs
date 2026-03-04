@@ -5,6 +5,9 @@ use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tracing::{info, warn};
 
+use crate::branch_names::{
+    canonical_branch_conflict_key, group_branch_identities, CanonicalBranchConflictKey,
+};
 use crate::commands::common;
 use crate::config::{ListOrder, PrDescriptionMode};
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
@@ -83,6 +86,28 @@ fn terminal_pr_action(state: TerminalPrState) -> &'static str {
     }
 }
 
+fn head_key(head: &str) -> CanonicalBranchConflictKey {
+    canonical_branch_conflict_key(head)
+}
+
+fn heads_without_open_prs(
+    heads: &[String],
+    prs_by_head: &HashMap<CanonicalBranchConflictKey, u64>,
+) -> Vec<String> {
+    heads
+        .iter()
+        .filter(|head| !prs_by_head.contains_key(&head_key(head)))
+        .cloned()
+        .collect()
+}
+
+fn pr_number_for_head(
+    prs_by_head: &HashMap<CanonicalBranchConflictKey, u64>,
+    head: &str,
+) -> Option<u64> {
+    prs_by_head.get(&head_key(head)).copied()
+}
+
 /// Fail `spr update` early when branch-name reuse matches a recently closed or merged PR.
 ///
 /// The guard only runs when PR creation is enabled, the CLI override is not set, and the
@@ -99,16 +124,12 @@ fn enforce_branch_reuse_guard(
     allow_branch_reuse: bool,
     branch_reuse_guard_days: u32,
     heads: &[String],
-    prs_by_head: &HashMap<String, u64>,
+    prs_by_head: &HashMap<CanonicalBranchConflictKey, u64>,
 ) -> Result<()> {
     if no_pr || allow_branch_reuse || branch_reuse_guard_days == 0 {
         Ok(())
     } else {
-        let heads_without_open_prs: Vec<String> = heads
-            .iter()
-            .filter(|head| !prs_by_head.contains_key(head.as_str()))
-            .cloned()
-            .collect();
+        let heads_without_open_prs = heads_without_open_prs(heads, prs_by_head);
         if heads_without_open_prs.is_empty() {
             Ok(())
         } else {
@@ -335,21 +356,21 @@ pub fn build_from_groups(
         return Ok(());
     }
     let total_groups = groups.len();
+    let branch_identities = group_branch_identities(&groups, prefix)?;
 
     info!("Preparing {} group(s)…", groups.len());
 
     // Build bottom→top and collect PR refs for the visual update pass.
     let mut just_created_numbers: Vec<u64> = vec![];
-    // Prefetch open PRs to reduce per-branch lookups
-    let heads: Vec<String> = groups
+    let heads: Vec<String> = branch_identities
         .iter()
-        .map(|g| format!("{}{}", prefix, g.tag))
+        .map(|identity| identity.exact.clone())
         .collect();
     let pr_list = list_open_prs_for_heads(&heads)?;
-    let mut prs_by_head: HashMap<String, u64> = HashMap::new();
+    let mut prs_by_head: HashMap<CanonicalBranchConflictKey, u64> = HashMap::new();
     let mut current_base_by_number: HashMap<u64, String> = HashMap::new();
     for p in pr_list {
-        prs_by_head.insert(p.head.clone(), p.number);
+        prs_by_head.insert(head_key(&p.head), p.number);
         current_base_by_number.insert(p.number, p.base);
     }
     enforce_branch_reuse_guard(
@@ -362,10 +383,7 @@ pub fn build_from_groups(
     // Allow force-push within the selected scope when branch diverged from remote
 
     // Batch fetch remote SHAs for all target branches
-    let mut branch_names: Vec<String> = groups
-        .iter()
-        .map(|g| format!("{}{}", prefix, g.tag))
-        .collect();
+    let mut branch_names = heads.clone();
     // Ensure we also include the repository base branch for remote SHA comparisons
     let base_ref_for_remote = sanitize_gh_base_ref(base);
     if !branch_names.contains(&base_ref_for_remote) {
@@ -390,7 +408,7 @@ pub fn build_from_groups(
     let display_indices = list_order.display_indices(groups.len());
     for (display_idx, group_idx) in display_indices.iter().enumerate() {
         let g = &groups[*group_idx];
-        let branch = format!("{}{}", prefix, g.tag);
+        let branch = branch_identities[*group_idx].exact.clone();
         info!(
             "({}/{}) Rebuilding branch {}",
             display_idx + 1,
@@ -430,18 +448,17 @@ pub fn build_from_groups(
         // Gather existing PR numbers and head branches in the local stack order (bottom→top)
         let mut numbers_full_pre: Vec<u64> = vec![];
         let mut head_by_number_pre: HashMap<u64, String> = HashMap::new();
-        for g in &groups {
-            let head_branch = format!("{}{}", prefix, g.tag);
-            if let Some(&n) = prs_by_head.get(&head_branch) {
+        for identity in &branch_identities {
+            if let Some(n) = pr_number_for_head(&prs_by_head, &identity.exact) {
                 numbers_full_pre.push(n);
-                head_by_number_pre.insert(n, head_branch.clone());
+                head_by_number_pre.insert(n, identity.exact.clone());
             }
         }
         if !numbers_full_pre.is_empty() {
             // Compute desired chained base per existing PR using local groups
             let mut desired_base_by_number_pre: HashMap<u64, String> = HashMap::new();
-            for (head, want_base) in common::build_head_base_chain(base, &groups, prefix) {
-                if let Some(&num) = prs_by_head.get(&head) {
+            for (head, want_base) in common::build_head_base_chain(base, &groups, prefix)? {
+                if let Some(num) = pr_number_for_head(&prs_by_head, &head) {
                     desired_base_by_number_pre.insert(num, want_base.clone());
                 }
             }
@@ -572,10 +589,10 @@ pub fn build_from_groups(
 
     // After pushes, (create or) update PRs
     let mut parent_branch = base.to_string();
-    for g in groups.iter() {
-        let branch = format!("{}{}", prefix, g.tag);
+    for (g, identity) in groups.iter().zip(branch_identities.iter()) {
+        let branch = identity.exact.clone();
         if !no_pr {
-            let was_known = prs_by_head.contains_key(&branch);
+            let was_known = prs_by_head.contains_key(&identity.conflict_key);
             let num = upsert_pr_cached(
                 &branch,
                 &sanitize_gh_base_ref(&parent_branch),
@@ -594,9 +611,8 @@ pub fn build_from_groups(
     if !no_pr {
         // Derive full stack order purely from local groups (bottom→top)
         let mut numbers_full: Vec<u64> = vec![];
-        for g in &groups {
-            let head_branch = format!("{}{}", prefix, g.tag);
-            if let Some(&n) = prs_by_head.get(&head_branch) {
+        for identity in &branch_identities {
+            if let Some(n) = pr_number_for_head(&prs_by_head, &identity.exact) {
                 numbers_full.push(n);
             }
         }
@@ -604,15 +620,16 @@ pub fn build_from_groups(
         let mut desired_stack_by_number: HashMap<u64, String> = HashMap::new();
         let mut base_body_by_number: HashMap<u64, String> = HashMap::new();
         let mut desired_base_by_number: HashMap<u64, String> = HashMap::new();
-        let chain = common::build_head_base_chain(base, &groups, prefix);
+        let chain = common::build_head_base_chain(base, &groups, prefix)?;
         let numbers_rev: Vec<u64> = numbers_full.iter().cloned().rev().collect();
         for (head_branch, want_base_ref) in chain {
-            if let Some(&num) = prs_by_head.get(&head_branch) {
+            if let Some(num) = pr_number_for_head(&prs_by_head, &head_branch) {
                 desired_base_by_number.insert(num, want_base_ref.clone());
                 // Stack visual (optional rewrite)
-                if let Some(g) = groups
+                if let Some((g, _identity)) = groups
                     .iter()
-                    .find(|g| format!("{}{}", prefix, g.tag) == head_branch)
+                    .zip(branch_identities.iter())
+                    .find(|(_group, identity)| identity.exact == head_branch)
                 {
                     let base = g.pr_body_base()?;
                     base_body_by_number.insert(num, base);
@@ -720,8 +737,8 @@ pub fn build_from_groups(
         let display_indices = list_order.display_indices(groups.len());
         for group_idx in display_indices {
             let g = &groups[group_idx];
-            let head_branch = format!("{}{}", prefix, g.tag);
-            if let Some(&n) = prs_by_head.get(&head_branch) {
+            let head_branch = &branch_identities[group_idx].exact;
+            if let Some(n) = pr_number_for_head(&prs_by_head, head_branch) {
                 // Use local group title (source of truth for desired title)
                 let title = g.pr_title().unwrap_or_else(|_| String::new());
                 ordered.push((n, title));
@@ -760,6 +777,7 @@ pub fn build_from_tags(
     let (_merge_base, leading_ignored, groups): (String, Vec<String>, Vec<Group>) =
         derive_groups_between_with_ignored(base, from, ignore_tag)?;
     let (groups, skipped_handles) = split_groups_for_update(&leading_ignored, groups);
+    group_branch_identities(&groups, prefix)?;
     build_from_groups(
         base,
         prefix,
@@ -778,10 +796,15 @@ pub fn build_from_tags(
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_reuse_guard_window, ignored_boundary_warning, parse_github_timestamp_rfc3339,
+        branch_reuse_guard_window, build_from_groups, head_key, heads_without_open_prs,
+        ignored_boundary_warning, parse_github_timestamp_rfc3339, pr_number_for_head,
         recent_pr_age, recent_pr_age_blocks_recreation, terminal_pr_action,
     };
+    use crate::branch_names::group_branch_identities;
+    use crate::config::{ListOrder, PrDescriptionMode};
     use crate::github::TerminalPrState;
+    use crate::parsing::{split_groups_for_update, Group};
+    use std::collections::HashMap;
     use time::{Duration as TimeDuration, OffsetDateTime};
 
     fn fixed_now() -> OffsetDateTime {
@@ -852,11 +875,58 @@ mod tests {
     }
 
     #[test]
+    fn heads_without_open_prs_treats_case_only_open_head_as_present() {
+        let mut prs_by_head = HashMap::new();
+        prs_by_head.insert(head_key("dank-spr/Alpha"), 17);
+
+        let missing = heads_without_open_prs(&["dank-spr/alpha".to_string()], &prs_by_head);
+
+        assert!(missing.is_empty());
+        assert_eq!(pr_number_for_head(&prs_by_head, "dank-spr/alpha"), Some(17));
+    }
+
+    #[test]
     // Verifies: the guard error wording distinguishes merged and closed terminal PR events.
     // Catches: regressions where closed PR blocks still claim the branch was merged.
     fn terminal_pr_action_describes_terminal_state() {
         assert_eq!(terminal_pr_action(TerminalPrState::Merged), "merged");
         assert_eq!(terminal_pr_action(TerminalPrState::Closed), "closed");
+    }
+
+    fn group(tag: &str) -> Group {
+        Group {
+            tag: tag.to_string(),
+            subjects: vec![format!("feat: {tag}")],
+            commits: vec![format!("{tag}1")],
+            first_message: Some(format!("feat: {tag} pr:{tag}")),
+            ignored_after: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ignored_only_suffix_collision_does_not_block_empty_publishable_prefix() {
+        let groups = vec![group("alpha"), group("Alpha")];
+
+        assert!(group_branch_identities(&groups, "dank-spr/").is_err());
+
+        let (pushable_groups, skipped_handles) =
+            split_groups_for_update(&["ignored".to_string()], groups);
+        group_branch_identities(&pushable_groups, "dank-spr/").unwrap();
+
+        build_from_groups(
+            "main",
+            "dank-spr/",
+            &skipped_handles,
+            false,
+            false,
+            PrDescriptionMode::Overwrite,
+            None,
+            pushable_groups,
+            ListOrder::RecentOnTop,
+            false,
+            180,
+        )
+        .unwrap();
     }
 
     #[test]

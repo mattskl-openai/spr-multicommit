@@ -14,6 +14,7 @@ use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
+use crate::branch_names::{group_branch_identities, synthetic_branch_name};
 use crate::commands::common::{self, CherryPickEmptyPolicy, CherryPickOp};
 use crate::commands::rewrite_resume::{
     self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
@@ -410,6 +411,7 @@ fn build_plan_for_current_stack(
             },
         ))
     } else {
+        group_branch_identities(&groups, prefix)?;
         let stack_head = git_rev_parse("HEAD")?;
         let preliminary_group_plans = groups
             .into_iter()
@@ -482,7 +484,7 @@ fn classify_source_branch_preliminary(
     stack_merge_base: &str,
     stack_head: &str,
 ) -> Result<PreliminarySourceBranchRecord> {
-    let branch_name = format!("{}{}", prefix, group.tag);
+    let branch_name = synthetic_branch_name(prefix, &group.tag);
     let stack_prefix = build_stack_prefix(group, stack_merge_base)?;
     let group_tip = stack_prefix
         .commits

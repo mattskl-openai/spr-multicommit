@@ -28,10 +28,10 @@ pub enum PrepSelection {
 
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub enum ListWhat {
-    /// List PRs in the stack (order via list_order config)
+    /// List PRs in the stack (halts early if live groups derive case-colliding synthetic branch names)
     #[command(alias = "p")]
     Pr,
-    /// List commits in the stack (order via list_order config)
+    /// List commits in the stack (halts early if live groups derive case-colliding synthetic branch names)
     #[command(alias = "c")]
     Commit,
 }
@@ -62,7 +62,8 @@ pub enum Cmd {
         pr_description_mode: Option<crate::config::PrDescriptionMode>,
 
         /// Bypass the recent branch-name reuse guard and allow creating a new PR even when the
-        /// same branch name had a recently closed or merged PR.
+        /// same synthetic branch name, including case-only variants, had a recently closed or
+        /// merged PR.
         #[arg(long)]
         allow_branch_reuse: bool,
 
@@ -103,7 +104,7 @@ pub enum Cmd {
         json: bool,
     },
 
-    /// Prepare PRs for landing (e.g., squash)
+    /// Prepare PRs for landing (e.g., squash) and halt early on case-colliding synthetic branch names
     Prep {
         // selection is provided via global --until/--exact flags
     },
@@ -122,20 +123,20 @@ pub enum Cmd {
         json: bool,
     },
 
-    /// List entities
+    /// List entities and halt early on case-colliding synthetic branch names
     #[command(alias = "ls")]
     List {
         #[command(subcommand)]
         what: ListWhat,
     },
 
-    /// Status overview (alias for `list pr`)
+    /// Status overview (alias for `list pr`) with the same early synthetic branch-collision guard
     #[command(alias = "stat")]
     Status {
         // no options; uses global flags
     },
 
-    /// Land PRs (merge variants)
+    /// Land PRs (merge variants) and halt early on case-colliding synthetic branch names
     Land {
         // Target PR index is provided via global --until. For `flatten`, 0 means the top PR. For `per-pr`, 0 means all
         #[command(subcommand)]
@@ -151,7 +152,7 @@ pub enum Cmd {
         json: bool,
     },
 
-    /// Relink PR stack to match local commit stack
+    /// Relink PR stack to match local commit stack and halt early on case-colliding synthetic branch names
     RelinkPrs {
         // dry-run is provided via global --dry-run
     },
@@ -178,7 +179,7 @@ pub enum Cmd {
         json: bool,
     },
 
-    /// Reorder local PR groups by moving one or a range to come after a target PR
+    /// Reorder local PR groups by moving one or a range to come after a target PR, halting early on case-colliding synthetic branch names
     #[command(alias = "mv")]
     Move {
         /// Position or range to move: `A`, `A..B`, `label`, `pr:<label>`, `a..b`, or `pr:<a>..pr:<b>`
@@ -288,7 +289,6 @@ mod tests {
         assert!(long_about.contains(
             "Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same."
         ));
-        assert!(long_about.contains("skip (rewritten-equivalent prefix)"));
         assert!(long_about.contains("spr resume <path>"));
         assert!(long_about.contains("skip (rewritten-equivalent prefix)"));
     }
