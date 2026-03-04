@@ -126,12 +126,19 @@ Precedence for defaults:
 Global flags
 ------------
 
- - `--base, -b <BRANCH>`: root base branch (default from config)
+- `--cd <PATH>`: change to `PATH` before loading repo config or running git/gh commands
+- `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
 - `--dry-run` (alias: `--dr`): print state-changing commands instead of executing
 - `--until <N|0|label|pr:<label>>`: target range used by `prep` and `land` (`0` means all)
 - `--exact <I|label|pr:<label>>`: used by `prep` to select exactly one PR group
 - `--verbose`: enable verbose logging of underlying git/gh commands
+
+Example:
+
+```bash
+spr --cd /path/to/repo status
+```
 
 Commands
 --------

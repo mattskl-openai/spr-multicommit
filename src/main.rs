@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use std::path::Path;
 
 mod cli;
 mod commands;
@@ -83,6 +84,15 @@ fn set_dry_run_env(dry_run: bool, assume_existing_prs: bool) {
     }
 }
 
+/// Change to the requested working directory before config discovery or repo-scoped commands.
+fn apply_working_directory_override(path: Option<&Path>) -> Result<()> {
+    if let Some(path) = path {
+        std::env::set_current_dir(path)
+            .with_context(|| format!("failed to change directory to {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Resolve the base branch, branch prefix, and ignore tag with explicit precedence.
 ///
 /// Base resolution follows: CLI `--base` → merged config `base` → discovery
@@ -117,6 +127,7 @@ fn resolve_base_prefix(
 
 fn main() -> Result<()> {
     let cli = crate::cli::Cli::parse();
+    apply_working_directory_override(cli.cd.as_deref())?;
     if cli.verbose {
         tracing_subscriber::fmt()
             .with_env_filter("info")
@@ -355,9 +366,32 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_requires_gh, resolve_update_pr_limit};
+    use super::{apply_working_directory_override, command_requires_gh, resolve_update_pr_limit};
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, StableHandle};
+    use crate::test_support::lock_cwd;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn capture() -> Self {
+            Self {
+                original: std::env::current_dir().unwrap(),
+            }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).unwrap();
+        }
+    }
 
     fn group(tag: &str) -> Group {
         Group {
@@ -424,5 +458,30 @@ mod tests {
     #[test]
     fn status_still_requires_github_cli() {
         assert!(command_requires_gh(&crate::cli::Cmd::Status {}));
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let status = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+        dir
+    }
+
+    #[test]
+    fn working_directory_override_changes_repo_context() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_repo();
+
+        apply_working_directory_override(Some(repo.path())).unwrap();
+        let expected_root = fs::canonicalize(repo.path()).unwrap();
+        let actual_root = PathBuf::from(crate::git::repo_root().unwrap().unwrap());
+
+        assert_eq!(fs::canonicalize(actual_root).unwrap(), expected_root);
     }
 }
