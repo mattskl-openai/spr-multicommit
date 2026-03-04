@@ -72,6 +72,9 @@ pub enum Cmd {
     },
 
     /// Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base
+    #[command(
+        long_about = "Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base.\n\nWhen `restack_conflict` is `halt`, `spr restack` leaves the temp rewrite worktree in place on conflict, writes a resume file under the repository common Git directory, and prints `spr resume <path>`. Resolve conflicts in that temp worktree, stage the resolution, and hand control back to `spr` with the printed resume command.\n\nWhen `restack_conflict` is `rollback`, `spr restack` preserves the historical cleanup-on-conflict behavior and removes the temp rewrite state instead."
+    )]
     Restack {
         /// Keep groups through this selector in place and rebuild only the groups above it
         #[arg(long, value_name = "N|0|bottom|top|last|all|label|pr:<label>")]
@@ -80,6 +83,10 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rebasing
         #[arg(long)]
         safe: bool,
+
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch
@@ -90,11 +97,29 @@ pub enum Cmd {
         /// Allow replayed duplicates and keep both copies when the later replay is non-seed
         #[arg(long)]
         allow_replayed_duplicates: bool,
+
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// Prepare PRs for landing (e.g., squash)
     Prep {
         // selection is provided via global --until/--exact flags
+    },
+
+    /// Resume a suspended local rewrite from a resume-state file
+    #[command(
+        long_about = "Resume a suspended local rewrite from a resume-state file.\n\nRun `spr resume <path>` with the exact path printed by `spr restack`, `spr absorb`, `spr move`, or `spr fix-pr` after a cherry-pick conflict. The supported workflow is: resolve the conflict in the printed temp rewrite worktree, stage the resolution, and then run the printed `spr resume <path>` command from any worktree in the same repository.\n\nThe resume file lives under the repository common Git directory, usually `.git/spr/resume/`. `spr resume` tolerates one accidental manual `git cherry-pick --continue` for the paused step, but broader manual replay edits are rejected."
+    )]
+    Resume {
+        /// Explicit path to the suspended rewrite's resume-state JSON file
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// List entities
@@ -121,6 +146,9 @@ pub enum Cmd {
         /// Skip automatic restack after landing (default: restack remaining commits with `--after N`)
         #[arg(long = "no-restack")]
         no_restack: bool,
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// Relink PR stack to match local commit stack
@@ -145,6 +173,9 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
 
     /// Reorder local PR groups by moving one or a range to come after a target PR
@@ -158,7 +189,29 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
     },
+}
+
+impl Cmd {
+    pub fn json_mode(&self) -> bool {
+        match self {
+            Self::Restack { json, .. }
+            | Self::Absorb { json, .. }
+            | Self::Resume { json, .. }
+            | Self::Land { json, .. }
+            | Self::FixPr { json, .. }
+            | Self::Move { json, .. } => *json,
+            Self::Update { .. }
+            | Self::Prep {}
+            | Self::List { .. }
+            | Self::Status {}
+            | Self::RelinkPrs {}
+            | Self::Cleanup {} => false,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -214,6 +267,7 @@ mod tests {
         match cli.cmd {
             Cmd::Absorb {
                 allow_replayed_duplicates,
+                json: _,
             } => assert!(allow_replayed_duplicates),
             other => panic!("unexpected command: {:?}", other),
         }
@@ -235,6 +289,50 @@ mod tests {
             "Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same."
         ));
         assert!(long_about.contains("skip (rewritten-equivalent prefix)"));
+        assert!(long_about.contains("spr resume <path>"));
+        assert!(long_about.contains("skip (rewritten-equivalent prefix)"));
+    }
+
+    #[test]
+    fn resume_command_parses_explicit_path() {
+        let cli = Cli::try_parse_from([
+            "spr",
+            "resume",
+            "--json",
+            ".git/spr/resume/restack-example.json",
+        ])
+        .unwrap();
+
+        match cli.cmd {
+            Cmd::Resume { path, json } => {
+                assert_eq!(path, PathBuf::from(".git/spr/resume/restack-example.json"));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resume_help_text_mentions_supported_workflow() {
+        let mut cli = Cli::command();
+        let resume = cli.find_subcommand_mut("resume").unwrap();
+        let long_about = resume.get_long_about().unwrap().to_string();
+
+        assert!(long_about.contains("resolve the conflict"));
+        assert!(long_about.contains("spr resume <path>"));
+        assert!(long_about.contains("common Git directory"));
+    }
+
+    #[test]
+    fn rewrite_commands_report_json_mode() {
+        let restack = Cli::try_parse_from(["spr", "restack", "--after", "1", "--json"]).unwrap();
+        assert!(restack.cmd.json_mode());
+
+        let land = Cli::try_parse_from(["spr", "land", "--json"]).unwrap();
+        assert!(land.cmd.json_mode());
+
+        let list = Cli::try_parse_from(["spr", "list", "pr"]).unwrap();
+        assert!(!list.cmd.json_mode());
     }
 
     #[test]
