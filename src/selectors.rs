@@ -437,6 +437,22 @@ mod tests {
     }
 
     #[test]
+    fn stable_handle_resolution_remains_exact_case() {
+        let groups = groups(&["Alpha"]);
+        let selector = GroupSelector::Stable(StableHandle {
+            tag: "alpha".to_string(),
+        });
+
+        let err = resolve_group_index(&groups, &selector).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("No outstanding PR group matches stable handle `pr:alpha`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn resolution_helpers_map_boundaries_to_counts() {
         let groups = groups(&["alpha", "beta", "gamma"]);
 

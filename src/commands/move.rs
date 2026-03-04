@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use tracing::info;
 
+use crate::branch_names::{group_branch_identities, synthetic_branch_name};
 use crate::commands::common;
 use crate::commands::common::CherryPickOp;
 use crate::commands::rewrite_resume::{
@@ -95,7 +96,7 @@ fn enforce_bottom_pr_automerge_guard(
 ) -> Result<()> {
     if changes_stack_bottom(new_order) {
         let bottom_group = &groups[0];
-        let bottom_head = format!("{}{}", prefix, bottom_group.tag);
+        let bottom_head = synthetic_branch_name(prefix, &bottom_group.tag);
         if let Some(bottom_pr) = get_open_pr_automerge_for_head(&bottom_head)? {
             if should_block_for_bottom_pr_automerge(bottom_pr.auto_merge_enabled, new_order) {
                 Err(anyhow!(
@@ -141,6 +142,7 @@ pub fn move_groups_after(
         info!("No local PR groups found; nothing to move.");
         return Ok(RewriteCommandOutcome::Completed);
     }
+    group_branch_identities(&groups, prefix)?;
 
     let (a, b, c) = resolve_move_targets(&groups, range, after)?;
     if a == 0 || b == 0 || a > n || b > n {
@@ -261,16 +263,44 @@ pub fn move_groups_after(
 
 #[cfg(test)]
 mod tests {
-    use super::{changes_stack_bottom, resolve_move_targets, should_block_for_bottom_pr_automerge};
+    use super::{
+        changes_stack_bottom, enforce_bottom_pr_automerge_guard, resolve_move_targets,
+        should_block_for_bottom_pr_automerge,
+    };
     use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
     use crate::commands::{move_groups_after, MoveExecutionOptions, RewriteCommandOutcome};
     use crate::config::DirtyWorktreePolicy;
     use crate::parsing::Group;
     use crate::selectors::{AfterSelector, GroupRangeSelector, GroupSelector, StableHandle};
     use crate::test_support::{commit_file, git, lock_cwd, log_subjects, write_file, DirGuard};
+    use std::env;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: String) -> Self {
+            let original = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                env::set_var(self.key, value);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
 
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
@@ -332,6 +362,45 @@ mod tests {
         commit_file(repo, "story.txt", "beta-1\n", "feat: beta pr:beta");
         commit_file(repo, "story.txt", "gamma-1\n", "feat: gamma pr:gamma");
         dir
+    }
+
+    fn install_gh_wrapper(script_body: &str) -> (TempDir, EnvVarGuard) {
+        let wrapper_dir = tempfile::tempdir().unwrap();
+        let script_path = wrapper_dir.path().join("gh");
+        fs::write(&script_path, script_body).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let original_path = env::var("PATH").unwrap_or_default();
+        let path_guard = EnvVarGuard::set(
+            "PATH",
+            format!("{}:{}", wrapper_dir.path().display(), original_path),
+        );
+
+        (wrapper_dir, path_guard)
+    }
+
+    #[test]
+    fn bottom_pr_automerge_guard_rejects_case_variant_remote_head() {
+        let _lock = lock_cwd();
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("gh.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"number\":17,\"headRefName\":\"dank-spr/Alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}}]'\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            log_path.display(),
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+
+        let err =
+            enforce_bottom_pr_automerge_guard("dank-spr/", &groups(&["alpha", "beta"]), &[2, 1])
+                .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Exact headRefName matches are required here"));
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("pr list --state open --search head:dank-spr/"));
     }
 
     #[test]
