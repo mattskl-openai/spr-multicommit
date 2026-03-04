@@ -5,7 +5,9 @@
 //! skippable, or blocking. When one or more groups have append-only local
 //! branch tails, the command rebuilds the checked-out stack branch from its
 //! current merge-base and inserts those tails immediately after their owning
-//! group's real commits and before any trailing ignored block.
+//! group's real commits and before any trailing ignored block. Rewritten local
+//! per-PR branches that are patch-equivalent to the canonical stack prefix are
+//! treated as unchanged instead of as divergence.
 
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
@@ -29,10 +31,12 @@ use crate::parsing::{derive_local_groups_with_ignored, Group};
 /// `prefix + tag` is considered for each group. Missing branches and branches
 /// that are unchanged or behind the stack are no-op states. Divergence, source
 /// branches that incorporated later stack commits, merge commits, and embedded
-/// `pr:<tag>` markers in absorbed tails are blocking errors. By default absorb
-/// also refuses to absorb a tail commit whose patch is already owned by a
-/// later stack commit that would still be replayed after this group's
-/// insertion point.
+/// `pr:<tag>` markers in absorbed tails are blocking errors. A local branch
+/// whose canonical stack prefix was rewritten to patch-equivalent commits is
+/// still acceptable: absorb matches that rewritten-equivalent prefix and then
+/// classifies only the unmatched tail. By default absorb also refuses to
+/// absorb a tail commit whose patch is already owned by a later stack commit
+/// that would still be replayed after this group's insertion point.
 pub fn absorb_branch_tails(
     base: &str,
     prefix: &str,
@@ -142,6 +146,12 @@ enum AbsorbPlanValidation {
 struct GroupRewritePlan {
     group: Group,
     source: SourceBranchRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StackPrefix {
+    commits: Vec<String>,
+    group_start_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,7 +366,14 @@ fn build_plan_for_current_stack(
             .into_iter()
             .zip(later_owned_patch_maps)
             .map(|(group, later_owned_patches)| {
-                build_group_rewrite_plan(group, prefix, &stack_head, &later_owned_patches, options)
+                build_group_rewrite_plan(
+                    group,
+                    prefix,
+                    &merge_base,
+                    &stack_head,
+                    &later_owned_patches,
+                    options,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let operations = build_rewrite_operations(&leading_ignored, &group_plans);
@@ -375,11 +392,19 @@ fn build_plan_for_current_stack(
 fn build_group_rewrite_plan(
     group: Group,
     prefix: &str,
+    stack_merge_base: &str,
     stack_head: &str,
     later_owned_patches: &LaterOwnedPatchMap,
     options: AbsorbOptions,
 ) -> Result<GroupRewritePlan> {
-    let source = classify_source_branch(&group, prefix, stack_head, later_owned_patches, options)?;
+    let source = classify_source_branch(
+        &group,
+        prefix,
+        stack_merge_base,
+        stack_head,
+        later_owned_patches,
+        options,
+    )?;
     Ok(GroupRewritePlan { group, source })
 }
 
@@ -402,12 +427,14 @@ fn validate_absorb_plan(plan: &RewritePlan) -> AbsorbPlanValidation {
 fn classify_source_branch(
     group: &Group,
     prefix: &str,
+    stack_merge_base: &str,
     stack_head: &str,
     later_owned_patches: &LaterOwnedPatchMap,
     options: AbsorbOptions,
 ) -> Result<SourceBranchRecord> {
     let branch_name = format!("{}{}", prefix, group.tag);
-    let group_tip = group
+    let stack_prefix = build_stack_prefix(group, stack_merge_base)?;
+    let group_tip = stack_prefix
         .commits
         .last()
         .cloned()
@@ -418,9 +445,7 @@ fn classify_source_branch(
             AbsorbClassification::Skip(AbsorbSkipReason::Unchanged)
         } else if git_is_ancestor(source_tip, &group_tip)? {
             AbsorbClassification::Skip(AbsorbSkipReason::BranchBehindStack)
-        } else if !git_is_ancestor(&group_tip, source_tip)? {
-            AbsorbClassification::Blocked(AbsorbBlocker::Diverged)
-        } else {
+        } else if git_is_ancestor(&group_tip, source_tip)? {
             let merge_base = git_merge_base(source_tip, stack_head)?;
             if merge_base != group_tip {
                 AbsorbClassification::Blocked(AbsorbBlocker::MergeBaseMismatch { merge_base })
@@ -428,6 +453,14 @@ fn classify_source_branch(
                 let tail = git_rev_list_range(&group_tip, source_tip)?;
                 classify_absorbed_tail(&tail, later_owned_patches, options)?
             }
+        } else {
+            classify_rewritten_equivalent_source_branch(
+                &stack_prefix,
+                source_tip,
+                stack_merge_base,
+                later_owned_patches,
+                options,
+            )?
         }
     } else {
         AbsorbClassification::Skip(AbsorbSkipReason::MissingBranch)
@@ -439,6 +472,82 @@ fn classify_source_branch(
         source_tip,
         classification,
     })
+}
+
+fn build_stack_prefix(group: &Group, stack_merge_base: &str) -> Result<StackPrefix> {
+    let group_tip = group
+        .commits
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow!("Group {} has no commits", group.tag))?;
+    let commits = git_rev_list_range(stack_merge_base, &group_tip)?;
+    let group_start_index = commits
+        .len()
+        .checked_sub(group.commits.len())
+        .ok_or_else(|| anyhow!("Group {} stack prefix is shorter than the group", group.tag))?;
+    Ok(StackPrefix {
+        commits,
+        group_start_index,
+    })
+}
+
+fn classify_rewritten_equivalent_source_branch(
+    stack_prefix: &StackPrefix,
+    source_tip: &str,
+    stack_merge_base: &str,
+    later_owned_patches: &LaterOwnedPatchMap,
+    options: AbsorbOptions,
+) -> Result<AbsorbClassification> {
+    let source_commits = git_rev_list_range(stack_merge_base, source_tip)?;
+    let patch_ids = git_patch_ids_for_commits(
+        &stack_prefix
+            .commits
+            .iter()
+            .chain(source_commits.iter())
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
+    let stack_patch_ids = patch_id_sequence(&stack_prefix.commits, &patch_ids)?;
+    let source_patch_ids = patch_id_sequence(&source_commits, &patch_ids)?;
+    let matched = common_patch_prefix_len(&stack_patch_ids, &source_patch_ids);
+    if source_commits.len() == matched {
+        if matched < stack_prefix.group_start_index {
+            Ok(AbsorbClassification::Blocked(AbsorbBlocker::Diverged))
+        } else if stack_prefix.commits.len() == matched {
+            Ok(AbsorbClassification::Skip(AbsorbSkipReason::Unchanged))
+        } else {
+            Ok(AbsorbClassification::Skip(
+                AbsorbSkipReason::BranchBehindStack,
+            ))
+        }
+    } else if matched != stack_prefix.commits.len() {
+        Ok(AbsorbClassification::Blocked(AbsorbBlocker::Diverged))
+    } else {
+        let tail = source_commits.into_iter().skip(matched).collect::<Vec<_>>();
+        classify_absorbed_tail(&tail, later_owned_patches, options)
+    }
+}
+
+fn patch_id_sequence(
+    commits: &[String],
+    patch_ids: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    commits
+        .iter()
+        .map(|sha| {
+            patch_ids
+                .get(sha)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing patch id for {}", sha))
+        })
+        .collect()
+}
+
+fn common_patch_prefix_len(left: &[String], right: &[String]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left_patch, right_patch)| left_patch == right_patch)
+        .count()
 }
 
 fn classify_absorbed_tail(
@@ -917,6 +1026,44 @@ mod tests {
             .collect()
     }
 
+    fn commit_range(repo: &Path, from_exclusive: &str, to_inclusive: &str) -> Vec<String> {
+        let range = format!("{from_exclusive}..{to_inclusive}");
+        git(repo, ["rev-list", "--reverse", &range].as_slice())
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn rewrite_stack_branch_equivalently(repo: &StackRepo) {
+        let commits = commit_range(&repo.repo, &repo.base_branch, &repo.stack_branch);
+        git(
+            &repo.repo,
+            ["checkout", "-b", "rewrite-copy", &repo.base_branch].as_slice(),
+        );
+        for commit in &commits {
+            git(
+                &repo.repo,
+                [
+                    "-c",
+                    "user.name=Rewrite Stack",
+                    "-c",
+                    "user.email=rewrite@example.com",
+                    "cherry-pick",
+                    commit,
+                ]
+                .as_slice(),
+            );
+        }
+        git(
+            &repo.repo,
+            ["branch", "-f", &repo.stack_branch, "HEAD"].as_slice(),
+        );
+        git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
+        git(&repo.repo, ["branch", "-D", "rewrite-copy"].as_slice());
+    }
+
     fn setup_single_group_stack(create_alpha_branch: bool) -> StackRepo {
         let dir = init_repo();
         let repo = dir.path().to_path_buf();
@@ -1134,12 +1281,13 @@ mod tests {
 
     fn classify_alpha(repo: &StackRepo, options: AbsorbOptions) -> AbsorbClassification {
         let _guard = DirGuard::change_to(&repo.repo);
-        let (_merge_base, _leading_ignored, groups) =
+        let (merge_base, _leading_ignored, groups) =
             derive_local_groups_with_ignored(&repo.base_branch, &repo.ignore_tag).unwrap();
         let later_owned_patch_maps = build_later_owned_patch_maps(&groups).unwrap();
         let plan = build_group_rewrite_plan(
             groups[0].clone(),
             &repo.prefix,
+            &merge_base,
             &rev_parse(&repo.repo, "HEAD"),
             &later_owned_patch_maps[0],
             options,
@@ -1189,6 +1337,42 @@ mod tests {
             classify_alpha(&repo, default_absorb_options()),
             AbsorbClassification::Skip(AbsorbSkipReason::BranchBehindStack)
         );
+    }
+
+    #[test]
+    fn classify_patch_equivalent_rewritten_source_branch_as_skip() {
+        let _lock = lock_cwd();
+        let repo = setup_single_group_stack(true);
+        let _keep_dir_alive = repo.dir.path();
+        rewrite_stack_branch_equivalently(&repo);
+
+        assert_eq!(
+            classify_alpha(&repo, default_absorb_options()),
+            AbsorbClassification::Skip(AbsorbSkipReason::Unchanged)
+        );
+    }
+
+    #[test]
+    fn classify_patch_equivalent_rewritten_source_branch_with_tail_as_absorbable() {
+        let _lock = lock_cwd();
+        let repo = setup_single_group_stack(true);
+        let _keep_dir_alive = repo.dir.path();
+        rewrite_stack_branch_equivalently(&repo);
+        git(&repo.repo, ["checkout", "dank-spr/alpha"].as_slice());
+        let tail_sha = commit_file(
+            &repo.repo,
+            "alpha-branch.txt",
+            "alpha-branch\n",
+            "feat: alpha branch tail",
+        );
+        git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
+
+        match classify_alpha(&repo, default_absorb_options()) {
+            AbsorbClassification::Absorbable(tail) => {
+                assert_eq!(tail.commits, vec![tail_sha]);
+            }
+            other => panic!("unexpected classification: {:?}", other),
+        }
     }
 
     #[test]
@@ -1524,6 +1708,39 @@ mod tests {
         assert!(
             tags_with_pattern(&repo.repo, "backup/absorb/*").is_empty(),
             "blocked absorb should not create a backup tag"
+        );
+    }
+
+    #[test]
+    fn absorb_skips_patch_equivalent_rewritten_branch_without_rewrite() {
+        let _lock = lock_cwd();
+        let repo = setup_single_group_stack(true);
+        let _keep_dir_alive = repo.dir.path();
+        rewrite_stack_branch_equivalently(&repo);
+        let original_head = rev_parse(&repo.repo, "HEAD");
+
+        let result = {
+            let _guard = DirGuard::change_to(&repo.repo);
+            absorb_branch_tails(
+                &repo.base_branch,
+                &repo.prefix,
+                &repo.ignore_tag,
+                false,
+                crate::config::DirtyWorktreePolicy::Discard,
+                default_absorb_options(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(result, RewriteCommandOutcome::Completed);
+        assert_eq!(
+            rev_parse(&repo.repo, "HEAD"),
+            original_head,
+            "patch-equivalent stale branches should not rewrite HEAD"
+        );
+        assert!(
+            tags_with_pattern(&repo.repo, "backup/absorb/*").is_empty(),
+            "no-op absorb should not create a backup tag"
         );
     }
 

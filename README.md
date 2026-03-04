@@ -214,7 +214,7 @@ Behavior:
 
 - If you append commits to the end of a local PR branch such as `user-spr/alpha`, `spr absorb` rebuilds the local stack so the new commits become part of the matching PR group while preserving PR-group order
 - Inspects only exact local branches named `prefix + tag`
-- Skips missing branches, unchanged branches, and branches that are behind the current stack
+- Skips missing branches, branches whose canonical stack prefix is already patch-equivalent to the current stack, and branches that are behind the current stack
 - Refuses to guess through divergence, source branches that incorporated later stack commits, merge commits, or absorbed commits that contain `pr:<tag>` markers
 - By default, also blocks copied later stack commits whose original replay would otherwise become empty or ambiguous
 - `--allow-replayed-duplicates` overrides that copied-commit blocker for safe cases by absorbing the copied commit and keeping its later non-seed replay in the rebuilt stack
