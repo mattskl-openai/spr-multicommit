@@ -5,7 +5,12 @@ use std::collections::HashSet;
 use tracing::info;
 
 use crate::commands::common;
+use crate::commands::common::CherryPickOp;
+use crate::commands::rewrite_resume::{
+    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
+};
 use crate::config::DirtyWorktreePolicy;
+use crate::git::git_rev_parse;
 use crate::git::git_ro;
 use crate::parsing::derive_local_groups_with_ignored;
 use crate::selectors::{resolve_group_ordinal, GroupSelector};
@@ -15,6 +20,20 @@ fn resolve_fix_pr_target(
     target: &GroupSelector,
 ) -> Result<usize> {
     resolve_group_ordinal(groups, target)
+}
+
+fn build_fix_pr_operations(
+    all_commits: &[String],
+    top_commits: &[String],
+    insert_pos: usize,
+) -> Vec<CherryPickOp> {
+    let mut operations = Vec::new();
+    operations.extend(CherryPickOp::from_commits(&all_commits[..=insert_pos]));
+    operations.extend(CherryPickOp::from_commits(top_commits));
+    if insert_pos + 1 < all_commits.len() {
+        operations.extend(CherryPickOp::from_commits(&all_commits[insert_pos + 1..]));
+    }
+    operations
 }
 
 /// Move the last `tail_count` commits (top-of-stack) to become the tail of PR `n` (1-based, bottom→top).
@@ -35,16 +54,16 @@ pub fn fix_pr_tail(
     safe: bool,
     dry: bool,
     dirty_worktree_policy: DirtyWorktreePolicy,
-) -> Result<()> {
+) -> Result<RewriteCommandOutcome> {
     if tail_count == 0 {
-        return Ok(());
+        return Ok(RewriteCommandOutcome::Completed);
     }
 
     let (merge_base, leading_ignored, groups) = derive_local_groups_with_ignored(base, ignore_tag)?;
     let total_groups = groups.len();
     if total_groups == 0 {
         info!("No local PR groups found; nothing to fix.");
-        return Ok(());
+        return Ok(RewriteCommandOutcome::Completed);
     }
 
     let target_n = resolve_fix_pr_target(&groups, target)?;
@@ -58,7 +77,7 @@ pub fn fix_pr_tail(
     }
     if all_commits.is_empty() {
         info!("No commits found; nothing to fix.");
-        return Ok(());
+        return Ok(RewriteCommandOutcome::Completed);
     }
 
     // Determine top M commits (trim if M > total)
@@ -126,46 +145,53 @@ pub fn fix_pr_tail(
         .position(|sha| sha == &last_of_n)
         .ok_or_else(|| anyhow!("Could not locate last commit of PR {} in stream", target_n))?;
 
-    // Build new order: remainder with top commits inserted after PR N's tail
-    let mut new_order: Vec<String> = Vec::with_capacity(all_commits.len() + top_commits.len());
-    new_order.extend(all_commits[..=insert_pos].iter().cloned());
-    new_order.extend(top_commits.iter().cloned());
-    if insert_pos + 1 < all_commits.len() {
-        new_order.extend(all_commits[insert_pos + 1..].iter().cloned());
-    }
-
     common::with_dirty_worktree_policy(dry, "spr fix-pr", dirty_worktree_policy, || {
         let (cur_branch, short) = common::get_current_branch_and_short()?;
-        if safe {
-            let _ = common::create_backup_tag(dry, "fix-pr", &cur_branch, &short)?;
-        }
+        let original_head = git_rev_parse("HEAD")?;
+        let original_worktree_root = rewrite_resume::current_repo_root()?;
+        let backup_tag = if safe {
+            Some(common::create_backup_tag(
+                dry,
+                "fix-pr",
+                &cur_branch,
+                &short,
+            )?)
+        } else {
+            None
+        };
 
         let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "fix", &merge_base, &short)?;
-
-        for sha in &new_order {
-            common::cherry_pick_commit(
-                dry,
-                &tmp_path,
-                sha,
-                common::CherryPickEmptyPolicy::StopOnEmpty,
-            )?;
-        }
-
-        let new_tip = common::tip_of_tmp(&tmp_path)?;
-        info!(
-            "Updating current branch {} to new tip {} (fix-pr applied)…",
-            cur_branch, new_tip
-        );
-        common::reset_current_branch_to(dry, &new_tip)?;
-        common::cleanup_temp_worktree(dry, &tmp_path, &tmp_branch)?;
-
-        Ok(())
+        let steps = rewrite_resume::build_replay_steps(&build_fix_pr_operations(
+            &all_commits,
+            &top_commits,
+            insert_pos,
+        ))?;
+        rewrite_resume::run_rewrite_session(
+            dry,
+            RewriteSession {
+                command_kind: RewriteCommandKind::FixPr,
+                conflict_policy: RewriteConflictPolicy::Suspend,
+                original_worktree_root,
+                original_branch: cur_branch,
+                original_head,
+                temp_branch: tmp_branch,
+                temp_worktree_path: tmp_path,
+                backup_tag,
+                steps,
+                post_success_hint: Some(
+                    "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
+                        .to_string(),
+                ),
+            },
+        )
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{fix_pr_tail, resolve_fix_pr_target};
+    use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
+    use crate::commands::RewriteCommandOutcome;
     use crate::config::DirtyWorktreePolicy;
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, StableHandle};
@@ -244,6 +270,28 @@ mod tests {
         git(repo, ["add", "review.txt"].as_slice());
         git(repo, ["commit", "-m", "fix review comment"].as_slice());
 
+        dir
+    }
+
+    fn init_fix_pr_conflict_repo() -> TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = dir.path();
+        git(repo, ["init", "-b", "main"].as_slice());
+        git(repo, ["config", "user.email", "spr@example.com"].as_slice());
+        git(repo, ["config", "user.name", "SPR Tests"].as_slice());
+        fs::write(repo.join("story.txt"), "base\n").expect("write base");
+        git(repo, ["add", "story.txt"].as_slice());
+        git(repo, ["commit", "-m", "init"].as_slice());
+        git(repo, ["checkout", "-b", "stack"].as_slice());
+        fs::write(repo.join("story.txt"), "alpha-1\n").expect("write alpha");
+        git(repo, ["add", "story.txt"].as_slice());
+        git(repo, ["commit", "-m", "feat: alpha pr:alpha"].as_slice());
+        fs::write(repo.join("story.txt"), "beta-1\n").expect("write beta");
+        git(repo, ["add", "story.txt"].as_slice());
+        git(repo, ["commit", "-m", "feat: beta pr:beta"].as_slice());
+        fs::write(repo.join("story.txt"), "review-fix\n").expect("write review");
+        git(repo, ["add", "story.txt"].as_slice());
+        git(repo, ["commit", "-m", "fix review comment"].as_slice());
         dir
     }
 
@@ -394,6 +442,69 @@ mod tests {
             fs::read_to_string(repo.join("scratch.txt")).expect("read scratch"),
             "scratch local\n",
             "halt policy should leave untracked files untouched"
+        );
+    }
+
+    #[test]
+    fn fix_pr_suspends_and_resumes_conflict() {
+        let _lock = lock_cwd();
+        let dir = init_fix_pr_conflict_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let outcome = fix_pr_tail(
+            "main",
+            "ignore",
+            &GroupSelector::LocalPr(1),
+            1,
+            false,
+            false,
+            DirtyWorktreePolicy::Halt,
+        )
+        .expect("fix-pr should suspend");
+        let mut current = outcome;
+        let mut last_resume_path = None;
+        while let RewriteCommandOutcome::Suspended { resume_path } = current {
+            let resume_state: RewriteResumeState =
+                serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
+                    .expect("parse resume state");
+            let resolved_contents = if resume_state.suspended_step_index == 1 {
+                "review-fix\n"
+            } else {
+                "review-fix\nbeta-1\n"
+            };
+            fs::write(
+                Path::new(&resume_state.temp_worktree_path).join("story.txt"),
+                resolved_contents,
+            )
+            .expect("resolve fix-pr conflict");
+            git(
+                Path::new(&resume_state.temp_worktree_path),
+                ["add", "story.txt"].as_slice(),
+            );
+            last_resume_path = Some(resume_path.clone());
+            current = resume_rewrite(false, &resume_path).expect("resume fix-pr");
+        }
+
+        assert_eq!(current, RewriteCommandOutcome::Completed);
+        if let Some(resume_path) = last_resume_path {
+            assert!(
+                !resume_path.exists(),
+                "successful fix-pr resume should delete the resume file"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(repo.join("story.txt")).expect("read final file"),
+            "review-fix\nbeta-1\n"
+        );
+        assert_eq!(
+            log_subjects(&repo),
+            vec![
+                "feat: beta pr:beta".to_string(),
+                "fix review comment".to_string(),
+                "feat: alpha pr:alpha".to_string(),
+                "init".to_string(),
+            ]
         );
     }
 }

@@ -72,6 +72,9 @@ pub enum Cmd {
     },
 
     /// Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base
+    #[command(
+        long_about = "Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base.\n\nWhen `restack_conflict` is `halt`, `spr restack` leaves the temp rewrite worktree in place on conflict, writes a resume file under the repository common Git directory, and prints `spr resume <path>`. Resolve conflicts in that temp worktree, stage the resolution, and hand control back to `spr` with the printed resume command.\n\nWhen `restack_conflict` is `rollback`, `spr restack` preserves the historical cleanup-on-conflict behavior and removes the temp rewrite state instead."
+    )]
     Restack {
         /// Keep groups through this selector in place and rebuild only the groups above it
         #[arg(long, value_name = "N|0|bottom|top|last|all|label|pr:<label>")]
@@ -84,7 +87,7 @@ pub enum Cmd {
 
     /// Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch
     #[command(
-        long_about = "Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.\n\nIf you append commits to the end of a local PR branch such as `user-spr/alpha`, run `spr absorb` while the stack branch is checked out. `spr` rebuilds the local stack so the new commits become part of the matching PR group. The PR-group order stays the same.\n\nThis command is local-only: it rewrites the current stack branch, creates a backup tag, and does not update GitHub. After checking the result, run `spr update`.\n\nOnly exact local branches named `prefix + tag` are considered.\n\nExample:\n- The current stack has three PR groups: `pr:alpha`, `pr:beta`, and `pr:gamma`.\n- Check out `user-spr/alpha` and append 2 commits.\n- Check out the stack branch.\n- Run `spr absorb`.\n- Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same.\n- Then run `spr update`.\n\nAdvanced:\n- By default, absorb blocks copied later commits when replaying the stack would become empty or ambiguous.\n- `--allow-replayed-duplicates` allows an earlier copied non-seed follow-up commit to coexist with its later replayed copy by keeping both commits in the rewritten stack."
+        long_about = "Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.\n\nIf you append commits to the end of a local PR branch such as `user-spr/alpha`, run `spr absorb` while the stack branch is checked out. `spr` rebuilds the local stack so the new commits become part of the matching PR group. The PR-group order stays the same.\n\nThis command is local-only: it rewrites the current stack branch, creates a backup tag, and does not update GitHub. After checking the result, run `spr update`.\n\nOnly exact local branches named `prefix + tag` are considered.\n\nExample:\n- The current stack has three PR groups: `pr:alpha`, `pr:beta`, and `pr:gamma`.\n- Check out `user-spr/alpha` and append 2 commits.\n- Check out the stack branch.\n- Run `spr absorb`.\n- Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same.\n- Then run `spr update`.\n\nOn cherry-pick conflict, `spr absorb` leaves the temp rewrite worktree in place, writes a resume file under the repository common Git directory, and prints `spr resume <path>`. Resolve conflicts in that temp worktree, stage the resolution, and run the printed resume command.\n\nAdvanced:\n- By default, absorb blocks copied later commits when replaying the stack would become empty or ambiguous.\n- `--allow-replayed-duplicates` allows an earlier copied non-seed follow-up commit to coexist with its later replayed copy by keeping both commits in the rewritten stack."
     )]
     Absorb {
         /// Allow replayed duplicates and keep both copies when the later replay is non-seed
@@ -95,6 +98,16 @@ pub enum Cmd {
     /// Prepare PRs for landing (e.g., squash)
     Prep {
         // selection is provided via global --until/--exact flags
+    },
+
+    /// Resume a suspended local rewrite from a resume-state file
+    #[command(
+        long_about = "Resume a suspended local rewrite from a resume-state file.\n\nRun `spr resume <path>` with the exact path printed by `spr restack`, `spr absorb`, `spr move`, or `spr fix-pr` after a cherry-pick conflict. The supported workflow is: resolve the conflict in the printed temp rewrite worktree, stage the resolution, and then run the printed `spr resume <path>` command from any worktree in the same repository.\n\nThe resume file lives under the repository common Git directory, usually `.git/spr/resume/`. `spr resume` tolerates one accidental manual `git cherry-pick --continue` for the paused step, but broader manual replay edits are rejected."
+    )]
+    Resume {
+        /// Explicit path to the suspended rewrite's resume-state JSON file
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
     },
 
     /// List entities
@@ -234,6 +247,31 @@ mod tests {
         assert!(long_about.contains(
             "Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same."
         ));
+        assert!(long_about.contains("spr resume <path>"));
+    }
+
+    #[test]
+    fn resume_command_parses_explicit_path() {
+        let cli =
+            Cli::try_parse_from(["spr", "resume", ".git/spr/resume/restack-example.json"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Resume { path } => {
+                assert_eq!(path, PathBuf::from(".git/spr/resume/restack-example.json"));
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resume_help_text_mentions_supported_workflow() {
+        let mut cli = Cli::command();
+        let resume = cli.find_subcommand_mut("resume").unwrap();
+        let long_about = resume.get_long_about().unwrap().to_string();
+
+        assert!(long_about.contains("resolve the conflict"));
+        assert!(long_about.contains("spr resume <path>"));
+        assert!(long_about.contains("common Git directory"));
     }
 
     #[test]

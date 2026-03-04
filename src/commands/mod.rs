@@ -8,6 +8,7 @@ pub mod r#move;
 pub mod prep;
 pub mod relink_prs;
 pub mod restack;
+pub mod rewrite_resume;
 pub mod update;
 
 pub use absorb::{absorb_branch_tails, AbsorbOptions, CopiedLaterStackCommitPolicy};
@@ -20,4 +21,5 @@ pub use prep::prep_squash;
 pub use r#move::{move_groups_after, MoveExecutionOptions};
 pub use relink_prs::relink_prs;
 pub use restack::{restack_after, restack_after_count};
+pub use rewrite_resume::{resume_rewrite, RewriteCommandOutcome};
 pub use update::{build_from_groups, build_from_tags};

@@ -25,15 +25,15 @@ pub enum PrDescriptionMode {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RestackConflictPolicy {
-    /// Abort and clean up temp restack state (default).
+    /// Abort and clean up temp restack state.
     Rollback,
-    /// Halt and leave the temp worktree/branch for manual resolution.
+    /// Suspend, leave the temp worktree in place, and resume with `spr resume`.
     Halt,
 }
 
 impl Default for RestackConflictPolicy {
     fn default() -> Self {
-        Self::Rollback
+        Self::Halt
     }
 }
 
@@ -112,8 +112,8 @@ pub struct FileConfig {
     /// Behavior when `spr restack` encounters a cherry-pick conflict.
     ///
     /// Supported values:
-    /// - `rollback` (default): abort and clean up temp restack state
-    /// - `halt`: stop and leave the temp worktree for manual resolution
+    /// - `halt` (default): suspend, leave the temp worktree in place, and use `spr resume`
+    /// - `rollback`: abort and clean up temp restack state
     pub restack_conflict: Option<RestackConflictPolicy>,
     /// Behavior when a branch-rewriting command sees local changes.
     ///
@@ -171,7 +171,7 @@ fn default_config() -> Config {
         ignore_tag: "ignore".to_string(),
         pr_description_mode: PrDescriptionMode::Overwrite,
         list_order: ListOrder::RecentOnTop,
-        restack_conflict: RestackConflictPolicy::Rollback,
+        restack_conflict: RestackConflictPolicy::Halt,
         dirty_worktree: DirtyWorktreePolicy::Halt,
         branch_reuse_guard_days: 180,
     }
@@ -246,7 +246,7 @@ pub fn load_config() -> Result<Config> {
 mod tests {
     use super::{
         apply_overrides, default_config, read_config_file, DirtyWorktreePolicy, FileConfig,
-        PrDescriptionMode,
+        PrDescriptionMode, RestackConflictPolicy,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -315,6 +315,32 @@ dirty_worktree: stash
             .expect("parse config")
             .expect("config exists");
         assert_eq!(cfg.dirty_worktree, Some(DirtyWorktreePolicy::Stash));
+    }
+
+    #[test]
+    fn read_config_file_parses_restack_conflict_policy() {
+        let dir = tempdir().expect("tempdir");
+        let mut path = dir.path().to_path_buf();
+        path.push(".spr_multicommit_cfg.yml");
+        fs::write(
+            &path,
+            r#"
+restack_conflict: rollback
+"#,
+        )
+        .expect("write config");
+
+        let cfg = read_config_file(&path)
+            .expect("parse config")
+            .expect("config exists");
+        assert_eq!(cfg.restack_conflict, Some(RestackConflictPolicy::Rollback));
+    }
+
+    #[test]
+    fn default_config_uses_halt_for_restack_conflict_policy() {
+        let cfg = default_config();
+
+        assert_eq!(cfg.restack_conflict, RestackConflictPolicy::Halt);
     }
 
     #[test]

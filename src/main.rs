@@ -55,6 +55,7 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
     match cmd {
         crate::cli::Cmd::Restack { .. }
         | crate::cli::Cmd::Absorb { .. }
+        | crate::cli::Cmd::Resume { .. }
         | crate::cli::Cmd::FixPr { .. } => false,
         crate::cli::Cmd::Update { .. }
         | crate::cli::Cmd::Prep {}
@@ -125,6 +126,36 @@ fn resolve_base_prefix(
     Ok((base, prefix, ignore_tag))
 }
 
+fn ensure_rewrite_completed(
+    command_name: &str,
+    outcome: crate::commands::RewriteCommandOutcome,
+) -> Result<()> {
+    if outcome == crate::commands::RewriteCommandOutcome::Completed {
+        Ok(())
+    } else if let crate::commands::RewriteCommandOutcome::Suspended { resume_path } = outcome {
+        Err(anyhow::anyhow!(
+            "{} suspended due to a cherry-pick conflict. Resolve the conflict in the temp worktree, stage the resolution, and run `spr resume {}`.",
+            command_name,
+            resume_path.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_resume_completed(outcome: crate::commands::RewriteCommandOutcome) -> Result<()> {
+    if outcome == crate::commands::RewriteCommandOutcome::Completed {
+        Ok(())
+    } else if let crate::commands::RewriteCommandOutcome::Suspended { resume_path } = outcome {
+        Err(anyhow::anyhow!(
+            "`spr resume` hit another cherry-pick conflict. Resolve the next conflict in the temp worktree, stage the resolution, and rerun `spr resume {}`.",
+            resume_path.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn main() -> Result<()> {
     let cli = crate::cli::Cli::parse();
     apply_working_directory_override(cli.cd.as_deref())?;
@@ -148,6 +179,10 @@ fn main() -> Result<()> {
         std::env::set_var("SPR_VERBOSE", "1");
     }
     init_tools(command_requires_gh(&cli.cmd))?;
+    if let crate::cli::Cmd::Resume { path } = &cli.cmd {
+        return ensure_resume_completed(crate::commands::resume_rewrite(cli.dry_run, path)?);
+    }
+
     let cfg = crate::config::load_config()?;
     let (base, prefix, ignore_tag) =
         resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone())?;
@@ -213,14 +248,17 @@ fn main() -> Result<()> {
         }
         crate::cli::Cmd::Restack { after, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            crate::commands::restack_after(
-                &base,
-                &ignore_tag,
-                &after,
-                safe,
-                cli.dry_run,
-                restack_conflict_policy,
-                dirty_worktree_policy,
+            ensure_rewrite_completed(
+                "spr restack",
+                crate::commands::restack_after(
+                    &base,
+                    &ignore_tag,
+                    &after,
+                    safe,
+                    cli.dry_run,
+                    restack_conflict_policy,
+                    dirty_worktree_policy,
+                )?,
             )?;
         }
         crate::cli::Cmd::Absorb {
@@ -234,13 +272,16 @@ fn main() -> Result<()> {
                     crate::commands::CopiedLaterStackCommitPolicy::Block
                 },
             };
-            crate::commands::absorb_branch_tails(
-                &base,
-                &prefix,
-                &ignore_tag,
-                cli.dry_run,
-                dirty_worktree_policy,
-                options,
+            ensure_rewrite_completed(
+                "spr absorb",
+                crate::commands::absorb_branch_tails(
+                    &base,
+                    &prefix,
+                    &ignore_tag,
+                    cli.dry_run,
+                    dirty_worktree_policy,
+                    options,
+                )?,
             )?;
         }
         crate::cli::Cmd::Prep {} => {
@@ -314,7 +355,7 @@ fn main() -> Result<()> {
             };
             if !no_restack {
                 // After landing the first N PRs, restack the remaining commits onto the latest base
-                crate::commands::restack_after_count(
+                let outcome = crate::commands::restack_after_count(
                     &base,
                     &ignore_tag,
                     landed_count,
@@ -323,6 +364,12 @@ fn main() -> Result<()> {
                     restack_conflict_policy,
                     dirty_worktree_policy,
                 )?;
+                if let crate::commands::RewriteCommandOutcome::Suspended { resume_path } = outcome {
+                    return Err(anyhow::anyhow!(
+                        "GitHub landing already succeeded, but the follow-on restack suspended due to a cherry-pick conflict. Resolve the conflict in the temp worktree, stage the resolution, and run `spr resume {}` instead of rerunning `spr land`.",
+                        resume_path.display()
+                    ));
+                }
             }
         }
         crate::cli::Cmd::RelinkPrs {} => {
@@ -335,31 +382,38 @@ fn main() -> Result<()> {
         }
         crate::cli::Cmd::FixPr { target, tail, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            crate::commands::fix_pr_tail(
-                &base,
-                &ignore_tag,
-                &target,
-                tail,
-                safe,
-                cli.dry_run,
-                dirty_worktree_policy,
+            ensure_rewrite_completed(
+                "spr fix-pr",
+                crate::commands::fix_pr_tail(
+                    &base,
+                    &ignore_tag,
+                    &target,
+                    tail,
+                    safe,
+                    cli.dry_run,
+                    dirty_worktree_policy,
+                )?,
             )?;
         }
         crate::cli::Cmd::Move { range, after, safe } => {
             set_dry_run_env(cli.dry_run, false);
-            crate::commands::move_groups_after(
-                &base,
-                &prefix,
-                &ignore_tag,
-                &range,
-                &after,
-                crate::commands::MoveExecutionOptions {
-                    safe,
-                    dry: cli.dry_run,
-                    dirty_worktree_policy,
-                },
+            ensure_rewrite_completed(
+                "spr move",
+                crate::commands::move_groups_after(
+                    &base,
+                    &prefix,
+                    &ignore_tag,
+                    &range,
+                    &after,
+                    crate::commands::MoveExecutionOptions {
+                        safe,
+                        dry: cli.dry_run,
+                        dirty_worktree_policy,
+                    },
+                )?,
             )?;
         }
+        crate::cli::Cmd::Resume { .. } => unreachable!("handled before config loading"),
     }
     Ok(())
 }
@@ -452,6 +506,13 @@ mod tests {
     fn absorb_is_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::Absorb {
             allow_replayed_duplicates: false,
+        }));
+    }
+
+    #[test]
+    fn resume_is_local_only_for_tool_checks() {
+        assert!(!command_requires_gh(&crate::cli::Cmd::Resume {
+            path: std::path::PathBuf::from(".git/spr/resume/example.json"),
         }));
     }
 

@@ -6,18 +6,20 @@
 //! branch is hard-reset to the rebuilt tip and the temp state is removed.
 //!
 //! Conflict handling is policy-driven via the `restack_conflict` config key.
-//! The default `rollback` behavior cleans up the temp state on conflict; the
-//! `halt` behavior leaves the temp worktree and branch in place and prints the
-//! exact commands needed to either roll back or continue manually.
+//! The default `halt` behavior suspends the replay, leaves the temp worktree
+//! in place, and writes a resume file for `spr resume <path>`. The `rollback`
+//! behavior preserves the historical cleanup-on-conflict path.
 
-use std::process::Command;
-
-use anyhow::{anyhow, Context, Result};
-use tracing::{info, warn};
+use anyhow::Result;
+use tracing::info;
 
 use crate::commands::common;
 use crate::commands::common::CherryPickOp;
+use crate::commands::rewrite_resume::{
+    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
+};
 use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
+use crate::git::git_rev_parse;
 use crate::git::git_rw;
 use crate::parsing::{derive_local_groups_with_ignored, Group};
 use crate::selectors::{resolve_after_count, AfterSelector};
@@ -28,36 +30,6 @@ struct RestackExecutionOptions {
     dry: bool,
     conflict_policy: RestackConflictPolicy,
     dirty_worktree_policy: DirtyWorktreePolicy,
-}
-
-fn cherry_pick_head_exists(tmp_path: &str) -> bool {
-    Command::new("git")
-        .args([
-            "-C",
-            tmp_path,
-            "rev-parse",
-            "-q",
-            "--verify",
-            "CHERRY_PICK_HEAD",
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn abort_cherry_pick_best_effort(dry: bool, tmp_path: &str) {
-    if let Err(e) = git_rw(dry, ["-C", tmp_path, "cherry-pick", "--abort"].as_slice()) {
-        warn!("Failed to abort cherry-pick in {}: {}", tmp_path, e);
-    }
-}
-
-fn cleanup_temp_worktree_best_effort(dry: bool, tmp_path: &str, tmp_branch: &str) {
-    if let Err(e) = common::cleanup_temp_worktree(dry, tmp_path, tmp_branch) {
-        warn!(
-            "Failed to clean up temp restack state ({} / {}): {}",
-            tmp_path, tmp_branch, e
-        );
-    }
 }
 
 /// Build the ordered cherry-pick plan that reconstructs the restacked history.
@@ -110,54 +82,6 @@ fn build_kept_ignored_segments(
 /// The instructions are explicit about the temp worktree location because a
 /// common mistake is to resolve conflicts in the original worktree, which does
 /// not affect the halted cherry-pick sequence.
-fn emit_halt_instructions(
-    cur_branch: &str,
-    backup_tag: Option<&str>,
-    base: &str,
-    tmp_path: &str,
-    tmp_branch: &str,
-    op_index: usize,
-    ops: &[CherryPickOp],
-) {
-    info!("Restack halted due to a cherry-pick conflict.");
-    info!("Base: {}", base);
-    info!("Temp worktree: {}", tmp_path);
-    info!("Temp branch: {}", tmp_branch);
-    info!("You remain on branch: {}", cur_branch);
-
-    info!("To roll back and clean up temp restack state:");
-    info!("  # if a cherry-pick is in progress, abort it first");
-    info!("  git -C {} cherry-pick --abort", tmp_path);
-    info!("  git worktree remove -f {}", tmp_path);
-    info!("  git branch -D {}", tmp_branch);
-    info!("  git checkout {}", cur_branch);
-    if let Some(backup) = backup_tag {
-        info!("  # Optional: restore the --safe backup tag onto your current branch");
-        info!("  git reset --hard refs/tags/{}", backup);
-    }
-
-    info!("To resolve and continue the restack manually:");
-    info!("  cd {}", tmp_path);
-    info!("  git status");
-    info!("  # resolve conflicts, then stage the resolutions");
-    info!("  git add <paths>");
-    info!("  git cherry-pick --continue");
-
-    let remaining_ops = ops.iter().skip(op_index + 1).collect::<Vec<_>>();
-    if !remaining_ops.is_empty() {
-        info!("  # then apply the remaining cherry-picks:");
-        for op in remaining_ops {
-            info!("  {}", op.command_for_user(tmp_path));
-        }
-    }
-
-    info!("  # finalize by moving your branch to the temp restack tip:");
-    info!("  git reset --hard {}", tmp_branch);
-    info!("  git worktree remove -f {}", tmp_path);
-    info!("  git branch -D {}", tmp_branch);
-    info!("  spr update");
-}
-
 fn resolve_restack_after_count(groups: &[Group], after: &AfterSelector) -> Result<usize> {
     resolve_after_count(groups, after)
 }
@@ -168,7 +92,7 @@ fn restack_after_resolved(
     groups: Vec<Group>,
     after: usize,
     options: RestackExecutionOptions,
-) -> Result<()> {
+) -> Result<RewriteCommandOutcome> {
     let after = std::cmp::min(after, groups.len());
     let kept_ignored_segments = build_kept_ignored_segments(leading_ignored, &groups, after);
     let remaining = groups[after..].to_vec();
@@ -179,6 +103,8 @@ fn restack_after_resolved(
         options.dirty_worktree_policy,
         || {
             let (cur_branch, short) = common::get_current_branch_and_short()?;
+            let original_head = git_rev_parse("HEAD")?;
+            let original_worktree_root = rewrite_resume::current_repo_root()?;
             if remaining.is_empty() && kept_ignored_segments.is_empty() {
                 if options.safe {
                     let _ = common::create_backup_tag(options.dry, "restack", &cur_branch, &short)?;
@@ -190,7 +116,7 @@ fn restack_after_resolved(
                     base
                 );
                 common::reset_current_branch_to(options.dry, base)?;
-                Ok(())
+                Ok(RewriteCommandOutcome::Completed)
             } else {
                 let backup_tag = if options.safe {
                     Some(common::create_backup_tag(
@@ -206,42 +132,35 @@ fn restack_after_resolved(
                 let (tmp_path, tmp_branch) =
                     common::create_temp_worktree(options.dry, "restack", base, &short)?;
                 let ops = build_cherry_pick_plan(&kept_ignored_segments, &remaining);
-                for (idx, op) in ops.iter().enumerate() {
-                    if let Err(err) = op.run(options.dry, &tmp_path) {
-                        let conflict = cherry_pick_head_exists(&tmp_path);
-                        if conflict && options.conflict_policy == RestackConflictPolicy::Halt {
-                            emit_halt_instructions(
-                                &cur_branch,
-                                backup_tag.as_deref(),
-                                base,
-                                &tmp_path,
-                                &tmp_branch,
-                                idx,
-                                &ops,
-                            );
-                            return Err(anyhow!(
-                                "restack halted due to conflict; resolve in temp worktree and continue manually"
-                            ));
-                        }
-
-                        if conflict {
-                            abort_cherry_pick_best_effort(options.dry, &tmp_path);
-                        }
-                        cleanup_temp_worktree_best_effort(options.dry, &tmp_path, &tmp_branch);
-                        return Err(err)
-                            .context("restack failed; temp restack state was cleaned up");
-                    }
+                let steps = rewrite_resume::build_replay_steps(&ops)?;
+                let outcome = rewrite_resume::run_rewrite_session(
+                    options.dry,
+                    RewriteSession {
+                        command_kind: RewriteCommandKind::Restack,
+                        conflict_policy: if options.conflict_policy
+                            == RestackConflictPolicy::Rollback
+                        {
+                            RewriteConflictPolicy::Rollback
+                        } else {
+                            RewriteConflictPolicy::Suspend
+                        },
+                        original_worktree_root,
+                        original_branch: cur_branch.clone(),
+                        original_head,
+                        temp_branch: tmp_branch,
+                        temp_worktree_path: tmp_path,
+                        backup_tag,
+                        steps,
+                        post_success_hint: None,
+                    },
+                )?;
+                if outcome == RewriteCommandOutcome::Completed {
+                    info!(
+                        "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
+                        after, cur_branch, base
+                    );
                 }
-
-                let new_tip = common::tip_of_tmp(&tmp_path)?;
-                info!(
-                    "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
-                    after, cur_branch, base
-                );
-                common::reset_current_branch_to(options.dry, &new_tip)?;
-                cleanup_temp_worktree_best_effort(options.dry, &tmp_path, &tmp_branch);
-
-                Ok(())
+                Ok(outcome)
             }
         },
     )
@@ -253,15 +172,13 @@ fn restack_after_resolved(
 /// rebuilt history. Ignored commits that appear between dropped PR groups are kept
 /// before the remaining stack.
 ///
-/// With the default `Rollback` conflict policy, any cherry-pick conflict aborts
-/// the restack attempt and `spr` *attempts* to clean up the temporary worktree
-/// and branch. Cleanup failures are logged as warnings and may require manual
-/// cleanup.
+/// With the default `Halt` conflict policy, any cherry-pick conflict suspends
+/// the restack, leaves the temporary worktree and branch in place, and writes
+/// a resume file for `spr resume <path>`.
 ///
-/// With the `Halt` conflict policy, restack stops at the first conflict and
-/// prints step-by-step instructions for resolving the conflict in the temp
-/// worktree and finishing the cherry-pick sequence manually before resetting
-/// the original branch to the rebuilt tip.
+/// With the `Rollback` conflict policy, restack preserves the historical
+/// cleanup-on-conflict behavior and attempts to remove the temp worktree and
+/// branch after aborting the failed cherry-pick.
 ///
 /// # Errors
 ///
@@ -274,14 +191,14 @@ pub fn restack_after(
     dry: bool,
     conflict_policy: RestackConflictPolicy,
     dirty_worktree_policy: DirtyWorktreePolicy,
-) -> Result<()> {
+) -> Result<RewriteCommandOutcome> {
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
     let (_merge_base, leading_ignored, groups) =
         derive_local_groups_with_ignored(base, ignore_tag)?;
     if groups.is_empty() {
         info!("No local PR groups found; nothing to restack.");
-        Ok(())
+        Ok(RewriteCommandOutcome::Completed)
     } else {
         let after = resolve_restack_after_count(&groups, after)?;
         restack_after_resolved(
@@ -308,13 +225,13 @@ pub fn restack_after_count(
     dry: bool,
     conflict_policy: RestackConflictPolicy,
     dirty_worktree_policy: DirtyWorktreePolicy,
-) -> Result<()> {
+) -> Result<RewriteCommandOutcome> {
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
     let (_merge_base, leading_ignored, groups) =
         derive_local_groups_with_ignored(base, ignore_tag)?;
     if groups.is_empty() {
-        Ok(())
+        Ok(RewriteCommandOutcome::Completed)
     } else {
         restack_after_resolved(
             base,
@@ -335,8 +252,15 @@ pub fn restack_after_count(
 mod tests {
     use super::{build_cherry_pick_plan, build_kept_ignored_segments, resolve_restack_after_count};
     use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp};
+    use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
+    use crate::commands::RewriteCommandOutcome;
+    use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
     use crate::parsing::Group;
     use crate::selectors::{AfterSelector, GroupSelector, StableHandle};
+    use crate::test_support::{commit_file, git, lock_cwd, write_file, DirGuard};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
 
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
@@ -416,6 +340,91 @@ mod tests {
                     sha: "gamma1".to_string(),
                     empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
                 },
+            ]
+        );
+    }
+
+    fn init_restack_conflict_repo() -> TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        git(&repo, ["init", "-b", "main"].as_slice());
+        git(
+            &repo,
+            ["config", "user.email", "spr@example.com"].as_slice(),
+        );
+        git(&repo, ["config", "user.name", "SPR Tests"].as_slice());
+        write_file(&repo, "story.txt", "base\n");
+        git(&repo, ["add", "story.txt"].as_slice());
+        git(&repo, ["commit", "-m", "init"].as_slice());
+
+        let origin = dir.path().join("origin.git");
+        git(
+            &repo,
+            ["init", "--bare", origin.to_str().unwrap()].as_slice(),
+        );
+        git(
+            &repo,
+            ["remote", "add", "origin", origin.to_str().unwrap()].as_slice(),
+        );
+        git(&repo, ["push", "-u", "origin", "main"].as_slice());
+
+        git(&repo, ["checkout", "-b", "stack"].as_slice());
+        commit_file(&repo, "alpha.txt", "alpha-1\n", "feat: alpha pr:alpha");
+        commit_file(&repo, "story.txt", "stack-beta\n", "feat: beta pr:beta");
+        git(&repo, ["checkout", "main"].as_slice());
+        commit_file(&repo, "story.txt", "base-updated\n", "feat: base update");
+        git(&repo, ["checkout", "stack"].as_slice());
+        dir
+    }
+
+    fn resolve_restack_conflict(temp_repo: &Path) {
+        fs::write(temp_repo.join("story.txt"), "base-updated\nstack-beta\n")
+            .expect("resolve restack conflict");
+        git(temp_repo, ["add", "story.txt"].as_slice());
+    }
+
+    #[test]
+    fn restack_halt_policy_suspends_and_resumes_conflict() {
+        let _lock = lock_cwd();
+        let dir = init_restack_conflict_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+
+        let outcome = super::restack_after(
+            "main",
+            "ignore",
+            &AfterSelector::Group(GroupSelector::LocalPr(1)),
+            false,
+            false,
+            RestackConflictPolicy::Halt,
+            DirtyWorktreePolicy::Halt,
+        )
+        .expect("restack should suspend");
+        let resume_path = match outcome {
+            RewriteCommandOutcome::Completed => panic!("expected suspended restack"),
+            RewriteCommandOutcome::Suspended { resume_path } => resume_path,
+        };
+        let resume_state: RewriteResumeState =
+            serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
+                .expect("parse resume state");
+        resolve_restack_conflict(Path::new(&resume_state.temp_worktree_path));
+
+        let resumed = resume_rewrite(false, &resume_path).expect("resume restack");
+        assert_eq!(resumed, RewriteCommandOutcome::Completed);
+        assert!(
+            !resume_path.exists(),
+            "successful restack resume should delete the resume file"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("story.txt")).expect("read final file"),
+            "base-updated\nstack-beta\n"
+        );
+        assert_eq!(
+            crate::test_support::log_subjects(&repo, 2),
+            vec![
+                "feat: beta pr:beta".to_string(),
+                "feat: base update".to_string(),
             ]
         );
     }
