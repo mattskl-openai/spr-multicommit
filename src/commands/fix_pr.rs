@@ -47,8 +47,7 @@ fn build_fix_pr_operations(
 /// `pr:<tag>` markers, when the tail intersects ignored commits, or when Git
 /// operations (worktree creation, cherry-picks, reset) fail.
 pub fn fix_pr_tail(
-    base: &str,
-    ignore_tag: &str,
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
     target: &GroupSelector,
     tail_count: usize,
     safe: bool,
@@ -59,7 +58,8 @@ pub fn fix_pr_tail(
         return Ok(RewriteCommandOutcome::Completed);
     }
 
-    let (merge_base, leading_ignored, groups) = derive_local_groups_with_ignored(base, ignore_tag)?;
+    let (merge_base, leading_ignored, groups) =
+        derive_local_groups_with_ignored(&metadata_context.base, &metadata_context.ignore_tag)?;
     let total_groups = groups.len();
     if total_groups == 0 {
         info!("No local PR groups found; nothing to fix.");
@@ -191,6 +191,7 @@ pub fn fix_pr_tail(
                     "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
                         .to_string(),
                 ),
+                metadata_refresh_context: Some(metadata_context.clone()),
             },
         )
         },
@@ -210,6 +211,14 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
+
+    fn metadata_context() -> crate::stack_metadata::RefreshMetadataContext {
+        crate::stack_metadata::RefreshMetadataContext {
+            base: "main".to_string(),
+            prefix: "dank-spr/".to_string(),
+            ignore_tag: "ignore".to_string(),
+        }
+    }
 
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
@@ -339,8 +348,7 @@ mod tests {
         dirty_worktree(&repo);
 
         fix_pr_tail(
-            "main",
-            "ignore",
+            &metadata_context(),
             &GroupSelector::LocalPr(1),
             1,
             false,
@@ -379,8 +387,7 @@ mod tests {
         dirty_worktree(&repo);
 
         fix_pr_tail(
-            "main",
-            "ignore",
+            &metadata_context(),
             &GroupSelector::LocalPr(1),
             1,
             false,
@@ -422,8 +429,7 @@ mod tests {
         dirty_worktree(&repo);
 
         let mut current = fix_pr_tail(
-            "main",
-            "ignore",
+            &metadata_context(),
             &GroupSelector::LocalPr(1),
             1,
             false,
@@ -507,8 +513,7 @@ mod tests {
         dirty_worktree(&repo);
 
         let err = fix_pr_tail(
-            "main",
-            "ignore",
+            &metadata_context(),
             &GroupSelector::LocalPr(1),
             1,
             false,
@@ -548,8 +553,7 @@ mod tests {
         let _guard = DirGuard::change_to(&repo);
 
         let outcome = fix_pr_tail(
-            "main",
-            "ignore",
+            &metadata_context(),
             &GroupSelector::LocalPr(1),
             1,
             false,

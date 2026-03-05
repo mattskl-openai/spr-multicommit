@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use crate::commands::common::{
     self, CherryPickEmptyPolicy, CherryPickOp, DeferredDirtyWorktreeRestore, DirtyWorktreeOutcome,
 };
-use crate::git::{git_rev_list_range, git_ro, git_rw, repo_root};
+use crate::git::{git_common_dir, git_rev_list_range, git_ro, git_rw, repo_root};
 
 const REWRITE_RESUME_SCHEMA_VERSION: u32 = 1;
 
@@ -99,6 +99,8 @@ pub struct RewriteResumeState {
     #[serde(default)]
     pub deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore,
     pub post_success_hint: Option<String>,
+    #[serde(default)]
+    pub metadata_refresh_context: Option<crate::stack_metadata::RefreshMetadataContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +117,7 @@ pub struct RewriteSession {
     pub operations: Vec<CherryPickOp>,
     pub deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore,
     pub post_success_hint: Option<String>,
+    pub metadata_refresh_context: Option<crate::stack_metadata::RefreshMetadataContext>,
 }
 
 impl DirtyWorktreeOutcome for RewriteCommandOutcome {
@@ -133,7 +136,7 @@ pub fn prepare_resume_path_for_new_session(
     original_branch: &str,
     original_head: &str,
 ) -> Result<PathBuf> {
-    let git_common_dir = current_common_git_dir()?;
+    let git_common_dir = git_common_dir()?;
     let resume_path = default_resume_path(
         &git_common_dir,
         command_kind,
@@ -178,7 +181,7 @@ pub fn prepare_resume_path_for_new_session(
 }
 
 pub fn run_rewrite_session(dry: bool, session: RewriteSession) -> Result<RewriteCommandOutcome> {
-    let git_common_dir = current_common_git_dir()?;
+    let git_common_dir = git_common_dir()?;
     let state = RewriteResumeState {
         schema_version: REWRITE_RESUME_SCHEMA_VERSION,
         command_kind: session.command_kind,
@@ -197,6 +200,7 @@ pub fn run_rewrite_session(dry: bool, session: RewriteSession) -> Result<Rewrite
         remaining_operations: Vec::new(),
         deferred_dirty_worktree_restore: session.deferred_dirty_worktree_restore,
         post_success_hint: session.post_success_hint,
+        metadata_refresh_context: session.metadata_refresh_context,
     };
     continue_rewrite_operations(
         dry,
@@ -370,6 +374,18 @@ fn finish_rewrite(
         ]
         .as_slice(),
     )?;
+    let metadata_refresh_result = if dry {
+        Ok(())
+    } else if let Some(metadata_refresh_context) = &state.metadata_refresh_context {
+        crate::stack_metadata::refresh_metadata_for_branch(
+            &state.original_worktree_root,
+            &state.original_branch,
+            metadata_refresh_context,
+            Some(Path::new(&state.git_common_dir)),
+        )
+    } else {
+        Ok(())
+    };
     let restore_result = if restore_dirty_worktree_on_success {
         state
             .deferred_dirty_worktree_restore
@@ -388,6 +404,7 @@ fn finish_rewrite(
         info!("{post_success_hint}");
     }
     restore_result?;
+    metadata_refresh_result?;
     Ok(RewriteCommandOutcome::Completed)
 }
 
@@ -744,7 +761,7 @@ fn validate_resume_state_against_current_repo(
     path: &Path,
     state: &RewriteResumeState,
 ) -> Result<()> {
-    let current_common_dir = current_common_git_dir()?;
+    let current_common_dir = git_common_dir()?;
     let expected_common_dir = canonicalize_existing_path(Path::new(&state.git_common_dir))
         .with_context(|| {
             format!(
@@ -822,12 +839,6 @@ fn validate_original_worktree_target(state: &RewriteResumeState) -> Result<()> {
 
     Ok(())
 }
-
-fn current_common_git_dir() -> Result<PathBuf> {
-    let raw = git_ro(["rev-parse", "--git-common-dir"].as_slice())?;
-    canonicalize_existing_path(&absolute_path(Path::new(raw.trim()))?)
-}
-
 fn default_resume_path(
     git_common_dir: &Path,
     command_kind: RewriteCommandKind,
@@ -1142,6 +1153,7 @@ mod tests {
             }],
             deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore::Noop,
             post_success_hint: None,
+            metadata_refresh_context: None,
         };
 
         let outcome = run_rewrite_session(false, session).expect("run rewrite session");
@@ -1200,6 +1212,7 @@ mod tests {
                 }],
                 deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore::Noop,
                 post_success_hint: None,
+                metadata_refresh_context: None,
             },
         )
         .expect("run range rewrite session");
@@ -1276,6 +1289,7 @@ mod tests {
                 }],
                 deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore::Noop,
                 post_success_hint: None,
+                metadata_refresh_context: None,
             },
         )
         .expect("run repeated range rewrite session");
@@ -1617,6 +1631,7 @@ mod tests {
             remaining_operations: vec![],
             deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore::Noop,
             post_success_hint: None,
+            metadata_refresh_context: None,
         };
 
         let lines =

@@ -255,6 +255,13 @@ pub fn move_groups_after(
                         "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
                             .to_string(),
                     ),
+                    metadata_refresh_context: Some(
+                        crate::stack_metadata::RefreshMetadataContext {
+                            base: base.to_string(),
+                            prefix: prefix.to_string(),
+                            ignore_tag: ignore_tag.to_string(),
+                        },
+                    ),
                 },
             )
         },

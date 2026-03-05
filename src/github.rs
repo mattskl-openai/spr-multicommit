@@ -720,6 +720,15 @@ pub fn get_repo_owner_name() -> Result<(String, String)> {
     anyhow::bail!("Unable to parse remote.origin.url: {}", url)
 }
 
+pub fn resolve_pr_url_head_ref(pr_url: &str) -> Result<String> {
+    let json = gh_ro(["pr", "view", pr_url, "--json", "headRefName"].as_slice())?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    value["headRefName"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("GitHub PR view result missing headRefName for {}", pr_url))
+}
+
 pub fn graphql_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     for c in s.chars() {
@@ -1053,7 +1062,7 @@ mod tests {
         filter_case_variant_head_search_matches, filter_head_search_matches,
         list_conflicting_prs_for_heads_search_exhaustive, list_exact_prs_for_heads,
         list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
-        list_recent_terminal_prs_for_heads, parse_open_pr_automerge_node,
+        list_recent_terminal_prs_for_heads, parse_open_pr_automerge_node, resolve_pr_url_head_ref,
         select_latest_merged_pr_match, select_single_open_pr_match, HeadSearchPr, PrState,
         TerminalPrState, EXACT_HEAD_QUERY_LIMIT,
     };
@@ -1181,6 +1190,25 @@ mod tests {
             path_guard,
             log_path.display().to_string(),
         )
+    }
+
+    #[test]
+    fn resolve_pr_url_head_ref_reads_only_head_ref_name() {
+        let _lock = lock_cwd();
+        let data_dir = tempfile::tempdir().unwrap();
+        let log_path = data_dir.path().join("gh.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n  echo '{{\"headRefName\":\"dank-spr/example\"}}'\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            log_path.display()
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+
+        let head_ref_name =
+            resolve_pr_url_head_ref("https://github.com/o/r/pull/17").expect("resolve PR URL");
+
+        assert_eq!(head_ref_name, "dank-spr/example");
+        let log = fs::read_to_string(log_path).expect("read gh log");
+        assert!(log.contains("pr view https://github.com/o/r/pull/17 --json headRefName"));
     }
 
     #[test]
