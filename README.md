@@ -100,8 +100,11 @@ pr_description_mode: overwrite | stack_only
 # one of: "recent_on_bottom" (default) or "recent_on_top"
 list_order: recent_on_bottom
 
-# How `spr restack` behaves on cherry-pick conflicts: "rollback" (default) or "halt"
-restack_conflict: rollback
+# How `spr restack` behaves on cherry-pick conflicts
+# - `halt` (default): suspend, leave the temp worktree in place, and resume
+#   with `spr resume <path>`
+# - `rollback`: abort and clean up temp restack state
+restack_conflict: halt
 
 # How branch-rewriting commands handle local changes in the checked-out worktree
 # This applies to `spr restack`, `spr move`, `spr fix-pr`, and `spr absorb`.
@@ -121,7 +124,7 @@ Precedence for defaults:
 
 - CLI flag > repo YAML > home YAML > git discovery (`origin/HEAD`)
 - Base has no built-in fallback; if discovery fails, set `base` explicitly
-- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `list_order = recent_on_bottom`, `restack_conflict = rollback`, `dirty_worktree = halt`
+- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `list_order = recent_on_bottom`, `restack_conflict = halt`, `dirty_worktree = halt`
 
 Global flags
 ------------
@@ -199,9 +202,9 @@ Behavior:
 - With `--safe`, a backup tag named like `backup/restack/<current-branch>-<short-sha>` is created first
 - Conflict handling is controlled by `restack_conflict` in config.
 - Before rewriting the checked-out branch, `spr restack` follows the `dirty_worktree` config.
-- `rollback` (default) aborts the restack and attempts to clean up the temp restack worktree and branch (cleanup failures may require manual cleanup).
-- `halt` stops on conflict, leaves the temp restack worktree and branch in place, and prints manual rollback/continue instructions.
-- When using `halt`, resolve conflicts inside the printed temp worktree path; resolving in your original worktree will not advance the halted cherry-pick.
+- `halt` (default) suspends on conflict, leaves the temp restack worktree and branch in place, writes a resume file under the repository common Git directory, and prints `spr resume <path>`.
+- `rollback` preserves the historical cleanup-on-conflict behavior and attempts to remove the temp restack worktree and branch (cleanup failures may require manual cleanup).
+- When restack suspends, resolve conflicts inside the printed temp worktree path, stage the resolution, and run the printed `spr resume <path>` command. Resolving in your original worktree does not advance the suspended cherry-pick.
 
 ### spr absorb
 
@@ -220,6 +223,7 @@ Behavior:
 - Inserts absorbed commits after the group's real commits and before that group's trailing ignored block
 - Creates a local backup tag before rewriting the stack
 - Before rewriting the checked-out branch, `spr absorb` follows the `dirty_worktree` config.
+- On cherry-pick conflict, `spr absorb` suspends the rewrite, leaves the temp worktree in place, and prints `spr resume <path>`
 - Does not update GitHub; inspect the rewritten stack first, then run `spr update`
 
 Typical workflow:
@@ -241,6 +245,97 @@ Override example for intentionally keeping both an earlier copied follow-up comm
 ```bash
 spr absorb --allow-replayed-duplicates
 ```
+
+### spr resume
+
+Resume a suspended local rewrite from the exact path printed by `spr restack`,
+`spr absorb`, `spr move`, or `spr fix-pr`.
+
+Behavior:
+
+- Accepts one explicit resume-file path under the repository common Git directory, usually `.git/spr/resume/`
+- Validates that the resume file belongs to the current repository and that the recorded temp worktree still exists
+- The suspend output prints the temp worktree path, temp branch, original branch, and resume-file path so the caller knows exactly which rewrite is paused
+- Supported workflow: resolve conflicts in the printed temp rewrite worktree, stage the resolution, then run the printed `spr resume <path>`
+- Tolerates one accidental manual `git cherry-pick --continue` for the paused step, then resumes the remaining replay under `spr`
+- Rejects broader manual replay edits, unknown resume-file schema versions, missing temp worktrees, or unresolved conflicts that are still staged as unmerged
+
+Machine-readable `--json` mode:
+
+- Supported on `spr restack`, `spr absorb`, `spr move`, `spr fix-pr`, `spr land`, and `spr resume`
+- In `--json` mode, stdout is exactly one JSON object and stderr is normally empty
+- Exit codes are:
+  - `0` for completed
+  - `1` for hard error, including CLI parse failures when `--json` was requested
+  - `2` for suspended rewrite awaiting conflict resolution
+- The suspended JSON payload includes the fields an agent needs to resolve and resume:
+  - `original_worktree_root`
+  - `original_branch`
+  - `temp_branch`
+  - `temp_worktree`
+  - `resume_file`
+  - `resume_argv`
+  - `paused_source_sha`
+  - `conflicted_paths`
+  - `post_success_hint`
+
+Example suspend payload:
+
+```json
+{
+  "schema_version": 1,
+  "result": "suspended",
+  "command": "restack",
+  "rewrite_command_kind": "restack",
+  "original_worktree_root": "/path/to/repo",
+  "original_branch": "stack",
+  "temp_branch": "spr/tmp-restack-717b9d8",
+  "temp_worktree": "/tmp/spr-restack-717b9d8",
+  "resume_file": "/path/to/repo/.git/spr/resume/restack-stack-717b9d8.json",
+  "resume_argv": [
+    "spr",
+    "--cd",
+    "/path/to/repo",
+    "resume",
+    "--json",
+    "/path/to/repo/.git/spr/resume/restack-stack-717b9d8.json"
+  ],
+  "paused_source_sha": "717b9d83bcdbea33286496800c76e65c62f795ed",
+  "conflicted_paths": [
+    "story.txt"
+  ],
+  "post_success_hint": null
+}
+```
+
+Mental model:
+
+- `spr` is not running `git rebase`; it is running a local rewrite engine that replays planned commits as individual cherry-picks in a temp worktree
+- The temp rewrite worktree is the execution sandbox
+- The resume file is a checkpoint for that paused rewrite
+- The original checked-out branch is not updated until the entire replay finishes successfully
+
+Suspend/resume flow:
+
+1. The original command (`spr restack`, `spr absorb`, `spr move`, or `spr fix-pr`) computes a replay plan for the rewritten stack.
+2. `spr` creates a temp branch and temp worktree at the right base commit.
+3. `spr` starts replaying the plan as individual cherry-picks in that temp worktree.
+4. If Git reports a cherry-pick conflict, `spr` records the paused rewrite state in the resume file, including the temp worktree path, the original branch identity, the paused temp-worktree `HEAD`, and the index of the failed replay step.
+5. `spr` prints the temp worktree path, temp branch, original branch, and `spr resume <path>`, then leaves the temp worktree in place. The original branch has still not moved.
+6. The user resolves only the current conflict in the printed temp worktree and stages the resolution with `git add`.
+7. The user runs `spr resume <path>` from any worktree in the same repository.
+8. `spr resume` reloads the checkpoint, validates that it still belongs to the current repository, validates that the temp worktree still exists, and then reconciles the paused step:
+   - If `CHERRY_PICK_HEAD` is still present, `spr` continues that paused cherry-pick itself.
+   - If `CHERRY_PICK_HEAD` is gone and the temp worktree advanced by exactly one commit, `spr` treats that as one accidental manual `git cherry-pick --continue` and resumes the remaining replay.
+9. `spr` then continues the remaining replay steps under `spr` control. If another conflict happens, it rewrites the same resume file with the new paused step and suspends again.
+10. Only after all replay steps succeed does `spr` reset the original branch to the rebuilt temp tip, remove the temp worktree and temp branch, and delete the resume file.
+
+Operator rules:
+
+- Resolve conflicts in the printed temp worktree, not in your original worktree.
+- Stage the resolution before running `spr resume <path>`.
+- Hand control back to `spr` after resolving the current conflict instead of manually replaying the rest of the rewrite.
+- One accidental manual `git cherry-pick --continue` is recoverable. Broader manual replay edits are intentionally rejected instead of being guessed through.
 
 ### spr list pr
 
@@ -299,6 +394,7 @@ Aliases:
 - `--safe`: create a local backup tag at current `HEAD` before rewriting
 - Ignore blocks (`pr:ignore`) stay attached to the preceding PR group and move with it
 - Before rewriting the checked-out branch, `spr move` follows the `dirty_worktree` config.
+- On cherry-pick conflict, `spr move` suspends the rewrite, leaves the temp worktree in place, and prints `spr resume <path>`
 
 Prints an explicit plan, e.g.: `2..3→4: [1,2,3,4,5,6] → [1,4,2,3,5,6]`.
 
@@ -324,6 +420,7 @@ Mode selection:
 Default follow-up behavior:
 
 - After a successful land, `spr` will automatically run `spr restack --after N` using the resolved group count from `--until`, so `spr land --until pr:beta` still restacks the correct remaining groups after `beta` disappears from the outstanding stack. Pass `--no-restack` to skip this.
+- If that follow-on restack suspends, the GitHub land already succeeded. Resolve the local restack conflict and run the printed `spr resume <path>` command instead of rerunning `spr land`.
 
 #### Mode: flatten
 
@@ -381,6 +478,7 @@ Behavior:
 - `--safe`: create a local backup tag at current `HEAD` before executing
 - Ignore blocks (`pr:ignore`) are preserved and cannot be moved; the command aborts if the tail intersects an ignore block
 - Before rewriting the checked-out branch, `spr fix-pr` follows the `dirty_worktree` config.
+- On cherry-pick conflict, `spr fix-pr` suspends the rewrite, leaves the temp worktree in place, and prints `spr resume <path>`
 
 ### spr cleanup
 

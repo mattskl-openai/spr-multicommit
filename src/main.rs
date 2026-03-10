@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{error::ErrorKind, Parser};
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 mod cli;
@@ -9,6 +10,7 @@ mod format;
 mod git;
 mod github;
 mod limit;
+mod machine_output;
 mod parsing;
 mod pr_labels;
 mod selectors;
@@ -55,6 +57,7 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
     match cmd {
         crate::cli::Cmd::Restack { .. }
         | crate::cli::Cmd::Absorb { .. }
+        | crate::cli::Cmd::Resume { .. }
         | crate::cli::Cmd::FixPr { .. } => false,
         crate::cli::Cmd::Update { .. }
         | crate::cli::Cmd::Prep {}
@@ -65,6 +68,12 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
         | crate::cli::Cmd::Cleanup {}
         | crate::cli::Cmd::Move { .. } => true,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    Human,
+    Json,
 }
 
 fn init_tools(needs_gh: bool) -> Result<()> {
@@ -125,29 +134,78 @@ fn resolve_base_prefix(
     Ok((base, prefix, ignore_tag))
 }
 
-fn main() -> Result<()> {
-    let cli = crate::cli::Cli::parse();
-    apply_working_directory_override(cli.cd.as_deref())?;
-    if cli.verbose {
-        tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .with_target(false)
-            .with_level(false)
-            .compact()
-            .init();
+fn ensure_rewrite_completed(
+    mode: OutputMode,
+    command_name: &str,
+    machine_command: crate::machine_output::MachineCommand,
+    outcome: crate::commands::RewriteCommandOutcome,
+) -> Result<crate::machine_output::MachineOutput> {
+    if outcome == crate::commands::RewriteCommandOutcome::Completed {
+        Ok(crate::machine_output::MachineOutput::completed(
+            machine_command,
+        ))
+    } else if let crate::commands::RewriteCommandOutcome::Suspended(state) = outcome {
+        if mode == OutputMode::Json {
+            Ok(crate::machine_output::MachineOutput::suspended(
+                machine_command,
+                *state,
+                None,
+            ))
+        } else {
+            Err(anyhow::anyhow!(
+                "{} suspended due to a cherry-pick conflict. Resolve the conflict in the temp worktree, stage the resolution, and run `spr resume {}`.",
+                command_name,
+                state.resume_path.display()
+            ))
+        }
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .with_target(false)
-            .with_level(false)
-            .without_time()
-            .compact()
-            .init();
+        Ok(crate::machine_output::MachineOutput::completed(
+            machine_command,
+        ))
     }
-    if cli.verbose {
-        std::env::set_var("SPR_VERBOSE", "1");
+}
+
+fn ensure_resume_completed(
+    mode: OutputMode,
+    outcome: crate::commands::RewriteCommandOutcome,
+) -> Result<crate::machine_output::MachineOutput> {
+    if outcome == crate::commands::RewriteCommandOutcome::Completed {
+        Ok(crate::machine_output::MachineOutput::completed(
+            crate::machine_output::MachineCommand::Resume,
+        ))
+    } else if let crate::commands::RewriteCommandOutcome::Suspended(state) = outcome {
+        if mode == OutputMode::Json {
+            Ok(crate::machine_output::MachineOutput::suspended(
+                crate::machine_output::MachineCommand::Resume,
+                *state,
+                None,
+            ))
+        } else {
+            Err(anyhow::anyhow!(
+                "`spr resume` hit another cherry-pick conflict. Resolve the next conflict in the temp worktree, stage the resolution, and rerun `spr resume {}`.",
+                state.resume_path.display()
+            ))
+        }
+    } else {
+        Ok(crate::machine_output::MachineOutput::completed(
+            crate::machine_output::MachineCommand::Resume,
+        ))
     }
+}
+
+fn run_cli(
+    cli: crate::cli::Cli,
+    output_mode: OutputMode,
+) -> Result<crate::machine_output::MachineOutput> {
+    apply_working_directory_override(cli.cd.as_deref())?;
     init_tools(command_requires_gh(&cli.cmd))?;
+    if let crate::cli::Cmd::Resume { path, .. } = &cli.cmd {
+        return ensure_resume_completed(
+            output_mode,
+            crate::commands::resume_rewrite(cli.dry_run, path)?,
+        );
+    }
+
     let cfg = crate::config::load_config()?;
     let (base, prefix, ignore_tag) =
         resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone())?;
@@ -169,9 +227,9 @@ fn main() -> Result<()> {
             set_dry_run_env(cli.dry_run, assume_existing_prs);
             let pr_description_mode = pr_description_mode_override.unwrap_or(pr_description_mode);
             if restack {
-                return Err(anyhow::anyhow!(
+                Err(anyhow::anyhow!(
                     "`spr update --restack` is deprecated. Use `spr restack --after N` instead."
-                ));
+                ))
             } else {
                 let (_merge_base, leading_ignored, all_groups) =
                     crate::parsing::derive_groups_between_with_ignored(&base, &from, &ignore_tag)?;
@@ -209,22 +267,35 @@ fn main() -> Result<()> {
                     allow_branch_reuse,
                     branch_reuse_guard_days,
                 )?;
+                Ok(crate::machine_output::MachineOutput::completed(
+                    crate::machine_output::MachineCommand::Restack,
+                ))
             }
         }
-        crate::cli::Cmd::Restack { after, safe } => {
+        crate::cli::Cmd::Restack {
+            after,
+            safe,
+            json: _,
+        } => {
             set_dry_run_env(cli.dry_run, false);
-            crate::commands::restack_after(
-                &base,
-                &ignore_tag,
-                &after,
-                safe,
-                cli.dry_run,
-                restack_conflict_policy,
-                dirty_worktree_policy,
-            )?;
+            ensure_rewrite_completed(
+                output_mode,
+                "spr restack",
+                crate::machine_output::MachineCommand::Restack,
+                crate::commands::restack_after(
+                    &base,
+                    &ignore_tag,
+                    &after,
+                    safe,
+                    cli.dry_run,
+                    restack_conflict_policy,
+                    dirty_worktree_policy,
+                )?,
+            )
         }
         crate::cli::Cmd::Absorb {
             allow_replayed_duplicates,
+            json: _,
         } => {
             set_dry_run_env(cli.dry_run, false);
             let options = crate::commands::AbsorbOptions {
@@ -234,14 +305,19 @@ fn main() -> Result<()> {
                     crate::commands::CopiedLaterStackCommitPolicy::Block
                 },
             };
-            crate::commands::absorb_branch_tails(
-                &base,
-                &prefix,
-                &ignore_tag,
-                cli.dry_run,
-                dirty_worktree_policy,
-                options,
-            )?;
+            ensure_rewrite_completed(
+                output_mode,
+                "spr absorb",
+                crate::machine_output::MachineCommand::Absorb,
+                crate::commands::absorb_branch_tails(
+                    &base,
+                    &prefix,
+                    &ignore_tag,
+                    cli.dry_run,
+                    dirty_worktree_policy,
+                    options,
+                )?,
+            )
         }
         crate::cli::Cmd::Prep {} => {
             set_dry_run_env(cli.dry_run, false);
@@ -268,23 +344,35 @@ fn main() -> Result<()> {
                 selection,
                 cli.dry_run,
             )?;
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
         }
-        crate::cli::Cmd::List { what } => match what {
-            crate::cli::ListWhat::Pr => {
-                crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
+        crate::cli::Cmd::List { what } => {
+            match what {
+                crate::cli::ListWhat::Pr => {
+                    crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?;
+                }
+                crate::cli::ListWhat::Commit => {
+                    crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?;
+                }
             }
-            crate::cli::ListWhat::Commit => {
-                crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?
-            }
-        },
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
+        }
         crate::cli::Cmd::Status {} => {
             // alias for `spr list pr`
-            crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
+            crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?;
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
         }
         crate::cli::Cmd::Land {
             which,
             r#unsafe,
             no_restack,
+            json: _,
         } => {
             set_dry_run_env(cli.dry_run, false);
             let mode = which.unwrap_or(match cfg.land.as_str() {
@@ -314,7 +402,7 @@ fn main() -> Result<()> {
             };
             if !no_restack {
                 // After landing the first N PRs, restack the remaining commits onto the latest base
-                crate::commands::restack_after_count(
+                let outcome = crate::commands::restack_after_count(
                     &base,
                     &ignore_tag,
                     landed_count,
@@ -323,53 +411,246 @@ fn main() -> Result<()> {
                     restack_conflict_policy,
                     dirty_worktree_policy,
                 )?;
+                if let crate::commands::RewriteCommandOutcome::Suspended(state) = outcome {
+                    let post_success_hint = Some(
+                        "GitHub landing already succeeded; resolve the local restack conflict and run the printed `spr resume <path>` command instead of rerunning `spr land`."
+                            .to_string(),
+                    );
+                    if output_mode == OutputMode::Json {
+                        return Ok(crate::machine_output::MachineOutput::suspended(
+                            crate::machine_output::MachineCommand::Land,
+                            *state,
+                            post_success_hint,
+                        ));
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "GitHub landing already succeeded, but the follow-on restack suspended due to a cherry-pick conflict. Resolve the conflict in the temp worktree, stage the resolution, and run `spr resume {}` instead of rerunning `spr land`.",
+                            state.resume_path.display()
+                        ));
+                    }
+                }
             }
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Land,
+            ))
         }
         crate::cli::Cmd::RelinkPrs {} => {
             set_dry_run_env(cli.dry_run, false);
             crate::commands::relink_prs(&base, &prefix, &ignore_tag, cli.dry_run)?;
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
         }
         crate::cli::Cmd::Cleanup {} => {
             set_dry_run_env(cli.dry_run, false);
             crate::commands::cleanup_remote_branches(&prefix, cli.dry_run)?;
+            Ok(crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineCommand::Restack,
+            ))
         }
-        crate::cli::Cmd::FixPr { target, tail, safe } => {
+        crate::cli::Cmd::FixPr {
+            target,
+            tail,
+            safe,
+            json: _,
+        } => {
             set_dry_run_env(cli.dry_run, false);
-            crate::commands::fix_pr_tail(
-                &base,
-                &ignore_tag,
-                &target,
-                tail,
-                safe,
-                cli.dry_run,
-                dirty_worktree_policy,
-            )?;
-        }
-        crate::cli::Cmd::Move { range, after, safe } => {
-            set_dry_run_env(cli.dry_run, false);
-            crate::commands::move_groups_after(
-                &base,
-                &prefix,
-                &ignore_tag,
-                &range,
-                &after,
-                crate::commands::MoveExecutionOptions {
+            ensure_rewrite_completed(
+                output_mode,
+                "spr fix-pr",
+                crate::machine_output::MachineCommand::FixPr,
+                crate::commands::fix_pr_tail(
+                    &base,
+                    &ignore_tag,
+                    &target,
+                    tail,
                     safe,
-                    dry: cli.dry_run,
+                    cli.dry_run,
                     dirty_worktree_policy,
-                },
-            )?;
+                )?,
+            )
+        }
+        crate::cli::Cmd::Move {
+            range,
+            after,
+            safe,
+            json: _,
+        } => {
+            set_dry_run_env(cli.dry_run, false);
+            ensure_rewrite_completed(
+                output_mode,
+                "spr move",
+                crate::machine_output::MachineCommand::Move,
+                crate::commands::move_groups_after(
+                    &base,
+                    &prefix,
+                    &ignore_tag,
+                    &range,
+                    &after,
+                    crate::commands::MoveExecutionOptions {
+                        safe,
+                        dry: cli.dry_run,
+                        dirty_worktree_policy,
+                    },
+                )?,
+            )
+        }
+        crate::cli::Cmd::Resume { .. } => unreachable!("handled before config loading"),
+    }
+}
+
+fn init_logging(verbose: bool, output_mode: OutputMode) {
+    if output_mode == OutputMode::Json {
+        return;
+    }
+    if verbose {
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_target(false)
+            .with_level(false)
+            .compact()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_target(false)
+            .with_level(false)
+            .without_time()
+            .compact()
+            .init();
+    }
+    if verbose {
+        std::env::set_var("SPR_VERBOSE", "1");
+    }
+}
+
+fn raw_args_request_json(args: &[OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg.as_os_str() == OsStr::new("--json"))
+}
+
+fn machine_command_for_raw_args(args: &[OsString]) -> crate::machine_output::MachineCommand {
+    let mut skip_value = false;
+    for arg in args.iter().skip(1) {
+        if skip_value {
+            skip_value = false;
+        } else if let Some(arg) = arg.to_str() {
+            if arg == "--cd"
+                || arg == "--base"
+                || arg == "--prefix"
+                || arg == "--until"
+                || arg == "--exact"
+                || arg == "-b"
+            {
+                skip_value = true;
+            } else if arg == "restack" {
+                return crate::machine_output::MachineCommand::Restack;
+            } else if arg == "absorb" {
+                return crate::machine_output::MachineCommand::Absorb;
+            } else if arg == "move" || arg == "mv" {
+                return crate::machine_output::MachineCommand::Move;
+            } else if arg == "fix-pr" || arg == "fix" {
+                return crate::machine_output::MachineCommand::FixPr;
+            } else if arg == "resume" {
+                return crate::machine_output::MachineCommand::Resume;
+            } else if arg == "land" {
+                return crate::machine_output::MachineCommand::Land;
+            } else if !arg.starts_with('-') {
+                return crate::machine_output::MachineCommand::Cli;
+            }
         }
     }
-    Ok(())
+    crate::machine_output::MachineCommand::Cli
+}
+
+fn parse_failure_as_machine_output(
+    args: &[OsString],
+    err: &clap::Error,
+) -> Option<crate::machine_output::MachineOutput> {
+    let is_display_only = matches!(
+        err.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    );
+    if raw_args_request_json(args) && !is_display_only {
+        Some(crate::machine_output::MachineOutput::error(
+            machine_command_for_raw_args(args),
+            err.to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn main() {
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match crate::cli::Cli::try_parse_from(raw_args.clone()) {
+        Ok(cli) => cli,
+        Err(err) => {
+            if let Some(output) = parse_failure_as_machine_output(&raw_args, &err) {
+                println!("{}", serde_json::to_string(&output).unwrap());
+                std::process::exit(crate::machine_output::EXIT_FAILURE);
+            } else {
+                err.exit();
+            }
+        }
+    };
+    let output_mode = if cli.cmd.json_mode() {
+        OutputMode::Json
+    } else {
+        OutputMode::Human
+    };
+    init_logging(cli.verbose, output_mode);
+    let command = machine_command_for_cli(&cli.cmd);
+    match run_cli(cli, output_mode) {
+        Ok(output) => {
+            if output_mode == OutputMode::Json {
+                println!("{}", serde_json::to_string(&output).unwrap());
+                std::process::exit(output.exit_code());
+            }
+        }
+        Err(err) => {
+            if output_mode == OutputMode::Json {
+                let output =
+                    crate::machine_output::MachineOutput::error(command, format!("{err:#}"));
+                println!("{}", serde_json::to_string(&output).unwrap());
+            } else {
+                eprintln!("Error: {err:#}");
+            }
+            std::process::exit(crate::machine_output::EXIT_FAILURE);
+        }
+    }
+}
+
+fn machine_command_for_cli(cmd: &crate::cli::Cmd) -> crate::machine_output::MachineCommand {
+    match cmd {
+        crate::cli::Cmd::Restack { .. } => crate::machine_output::MachineCommand::Restack,
+        crate::cli::Cmd::Absorb { .. } => crate::machine_output::MachineCommand::Absorb,
+        crate::cli::Cmd::Resume { .. } => crate::machine_output::MachineCommand::Resume,
+        crate::cli::Cmd::Land { .. } => crate::machine_output::MachineCommand::Land,
+        crate::cli::Cmd::FixPr { .. } => crate::machine_output::MachineCommand::FixPr,
+        crate::cli::Cmd::Move { .. } => crate::machine_output::MachineCommand::Move,
+        crate::cli::Cmd::Update { .. }
+        | crate::cli::Cmd::Prep {}
+        | crate::cli::Cmd::List { .. }
+        | crate::cli::Cmd::Status {}
+        | crate::cli::Cmd::RelinkPrs {}
+        | crate::cli::Cmd::Cleanup {} => crate::machine_output::MachineCommand::Restack,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_working_directory_override, command_requires_gh, resolve_update_pr_limit};
+    use super::{
+        apply_working_directory_override, command_requires_gh, machine_command_for_raw_args,
+        parse_failure_as_machine_output, resolve_update_pr_limit,
+    };
+    use crate::machine_output::{MachineCommand, MachinePayload};
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, StableHandle};
     use crate::test_support::lock_cwd;
+    use clap::Parser;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -452,6 +733,15 @@ mod tests {
     fn absorb_is_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::Absorb {
             allow_replayed_duplicates: false,
+            json: false,
+        }));
+    }
+
+    #[test]
+    fn resume_is_local_only_for_tool_checks() {
+        assert!(!command_requires_gh(&crate::cli::Cmd::Resume {
+            path: std::path::PathBuf::from(".git/spr/resume/example.json"),
+            json: false,
         }));
     }
 
@@ -483,5 +773,64 @@ mod tests {
         let actual_root = PathBuf::from(crate::git::repo_root().unwrap().unwrap());
 
         assert_eq!(fs::canonicalize(actual_root).unwrap(), expected_root);
+    }
+
+    #[test]
+    fn machine_command_for_raw_args_skips_global_option_values() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("--cd"),
+            OsString::from("/tmp/repo"),
+            OsString::from("resume"),
+            OsString::from("--json"),
+            OsString::from("state.json"),
+        ];
+
+        assert_eq!(machine_command_for_raw_args(&args), MachineCommand::Resume);
+    }
+
+    #[test]
+    fn parse_failure_with_json_returns_machine_error() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("restack"),
+            OsString::from("--json"),
+        ];
+        let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
+        let output = parse_failure_as_machine_output(&args, &err)
+            .expect("json parse failure should serialize");
+
+        match output.payload {
+            MachinePayload::Error {
+                command,
+                ref message,
+            } => {
+                assert_eq!(command, MachineCommand::Restack);
+                assert!(message.contains("--after"));
+            }
+            other => panic!("unexpected parse-failure payload: {:?}", other),
+        }
+        assert_eq!(output.exit_code(), crate::machine_output::EXIT_FAILURE);
+    }
+
+    #[test]
+    fn parse_failure_without_json_stays_human() {
+        let args = vec![OsString::from("spr"), OsString::from("restack")];
+        let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
+
+        assert!(parse_failure_as_machine_output(&args, &err).is_none());
+    }
+
+    #[test]
+    fn help_request_with_json_stays_human() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("restack"),
+            OsString::from("--json"),
+            OsString::from("--help"),
+        ];
+        let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected help output");
+
+        assert!(parse_failure_as_machine_output(&args, &err).is_none());
     }
 }
