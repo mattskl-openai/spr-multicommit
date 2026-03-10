@@ -4,11 +4,20 @@ use anyhow::{anyhow, Result};
 use tracing::info;
 
 use crate::commands::common;
+use crate::config::DirtyWorktreePolicy;
 use crate::github::get_open_pr_automerge_for_head;
 use crate::parsing::derive_local_groups_with_ignored;
 use crate::selectors::{
     resolve_after_count, resolve_group_range, AfterSelector, GroupRangeSelector,
 };
+
+/// Execution controls for `spr move`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveExecutionOptions {
+    pub safe: bool,
+    pub dry: bool,
+    pub dirty_worktree_policy: DirtyWorktreePolicy,
+}
 
 fn format_simple_plan(old: &[usize], new: &[usize], a: usize, b: usize, c: usize) -> String {
     let lhs = if a == b {
@@ -128,8 +137,7 @@ pub fn move_groups_after(
     ignore_tag: &str,
     range: &GroupRangeSelector,
     after: &AfterSelector,
-    safe: bool,
-    dry: bool,
+    options: MoveExecutionOptions,
 ) -> Result<()> {
     // Discover groups from local commits bottom→top
     let (merge_base, leading_ignored, groups) = derive_local_groups_with_ignored(base, ignore_tag)?;
@@ -204,44 +212,46 @@ pub fn move_groups_after(
         return Ok(());
     }
 
-    // Optionally create a backup tag at current HEAD
-    let (cur_branch, short) = common::get_current_branch_and_short()?;
-    if safe {
-        let _ = common::create_backup_tag(dry, "move", &cur_branch, &short)?;
-    }
+    common::with_dirty_worktree_policy(
+        options.dry,
+        "spr move",
+        options.dirty_worktree_policy,
+        || {
+            let (cur_branch, short) = common::get_current_branch_and_short()?;
+            if options.safe {
+                let _ = common::create_backup_tag(options.dry, "move", &cur_branch, &short)?;
+            }
 
-    // Build the new history in a temporary worktree off merge-base
-    let (tmp_path, tmp_branch) = common::create_temp_worktree(dry, "move", &merge_base, &short)?;
+            let (tmp_path, tmp_branch) =
+                common::create_temp_worktree(options.dry, "move", &merge_base, &short)?;
 
-    // Preserve ignored commits that appear before the first group
-    cherry_pick_block(dry, &tmp_path, &leading_ignored)?;
+            cherry_pick_block(options.dry, &tmp_path, &leading_ignored)?;
 
-    // Cherry-pick commits in the new order, group by group (batched per-group)
-    for idx in &new_order {
-        let g = &groups[*idx - 1];
-        if let (Some(first), Some(last)) = (g.commits.first(), g.commits.last()) {
-            common::cherry_pick_range(
-                dry,
-                &tmp_path,
-                first,
-                last,
-                common::CherryPickEmptyPolicy::StopOnEmpty,
-            )?;
-        }
-        cherry_pick_block(dry, &tmp_path, &g.ignored_after)?;
-    }
+            for idx in &new_order {
+                let g = &groups[*idx - 1];
+                if let (Some(first), Some(last)) = (g.commits.first(), g.commits.last()) {
+                    common::cherry_pick_range(
+                        options.dry,
+                        &tmp_path,
+                        first,
+                        last,
+                        common::CherryPickEmptyPolicy::StopOnEmpty,
+                    )?;
+                }
+                cherry_pick_block(options.dry, &tmp_path, &g.ignored_after)?;
+            }
 
-    let new_tip = common::tip_of_tmp(&tmp_path)?;
-    info!(
-        "Updating current branch {} to new tip {} (stack reordered)…",
-        cur_branch, new_tip
-    );
-    common::reset_current_branch_to(dry, &new_tip)?;
+            let new_tip = common::tip_of_tmp(&tmp_path)?;
+            info!(
+                "Updating current branch {} to new tip {} (stack reordered)…",
+                cur_branch, new_tip
+            );
+            common::reset_current_branch_to(options.dry, &new_tip)?;
+            common::cleanup_temp_worktree(options.dry, &tmp_path, &tmp_branch)?;
 
-    // Cleanup temp worktree/branch
-    common::cleanup_temp_worktree(dry, &tmp_path, &tmp_branch)?;
-
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]

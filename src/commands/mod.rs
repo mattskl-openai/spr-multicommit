@@ -17,7 +17,7 @@ pub use land::{land_flatten_until, land_per_pr_until};
 pub use list::list_commits_display;
 pub use list::list_prs_display;
 pub use prep::prep_squash;
-pub use r#move::move_groups_after;
+pub use r#move::{move_groups_after, MoveExecutionOptions};
 pub use relink_prs::relink_prs;
 pub use restack::{restack_after, restack_after_count};
 pub use update::{build_from_groups, build_from_tags};

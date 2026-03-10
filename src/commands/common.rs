@@ -17,15 +17,21 @@
 //! and uses `git worktree add -B` as a final safeguard when cleanup is skipped
 //! in dry-run mode.
 //!
+//! Branch-rewriting commands also share dirty-worktree handling. Depending on
+//! config, they may preserve current behavior and discard tracked changes,
+//! auto-stash local changes and restore them after the rewrite, or halt before
+//! any destructive step.
+//!
 //! Backup tags are local-only and are intended as an escape hatch for a single
 //! user; callers should not rely on them being immutable.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::config::DirtyWorktreePolicy;
 use crate::git::{git_ro, git_rw, normalize_branch_name};
 use crate::parsing::Group;
 
@@ -266,6 +272,189 @@ pub fn cleanup_temp_worktree(dry: bool, tmp_path: &str, tmp_branch: &str) -> Res
     Ok(())
 }
 
+#[derive(Debug)]
+enum DirtyWorktreeRestore {
+    Noop,
+    PlannedStash,
+    Stashed { stash_ref: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewriteOutcome {
+    Succeeded,
+    Failed,
+}
+
+impl RewriteOutcome {
+    fn verb(self) -> &'static str {
+        if self == Self::Succeeded {
+            "rewrote history"
+        } else {
+            "failed before finishing the rewrite"
+        }
+    }
+}
+
+fn worktree_status_lines() -> Result<Vec<String>> {
+    let out = git_ro(["status", "--porcelain=v1"].as_slice())?;
+    Ok(out.lines().map(|line| line.to_string()).collect::<Vec<_>>())
+}
+
+fn status_line_has_conflict(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    if bytes.len() < 2 {
+        false
+    } else {
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+        x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D')
+    }
+}
+
+fn prepare_dirty_worktree(
+    dry: bool,
+    command_name: &str,
+    policy: DirtyWorktreePolicy,
+) -> Result<DirtyWorktreeRestore> {
+    let status_lines = worktree_status_lines()?;
+    if status_lines.is_empty() {
+        Ok(DirtyWorktreeRestore::Noop)
+    } else if status_lines
+        .iter()
+        .any(|line| status_line_has_conflict(line))
+    {
+        bail!(
+            "{} cannot rewrite history with unresolved merge conflicts:\n{}\nResolve the conflicts first.",
+            command_name,
+            status_lines.join("\n")
+        );
+    } else if policy == DirtyWorktreePolicy::Discard {
+        info!(
+            "{} detected local changes and dirty_worktree=discard; proceeding without preserving tracked changes. Untracked files are left in place.",
+            command_name
+        );
+        Ok(DirtyWorktreeRestore::Noop)
+    } else if policy == DirtyWorktreePolicy::Halt {
+        bail!(
+            "{} rewrites the checked-out branch and dirty_worktree=halt found local changes:\n{}\nCommit, stash, or discard them first.",
+            command_name,
+            status_lines.join("\n")
+        );
+    } else if dry {
+        info!(
+            "DRY-RUN: would stash local changes before {} because dirty_worktree=stash",
+            command_name
+        );
+        Ok(DirtyWorktreeRestore::PlannedStash)
+    } else {
+        let message = format!("spr auto-stash before {}", command_name);
+        let stash_ref = "stash@{0}".to_string();
+        let _ = git_rw(
+            false,
+            [
+                "stash",
+                "push",
+                "--include-untracked",
+                "--message",
+                &message,
+            ]
+            .as_slice(),
+        )?;
+        let remaining = worktree_status_lines()?;
+        if remaining.is_empty() {
+            info!(
+                "Stashed local changes before {} because dirty_worktree=stash",
+                command_name
+            );
+            Ok(DirtyWorktreeRestore::Stashed { stash_ref })
+        } else {
+            bail!(
+                "{} stashed local changes but the worktree is still dirty:\n{}",
+                command_name,
+                remaining.join("\n")
+            );
+        }
+    }
+}
+
+impl DirtyWorktreeRestore {
+    fn restore(self, dry: bool, command_name: &str, outcome: RewriteOutcome) -> Result<()> {
+        match self {
+            Self::Noop => Ok(()),
+            Self::PlannedStash => {
+                if dry {
+                    info!(
+                        "DRY-RUN: would restore stashed local changes after {}",
+                        command_name
+                    );
+                }
+                Ok(())
+            }
+            Self::Stashed { stash_ref } => {
+                let _ = git_rw(false, ["stash", "apply", "--index", &stash_ref].as_slice())
+                    .with_context(|| {
+                        format!(
+                            "{} {} but failed to restore stashed changes from {}; the stash entry was kept for manual recovery",
+                            command_name,
+                            outcome.verb(),
+                            stash_ref
+                        )
+                    })?;
+                if let Err(err) = git_rw(false, ["stash", "drop", &stash_ref].as_slice()) {
+                    warn!(
+                        "Restored stashed local changes after {}, but failed to drop {}: {}",
+                        command_name, stash_ref, err
+                    );
+                }
+                if dry {
+                    info!(
+                        "DRY-RUN: restored stashed local changes after {}",
+                        command_name
+                    );
+                } else {
+                    info!("Restored stashed local changes after {}", command_name);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Run a branch rewrite under the configured dirty-worktree policy.
+///
+/// This is the single source of truth for commands that rebuild the
+/// checked-out branch and then replace it with a rewritten tip.
+pub fn with_dirty_worktree_policy<T, F>(
+    dry: bool,
+    command_name: &str,
+    policy: DirtyWorktreePolicy,
+    rewrite: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let restore = prepare_dirty_worktree(dry, command_name, policy)?;
+    let rewrite_result = rewrite();
+    let outcome = if rewrite_result.is_ok() {
+        RewriteOutcome::Succeeded
+    } else {
+        RewriteOutcome::Failed
+    };
+    let restore_result = restore.restore(dry, command_name, outcome);
+
+    match (rewrite_result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(restore_err)) => Err(restore_err),
+        (Err(rewrite_err), Ok(())) => Err(rewrite_err),
+        (Err(rewrite_err), Err(restore_err)) => Err(rewrite_err).with_context(|| {
+            format!(
+                "also failed to restore local changes after {}: {restore_err:#}",
+                command_name
+            )
+        }),
+    }
+}
+
 /// A single cherry-pick operation used to rebuild stack history.
 ///
 /// `Range` represents an inclusive `first^..last` cherry-pick over a contiguous
@@ -386,34 +575,11 @@ mod tests {
         cleanup_temp_worktree, create_backup_tag, create_temp_worktree,
         get_current_branch_and_short,
     };
-    use std::env;
+    use crate::test_support::{lock_cwd, DirGuard};
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    // Tests in this module mutate the process-wide current working directory.
-    // Serialize them to avoid cross-test interference.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-    struct DirGuard {
-        original: PathBuf,
-    }
-
-    impl DirGuard {
-        fn change_to(path: &Path) -> Self {
-            let original = env::current_dir().expect("current dir available");
-            env::set_current_dir(path).expect("set current dir to temp repo");
-            Self { original }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            env::set_current_dir(&self.original).expect("restore original current dir");
-        }
-    }
 
     fn git(repo: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -445,7 +611,7 @@ mod tests {
 
     #[test]
     fn create_backup_tag_overwrites_existing() {
-        let _lock = CWD_LOCK.lock().expect("lock cwd");
+        let _lock = lock_cwd();
         let dir = init_repo();
         let repo = dir.path().to_path_buf();
         let _guard = DirGuard::change_to(&repo);
@@ -473,7 +639,7 @@ mod tests {
 
     #[test]
     fn create_temp_worktree_replaces_existing_temp_branch() {
-        let _lock = CWD_LOCK.lock().expect("lock cwd");
+        let _lock = lock_cwd();
         let dir = init_repo();
         let repo = dir.path().to_path_buf();
         let _guard = DirGuard::change_to(&repo);
