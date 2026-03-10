@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Extent {
@@ -178,6 +179,9 @@ pub struct Cli {
     /// Verbose output for underlying git/gh commands
     #[arg(long, global = true)]
     pub verbose: bool,
+    /// Change to PATH before loading repo config or running git/gh commands
+    #[arg(long, global = true, value_name = "PATH")]
+    pub cd: Option<PathBuf>,
     /// Global base branch (root of stack)
     #[arg(short = 'b', long, global = true)]
     pub base: Option<String>,
@@ -201,6 +205,7 @@ pub struct Cli {
 mod tests {
     use super::{Cli, Cmd};
     use clap::{CommandFactory, Parser};
+    use std::path::PathBuf;
 
     #[test]
     fn absorb_override_flag_parses() {
@@ -230,5 +235,21 @@ mod tests {
             "Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same."
         ));
         assert!(long_about.contains("skip (rewritten-equivalent prefix)"));
+    }
+
+    #[test]
+    fn global_cd_flag_parses_after_subcommand() {
+        let cli = Cli::try_parse_from(["spr", "status", "--cd", "/tmp/example"]).unwrap();
+
+        assert_eq!(cli.cd, Some(PathBuf::from("/tmp/example")));
+        assert!(matches!(cli.cmd, Cmd::Status {}));
+    }
+
+    #[test]
+    fn global_cd_flag_parses_before_subcommand() {
+        let cli = Cli::try_parse_from(["spr", "--cd", "/tmp/example", "status"]).unwrap();
+
+        assert_eq!(cli.cd, Some(PathBuf::from("/tmp/example")));
+        assert!(matches!(cli.cmd, Cmd::Status {}));
     }
 }
