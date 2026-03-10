@@ -16,7 +16,7 @@ fn resolve_fix_pr_target(
     resolve_group_ordinal(groups, target)
 }
 
-/// Move the last `tail_count` commits (top-of-stack) to become the tail of PR `n` (1-based, bottom→top).
+/// Move the last `tail_count` commits (top-of-stack) to the tail of a selected PR group.
 ///
 /// Ignore blocks are treated as part of the preceding group and are never moved.
 /// If the selected tail commits intersect an ignore block, the operation aborts.
@@ -67,7 +67,7 @@ pub fn fix_pr_tail(
     let mut offenders: Vec<String> = vec![];
     for sha in &top_commits {
         let msg = git_ro(["log", "-n", "1", "--format=%B", sha].as_slice())?;
-        if crate::pr_labels::candidate_marker_regex().is_match(&msg) {
+        if crate::pr_labels::contains_candidate_marker(&msg) {
             offenders.push(sha.clone());
         }
     }
@@ -143,7 +143,12 @@ pub fn fix_pr_tail(
 
     for sha in &new_order {
         // Cherry-pick the commit onto tmp
-        common::cherry_pick_commit(dry, &tmp_path, sha)?;
+        common::cherry_pick_commit(
+            dry,
+            &tmp_path,
+            sha,
+            common::CherryPickEmptyPolicy::StopOnEmpty,
+        )?;
     }
 
     // Point current branch to new tip

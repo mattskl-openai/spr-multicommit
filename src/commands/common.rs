@@ -212,14 +212,40 @@ fn cleanup_existing_temp_state(dry: bool, tmp_path: &str, tmp_branch: &str) -> R
     Ok(())
 }
 
-pub fn cherry_pick_commit(dry: bool, tmp_path: &str, sha: &str) -> Result<()> {
-    let _ = git_rw(dry, ["-C", tmp_path, "cherry-pick", sha].as_slice())?;
+fn cherry_pick_args<'a>(
+    tmp_path: &'a str,
+    empty_policy: CherryPickEmptyPolicy,
+    tail_args: &[&'a str],
+) -> Vec<&'a str> {
+    let mut args = vec!["-C", tmp_path, "cherry-pick"];
+    if empty_policy == CherryPickEmptyPolicy::KeepRedundantCommits {
+        args.push("--empty=keep");
+    }
+    args.extend_from_slice(tail_args);
+    args
+}
+
+pub fn cherry_pick_commit(
+    dry: bool,
+    tmp_path: &str,
+    sha: &str,
+    empty_policy: CherryPickEmptyPolicy,
+) -> Result<()> {
+    let args = cherry_pick_args(tmp_path, empty_policy, &[sha]);
+    let _ = git_rw(dry, args.as_slice())?;
     Ok(())
 }
 
-pub fn cherry_pick_range(dry: bool, tmp_path: &str, first: &str, last: &str) -> Result<()> {
+pub fn cherry_pick_range(
+    dry: bool,
+    tmp_path: &str,
+    first: &str,
+    last: &str,
+    empty_policy: CherryPickEmptyPolicy,
+) -> Result<()> {
     let range = format!("{}^..{}", first, last);
-    let _ = git_rw(dry, ["-C", tmp_path, "cherry-pick", &range].as_slice())?;
+    let args = cherry_pick_args(tmp_path, empty_policy, &[range.as_str()]);
+    let _ = git_rw(dry, args.as_slice())?;
     Ok(())
 }
 
@@ -238,6 +264,108 @@ pub fn cleanup_temp_worktree(dry: bool, tmp_path: &str, tmp_branch: &str) -> Res
     let _ = git_rw(dry, ["worktree", "remove", "-f", tmp_path].as_slice())?;
     let _ = git_rw(dry, ["branch", "-D", tmp_branch].as_slice())?;
     Ok(())
+}
+
+/// A single cherry-pick operation used to rebuild stack history.
+///
+/// `Range` represents an inclusive `first^..last` cherry-pick over a contiguous
+/// commit interval. Callers must supply commits that already reflect the
+/// intended replay order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CherryPickEmptyPolicy {
+    /// Stop when a replay becomes empty because earlier history already applied it.
+    StopOnEmpty,
+    /// Keep redundant replays as explicit empty commits.
+    KeepRedundantCommits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CherryPickOp {
+    /// Cherry-pick exactly one commit.
+    Commit {
+        sha: String,
+        empty_policy: CherryPickEmptyPolicy,
+    },
+    /// Cherry-pick one contiguous inclusive range.
+    Range {
+        first: String,
+        last: String,
+        empty_policy: CherryPickEmptyPolicy,
+    },
+}
+
+impl CherryPickOp {
+    /// Builds the smallest cherry-pick operation that can replay `commits`.
+    ///
+    /// Returns `None` when the slice is empty.
+    pub fn from_commits(commits: &[String]) -> Option<Self> {
+        Self::from_commits_with_empty_policy(commits, CherryPickEmptyPolicy::StopOnEmpty)
+    }
+
+    /// Builds the smallest cherry-pick operation that can replay `commits`
+    /// under a specific empty-commit policy.
+    pub fn from_commits_with_empty_policy(
+        commits: &[String],
+        empty_policy: CherryPickEmptyPolicy,
+    ) -> Option<Self> {
+        if let (Some(first), Some(last)) = (commits.first(), commits.last()) {
+            if commits.len() == 1 {
+                Some(Self::Commit {
+                    sha: first.clone(),
+                    empty_policy,
+                })
+            } else {
+                Some(Self::Range {
+                    first: first.clone(),
+                    last: last.clone(),
+                    empty_policy,
+                })
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Executes the operation in the temp worktree at `tmp_path`.
+    pub fn run(&self, dry: bool, tmp_path: &str) -> Result<()> {
+        match self {
+            Self::Commit { sha, empty_policy } => {
+                cherry_pick_commit(dry, tmp_path, sha, *empty_policy)
+            }
+            Self::Range {
+                first,
+                last,
+                empty_policy,
+            } => cherry_pick_range(dry, tmp_path, first, last, *empty_policy),
+        }
+    }
+
+    /// Renders the matching `git cherry-pick` command for human continuation.
+    pub fn command_for_user(&self, tmp_path: &str) -> String {
+        match self {
+            Self::Commit { sha, empty_policy } => {
+                if *empty_policy == CherryPickEmptyPolicy::KeepRedundantCommits {
+                    format!("git -C {} cherry-pick --empty=keep {}", tmp_path, sha)
+                } else {
+                    format!("git -C {} cherry-pick {}", tmp_path, sha)
+                }
+            }
+            Self::Range {
+                first,
+                last,
+                empty_policy,
+            } => {
+                if *empty_policy == CherryPickEmptyPolicy::KeepRedundantCommits {
+                    format!(
+                        "git -C {} cherry-pick --empty=keep {}^..{}",
+                        tmp_path, first, last
+                    )
+                } else {
+                    format!("git -C {} cherry-pick {}^..{}", tmp_path, first, last)
+                }
+            }
+        }
+    }
 }
 
 /// Build expected (head, base) chain bottom→top from local groups
