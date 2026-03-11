@@ -333,6 +333,58 @@ fn list_conflicting_prs_for_heads_search_exhaustive(
     }
 }
 
+/// Resolve one requested open head from already-fetched exact and conflict matches.
+///
+/// Callers are expected to pass the exact `headRefName` results and the case-insensitive conflict
+/// probe results from the same open-PR query batch. This function combines those two views and
+/// then applies the normal exact-head rule: one exact match is reusable, no matches means
+/// `None`, and any case-variant hit remains an error instead of being silently reused. Mixing
+/// maps from different query states or snapshots would make the ambiguity check misleading
+/// because the function assumes both inputs describe the same moment in GitHub state.
+///
+/// # Errors
+///
+/// Returns the same ambiguity error as `select_single_open_pr_match` when GitHub reports
+/// multiple exact open PRs or any case-variant open PR for the requested head.
+fn select_resolved_open_pr_match(
+    requested_head: &str,
+    exact_matches_by_head: &HashMap<String, Vec<HeadSearchPr>>,
+    conflict_matches_by_head: &HashMap<String, Vec<HeadSearchPr>>,
+) -> Result<Option<HeadSearchPr>> {
+    let mut matches = exact_matches_by_head
+        .get(requested_head)
+        .cloned()
+        .unwrap_or_default();
+    matches.extend(
+        conflict_matches_by_head
+            .get(requested_head)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    select_single_open_pr_match(requested_head, matches)
+}
+
+/// Resolve the current open PR for a single head with the same rules as the batched open lookup.
+///
+/// This scalar wrapper is for call sites that only care about one branch, such as auto-merge
+/// inspection or post-create PR-number recovery. It intentionally performs both the exact
+/// `headRefName` lookup and the case-insensitive open-search probe before resolving the result, so
+/// these single-head paths cannot drift from the batched open-PR behavior. Falling back to only
+/// the exact lookup here would reintroduce the bug where a local branch can ignore a conflicting
+/// case-variant remote head spelling.
+///
+/// # Errors
+///
+/// Returns any GitHub lookup failure or the same ambiguity error produced by the batched path
+/// when the requested head is not uniquely reusable.
+fn get_resolved_open_pr_match(head: &str) -> Result<Option<HeadSearchPr>> {
+    let requested_heads = [head.to_string()];
+    let exact_matches_by_head =
+        list_exact_prs_for_heads(&requested_heads, &["OPEN"], EXACT_HEAD_QUERY_LIMIT)?;
+    let conflict_matches_by_head = list_open_conflicting_prs_for_heads_search(&requested_heads)?;
+    select_resolved_open_pr_match(head, &exact_matches_by_head, &conflict_matches_by_head)
+}
+
 fn partition_exact_head_matches(
     requested_head: &str,
     matches: Vec<HeadSearchPr>,
@@ -706,14 +758,9 @@ pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
     let exact_matches_by_head = list_exact_prs_for_heads(heads, &["OPEN"], EXACT_HEAD_QUERY_LIMIT)?;
     let conflict_matches_by_head = list_open_conflicting_prs_for_heads_search(heads)?;
     for head in heads {
-        let mut matches = exact_matches_by_head.get(head).cloned().unwrap_or_default();
-        matches.extend(
-            conflict_matches_by_head
-                .get(head)
-                .cloned()
-                .unwrap_or_default(),
-        );
-        if let Some(pr) = select_single_open_pr_match(head, matches)? {
+        if let Some(pr) =
+            select_resolved_open_pr_match(head, &exact_matches_by_head, &conflict_matches_by_head)?
+        {
             out.push(head_search_pr_to_info(&pr, head)?);
         }
     }
@@ -744,17 +791,7 @@ fn parse_open_pr_automerge_node(
 ///
 /// Returns `Ok(None)` when no open PR exists for that head branch.
 pub fn get_open_pr_automerge_for_head(head: &str) -> Result<Option<OpenPrAutomergeInfo>> {
-    let requested_heads = [head.to_string()];
-    let mut matches =
-        list_exact_prs_for_heads(&requested_heads, &["OPEN"], EXACT_HEAD_QUERY_LIMIT)?
-            .remove(head)
-            .unwrap_or_default();
-    matches.extend(
-        list_open_conflicting_prs_for_heads_search(&requested_heads)?
-            .remove(head)
-            .unwrap_or_default(),
-    );
-    if let Some(pr) = select_single_open_pr_match(head, matches)? {
+    if let Some(pr) = get_resolved_open_pr_match(head)? {
         Ok(Some(OpenPrAutomergeInfo {
             number: pr.number,
             head: pr.head,
@@ -854,17 +891,11 @@ pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoW
     let open_conflicts_by_head = list_open_conflicting_prs_for_heads_search(heads)?;
     let mut heads_without_open_prs = Vec::new();
     for head in heads {
-        let mut open_matches = exact_open_matches_by_head
-            .get(head)
-            .cloned()
-            .unwrap_or_default();
-        open_matches.extend(
-            open_conflicts_by_head
-                .get(head)
-                .cloned()
-                .unwrap_or_default(),
-        );
-        if let Some(pr) = select_single_open_pr_match(head, open_matches)? {
+        if let Some(pr) = select_resolved_open_pr_match(
+            head,
+            &exact_open_matches_by_head,
+            &open_conflicts_by_head,
+        )? {
             out.push(PrInfoWithState {
                 number: pr.number,
                 head: pr.head,
@@ -974,17 +1005,7 @@ pub fn upsert_pr_cached(
     )?;
     let mut num: u64 = created_number.trim().parse().unwrap_or(0);
     if num == 0 && !dry {
-        let post_create_heads = [branch.to_string()];
-        let mut post_create_matches =
-            list_exact_prs_for_heads(&post_create_heads, &["OPEN"], EXACT_HEAD_QUERY_LIMIT)?
-                .remove(branch)
-                .unwrap_or_default();
-        post_create_matches.extend(
-            list_open_conflicting_prs_for_heads_search(&post_create_heads)?
-                .remove(branch)
-                .unwrap_or_default(),
-        );
-        if let Some(existing) = select_single_open_pr_match(branch, post_create_matches)? {
+        if let Some(existing) = get_resolved_open_pr_match(branch)? {
             num = existing.number;
         }
     }
