@@ -83,8 +83,13 @@ pub struct TerminalPrInfo {
 }
 
 const HEAD_SEARCH_LIMIT: usize = 100;
+const OPEN_CONFLICT_SEARCH_LIMIT: usize = 2;
 const HEAD_SEARCH_FIELDS: &str =
     "number,headRefName,baseRefName,state,mergedAt,closedAt,url,autoMergeRequest";
+const EXACT_HEAD_QUERY_LIMIT: usize = 10;
+const EXACT_PR_GRAPHQL_FIELDS: &str =
+    "number headRefName baseRefName state mergedAt closedAt url autoMergeRequest { enabledAt }";
+const TERMINAL_PR_SEARCH_GRAPHQL_FIELDS: &str = "number headRefName state mergedAt closedAt url";
 
 #[derive(Debug, Deserialize, Clone)]
 struct HeadSearchPr {
@@ -113,18 +118,30 @@ fn head_search_query(head: &str) -> String {
     format!("head:{head}")
 }
 
-fn head_search_scope(head: &str) -> String {
-    if let Some((prefix, _)) = head.rsplit_once('/') {
-        head_search_query(&format!("{prefix}/"))
-    } else {
-        head_search_query(head)
-    }
+fn open_conflict_search_query(repo: &str, head: &str) -> String {
+    format!("repo:{repo} is:pr is:open head:{head}")
 }
 
-fn filter_head_search_matches(requested_head: &str, prs: Vec<HeadSearchPr>) -> Vec<HeadSearchPr> {
+fn recent_terminal_search_query(repo: &str, head: &str, closed_since: OffsetDateTime) -> String {
+    let closed_since = closed_since.date();
+    format!("repo:{repo} is:pr is:closed head:{head} closed:>={closed_since} sort:closed-desc")
+}
+
+fn filter_head_search_matches(requested_head: &str, prs: &[HeadSearchPr]) -> Vec<HeadSearchPr> {
     let requested_key = head_key(requested_head);
-    prs.into_iter()
+    prs.iter()
         .filter(|pr| head_key(&pr.head) == requested_key)
+        .cloned()
+        .collect()
+}
+
+fn filter_case_variant_head_search_matches(
+    requested_head: &str,
+    prs: &[HeadSearchPr],
+) -> Vec<HeadSearchPr> {
+    filter_head_search_matches(requested_head, prs)
+        .into_iter()
+        .filter(|pr| pr.head != requested_head)
         .collect()
 }
 
@@ -148,9 +165,10 @@ fn list_prs_for_search_query(query: &str, state: &str, limit: usize) -> Result<V
     serde_json::from_str(&json).map_err(Into::into)
 }
 
-fn list_prs_for_heads_search(
+fn list_exact_prs_for_heads(
     heads: &[String],
-    state: &str,
+    states: &[&str],
+    limit: usize,
 ) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
     let mut matches_by_head: HashMap<String, Vec<HeadSearchPr>> = heads
         .iter()
@@ -160,43 +178,138 @@ fn list_prs_for_heads_search(
         return Ok(matches_by_head);
     }
 
-    let mut heads_by_query: HashMap<String, Vec<String>> = HashMap::new();
-    for head in heads {
-        heads_by_query
-            .entry(head_search_scope(head))
-            .or_default()
-            .push(head.clone());
+    let (owner, name) = get_repo_owner_name()?;
+    let states = states.join(",");
+    let mut query =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (i, head) in heads.iter().enumerate() {
+        query.push_str(&format!(
+            "pr{}: pullRequests(headRefName:\"{}\", states:[{}], first:{}, orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ {} }} }} ",
+            i,
+            graphql_escape(head),
+            states,
+            limit,
+            EXACT_PR_GRAPHQL_FIELDS,
+        ));
     }
-
-    for (query, query_heads) in heads_by_query {
-        let mut limit = HEAD_SEARCH_LIMIT;
-        loop {
-            let prs = list_prs_for_search_query(&query, state, limit)?;
-            let query_matches: Vec<(String, Vec<HeadSearchPr>)> = query_heads
-                .iter()
-                .map(|requested_head| {
-                    (
-                        requested_head.clone(),
-                        filter_head_search_matches(requested_head, prs.clone()),
-                    )
-                })
-                .collect();
-            let all_requested_heads_have_matches =
-                query_matches.iter().all(|(_, matches)| !matches.is_empty());
-            for (requested_head, matches) in query_matches {
-                matches_by_head.insert(requested_head, matches);
-            }
-            if all_requested_heads_have_matches || prs.len() < limit {
-                break;
-            }
-            let Some(next_limit) = limit.checked_mul(2) else {
-                break;
-            };
-            limit = next_limit;
-        }
+    query.push_str("} }");
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", query),
+            "-F",
+            &format!("owner={}", owner),
+            "-F",
+            &format!("name={}", name),
+        ]
+        .as_slice(),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &value["data"]["repository"];
+    for (i, head) in heads.iter().enumerate() {
+        let key = format!("pr{}", i);
+        let matches = repo[&key]["nodes"]
+            .as_array()
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .collect::<std::result::Result<Vec<HeadSearchPr>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        matches_by_head.insert(head.clone(), matches);
     }
 
     Ok(matches_by_head)
+}
+
+fn list_prs_for_search_query_exhaustive(query: &str, state: &str) -> Result<Vec<HeadSearchPr>> {
+    let mut limit = HEAD_SEARCH_LIMIT;
+    loop {
+        let prs = list_prs_for_search_query(query, state, limit)?;
+        if prs.len() < limit {
+            return Ok(prs);
+        }
+        let Some(next_limit) = limit.checked_mul(2) else {
+            return Ok(prs);
+        };
+        limit = next_limit;
+    }
+}
+
+fn list_open_conflicting_prs_for_heads_search(
+    heads: &[String],
+) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
+    let mut matches_by_head: HashMap<String, Vec<HeadSearchPr>> = heads
+        .iter()
+        .map(|head| (head.clone(), Vec::new()))
+        .collect();
+    if heads.is_empty() {
+        return Ok(matches_by_head);
+    }
+
+    let (owner, name) = get_repo_owner_name()?;
+    let repo = format!("{owner}/{name}");
+    let mut query = String::from("query { ");
+    for (i, head) in heads.iter().enumerate() {
+        let search_query = open_conflict_search_query(&repo, head);
+        query.push_str(&format!(
+            "pr{}: search(query:\"{}\", type:ISSUE, first:{}) {{ nodes {{ ... on PullRequest {{ {} }} }} }} ",
+            i,
+            graphql_escape(&search_query),
+            OPEN_CONFLICT_SEARCH_LIMIT,
+            EXACT_PR_GRAPHQL_FIELDS,
+        ));
+    }
+    query.push('}');
+
+    let json = gh_ro(["api", "graphql", "-f", &format!("query={query}")].as_slice())?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let data = &value["data"];
+    for (i, head) in heads.iter().enumerate() {
+        let key = format!("pr{}", i);
+        let prs = data[&key]["nodes"]
+            .as_array()
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .collect::<std::result::Result<Vec<HeadSearchPr>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        matches_by_head.insert(
+            head.clone(),
+            filter_case_variant_head_search_matches(head, &prs),
+        );
+    }
+
+    Ok(matches_by_head)
+}
+
+fn list_conflicting_prs_for_heads_search_exhaustive(
+    heads: &[String],
+    state: &str,
+) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
+    if heads.is_empty() {
+        Ok(HashMap::new())
+    } else {
+        heads
+            .iter()
+            .map(|head| {
+                let prs = list_prs_for_search_query_exhaustive(&head_search_query(head), state)?;
+                Ok((
+                    head.clone(),
+                    filter_case_variant_head_search_matches(head, &prs),
+                ))
+            })
+            .collect()
+    }
 }
 
 fn partition_exact_head_matches(
@@ -314,12 +427,20 @@ fn head_search_pr_to_info(pr: &HeadSearchPr, requested_head: &str) -> Result<PrI
 fn terminal_info_from_head_search(
     pr: &HeadSearchPr,
     requested_head: &str,
-) -> Result<Option<TerminalPrInfo>> {
+) -> Result<TerminalPrInfo> {
     let Some(state) = pr.state.as_deref() else {
-        return Ok(None);
+        return Err(anyhow!(
+            "Terminal PR #{} missing state for {}",
+            pr.number,
+            requested_head
+        ));
     };
     if state == "OPEN" {
-        return Ok(None);
+        return Err(anyhow!(
+            "Terminal PR #{} unexpectedly has OPEN state for {}",
+            pr.number,
+            requested_head
+        ));
     }
     let terminal_state = if state == "MERGED" {
         TerminalPrState::Merged
@@ -357,13 +478,13 @@ fn terminal_info_from_head_search(
             requested_head
         )
     })?;
-    Ok(Some(TerminalPrInfo {
+    Ok(TerminalPrInfo {
         number: pr.number,
         head: pr.head.clone(),
         state: terminal_state,
         terminal_at: terminal_at.to_string(),
         url: url.to_string(),
-    }))
+    })
 }
 
 #[derive(Clone)]
@@ -550,9 +671,16 @@ pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
     if heads.is_empty() {
         return Ok(out);
     }
-    let matches_by_head = list_prs_for_heads_search(heads, "open")?;
+    let exact_matches_by_head = list_exact_prs_for_heads(heads, &["OPEN"], EXACT_HEAD_QUERY_LIMIT)?;
+    let conflict_matches_by_head = list_open_conflicting_prs_for_heads_search(heads)?;
     for head in heads {
-        let matches = matches_by_head.get(head).cloned().unwrap_or_default();
+        let mut matches = exact_matches_by_head.get(head).cloned().unwrap_or_default();
+        matches.extend(
+            conflict_matches_by_head
+                .get(head)
+                .cloned()
+                .unwrap_or_default(),
+        );
         if let Some(pr) = select_single_open_pr_match(head, matches)? {
             out.push(head_search_pr_to_info(&pr, head)?);
         }
@@ -584,9 +712,16 @@ fn parse_open_pr_automerge_node(
 ///
 /// Returns `Ok(None)` when no open PR exists for that head branch.
 pub fn get_open_pr_automerge_for_head(head: &str) -> Result<Option<OpenPrAutomergeInfo>> {
-    let matches = list_prs_for_heads_search(&[head.to_string()], "open")?
-        .remove(head)
-        .unwrap_or_default();
+    let requested_heads = [head.to_string()];
+    let mut matches =
+        list_exact_prs_for_heads(&requested_heads, &["OPEN"], EXACT_HEAD_QUERY_LIMIT)?
+            .remove(head)
+            .unwrap_or_default();
+    matches.extend(
+        list_open_conflicting_prs_for_heads_search(&requested_heads)?
+            .remove(head)
+            .unwrap_or_default(),
+    );
     if let Some(pr) = select_single_open_pr_match(head, matches)? {
         Ok(Some(OpenPrAutomergeInfo {
             number: pr.number,
@@ -610,161 +745,49 @@ fn parse_github_datetime_rfc3339(s: &str, context: &str) -> Result<OffsetDateTim
     })
 }
 
-fn parse_terminal_pr_state(
-    node: &serde_json::Value,
-    requested_head: &str,
-    number: u64,
-) -> Result<TerminalPrState> {
-    let state = node["state"].as_str().ok_or_else(|| {
-        anyhow!(
-            "Terminal PR #{} missing state for {}",
-            number,
-            requested_head
-        )
-    })?;
-    if state == "MERGED" {
-        Ok(TerminalPrState::Merged)
-    } else if state == "CLOSED" {
-        Ok(TerminalPrState::Closed)
-    } else {
-        Err(anyhow!(
-            "Terminal PR #{} has unsupported state {} for {}",
-            number,
-            state,
-            requested_head
-        ))
-    }
-}
-
-fn parse_terminal_pr_timestamp(
-    node: &serde_json::Value,
-    requested_head: &str,
-    number: u64,
-    state: TerminalPrState,
-) -> Result<String> {
-    if state == TerminalPrState::Merged {
-        node["mergedAt"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Merged PR #{} missing mergedAt for {}",
-                    number,
-                    requested_head
-                )
-            })
-    } else {
-        node["closedAt"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Closed PR #{} missing closedAt for {}",
-                    number,
-                    requested_head
-                )
-            })
-    }
-}
-
-/// Parse one terminal-PR GraphQL node into typed metadata used by the update guard.
+/// Fetches the newest recent closed-or-merged PR for each requested head branch.
 ///
-/// The caller still parses `terminal_at` separately for ordering so this function can preserve
-/// the original timestamp text for user-facing errors.
-fn parse_terminal_pr_node(
-    node: &serde_json::Value,
-    requested_head: &str,
-) -> Result<TerminalPrInfo> {
-    let number = node["number"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("Terminal PR result missing number for {}", requested_head))?;
-    let head = node["headRefName"].as_str().ok_or_else(|| {
-        anyhow!(
-            "Terminal PR result missing headRefName for {}",
-            requested_head
-        )
-    })?;
-    let state = parse_terminal_pr_state(node, requested_head, number)?;
-    let terminal_at = parse_terminal_pr_timestamp(node, requested_head, number, state)?;
-    let url = node["url"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Terminal PR #{} missing url for {}", number, requested_head))?;
-
-    Ok(TerminalPrInfo {
-        number,
-        head: head.to_string(),
-        state,
-        terminal_at,
-        url: url.to_string(),
-    })
-}
-
-/// Select the newest terminal PR by its terminal timestamp from a bounded set of PR nodes.
-///
-/// GitHub returns nodes ordered by `UPDATED_AT`, which can differ from close or merge time when
-/// older PRs receive later comments or edits. Picking the max terminal timestamp avoids basing
-/// the update guard on a stale terminal PR.
-fn select_latest_terminal_pr(
-    nodes: &[serde_json::Value],
-    requested_head: &str,
-) -> Result<Option<TerminalPrInfo>> {
-    let mut latest: Option<(OffsetDateTime, TerminalPrInfo)> = None;
-    for node in nodes {
-        let info = parse_terminal_pr_node(node, requested_head)?;
-        let terminal_at = parse_github_datetime_rfc3339(&info.terminal_at, requested_head)?;
-        if latest
-            .as_ref()
-            .map(|(current, _)| terminal_at > *current)
-            .unwrap_or(true)
-        {
-            latest = Some((terminal_at, info));
-        }
-    }
-
-    if let Some((_, info)) = latest {
-        Ok(Some(info))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Fetches the latest closed-or-merged PR for each requested head branch.
-///
-/// Heads with no closed or merged PR are omitted from the result. Callers that already know the
-/// set of heads with open PRs can use this to look up only the remaining candidates when
-/// enforcing branch-name reuse guardrails. Matching uses the canonical
-/// synthetic-branch conflict key so case-only head differences still block
-/// reuse.
-pub fn list_terminal_prs_for_heads(heads: &[String]) -> Result<Vec<TerminalPrInfo>> {
+/// The query is bounded by the caller's coarse closed-date cutoff and sorted by GitHub's
+/// `closed` qualifier, so the branch-reuse guard can answer "is there any recent terminal PR on
+/// this case-insensitive head identity?" with one search result per head instead of scanning full
+/// history. Callers should still compare the returned timestamp precisely because GitHub's search
+/// qualifier is date-based, not full-RFC3339. The returned `terminal_at` remains state-specific:
+/// `mergedAt` for merged PRs and `closedAt` for manually closed PRs.
+pub fn list_recent_terminal_prs_for_heads(
+    heads: &[String],
+    closed_since: OffsetDateTime,
+) -> Result<Vec<TerminalPrInfo>> {
     let mut out: Vec<TerminalPrInfo> = Vec::new();
     if heads.is_empty() {
         return Ok(out);
     }
-    let matches_by_head = list_prs_for_heads_search(heads, "all")?;
-    for requested_head in heads {
-        let matches = matches_by_head
-            .get(requested_head)
+    let (owner, name) = get_repo_owner_name()?;
+    let repo = format!("{owner}/{name}");
+    let mut query = String::from("query { ");
+    for (i, head) in heads.iter().enumerate() {
+        let search_query = recent_terminal_search_query(&repo, head, closed_since);
+        query.push_str(&format!(
+            "pr{}: search(query:\"{}\", type:ISSUE, first:1) {{ nodes {{ ... on PullRequest {{ {} }} }} }} ",
+            i,
+            graphql_escape(&search_query),
+            TERMINAL_PR_SEARCH_GRAPHQL_FIELDS,
+        ));
+    }
+    query.push('}');
+
+    let json = gh_ro(["api", "graphql", "-f", &format!("query={query}")].as_slice())?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let data = &value["data"];
+    for (i, requested_head) in heads.iter().enumerate() {
+        let key = format!("pr{}", i);
+        let pr = data[&key]["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.first())
             .cloned()
-            .unwrap_or_default();
-        let terminal_matches = matches
-            .iter()
-            .filter_map(|pr| terminal_info_from_head_search(pr, requested_head).transpose())
-            .collect::<Result<Vec<_>>>()?;
-        let nodes: Vec<serde_json::Value> = terminal_matches
-            .iter()
-            .map(|info| {
-                serde_json::json!({
-                    "number": info.number,
-                    "headRefName": info.head,
-                    "state": if info.state == TerminalPrState::Merged { "MERGED" } else { "CLOSED" },
-                    "mergedAt": if info.state == TerminalPrState::Merged { serde_json::Value::String(info.terminal_at.clone()) } else { serde_json::Value::Null },
-                    "closedAt": if info.state == TerminalPrState::Closed { serde_json::Value::String(info.terminal_at.clone()) } else { serde_json::Value::Null },
-                    "url": info.url,
-                })
-            })
-            .collect();
-        if let Some(info) = select_latest_terminal_pr(&nodes, requested_head)? {
-            out.push(info);
+            .map(serde_json::from_value)
+            .transpose()?;
+        if let Some(pr) = pr {
+            out.push(terminal_info_from_head_search(&pr, requested_head)?);
         }
     }
 
@@ -792,10 +815,21 @@ pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoW
     if heads.is_empty() {
         return Ok(out);
     }
-    let open_matches_by_head = list_prs_for_heads_search(heads, "open")?;
+    let exact_open_matches_by_head =
+        list_exact_prs_for_heads(heads, &["OPEN"], EXACT_HEAD_QUERY_LIMIT)?;
+    let open_conflicts_by_head = list_open_conflicting_prs_for_heads_search(heads)?;
     let mut heads_without_open_prs = Vec::new();
     for head in heads {
-        let open_matches = open_matches_by_head.get(head).cloned().unwrap_or_default();
+        let mut open_matches = exact_open_matches_by_head
+            .get(head)
+            .cloned()
+            .unwrap_or_default();
+        open_matches.extend(
+            open_conflicts_by_head
+                .get(head)
+                .cloned()
+                .unwrap_or_default(),
+        );
         if let Some(pr) = select_single_open_pr_match(head, open_matches)? {
             out.push(PrInfoWithState {
                 number: pr.number,
@@ -807,12 +841,21 @@ pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoW
         }
     }
     if !heads_without_open_prs.is_empty() {
-        let merged_matches_by_head = list_prs_for_heads_search(&heads_without_open_prs, "merged")?;
+        let exact_merged_matches_by_head =
+            list_exact_prs_for_heads(&heads_without_open_prs, &["MERGED"], EXACT_HEAD_QUERY_LIMIT)?;
+        let merged_conflicts_by_head =
+            list_conflicting_prs_for_heads_search_exhaustive(&heads_without_open_prs, "merged")?;
         for head in &heads_without_open_prs {
-            let merged_matches = merged_matches_by_head
+            let mut merged_matches = exact_merged_matches_by_head
                 .get(head)
                 .cloned()
                 .unwrap_or_default();
+            merged_matches.extend(
+                merged_conflicts_by_head
+                    .get(head)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
             if let Some(pr) = select_latest_merged_pr_match(head, &merged_matches)? {
                 out.push(PrInfoWithState {
                     number: pr.number,
@@ -897,9 +940,16 @@ pub fn upsert_pr_cached(
     )?;
     let mut num: u64 = created_number.trim().parse().unwrap_or(0);
     if num == 0 && !dry {
-        let post_create_matches = list_prs_for_heads_search(&[branch.to_string()], "open")?
-            .remove(branch)
-            .unwrap_or_default();
+        let post_create_heads = [branch.to_string()];
+        let mut post_create_matches =
+            list_exact_prs_for_heads(&post_create_heads, &["OPEN"], EXACT_HEAD_QUERY_LIMIT)?
+                .remove(branch)
+                .unwrap_or_default();
+        post_create_matches.extend(
+            list_open_conflicting_prs_for_heads_search(&post_create_heads)?
+                .remove(branch)
+                .unwrap_or_default(),
+        );
         if let Some(existing) = select_single_open_pr_match(branch, post_create_matches)? {
             num = existing.number;
         }
@@ -945,13 +995,15 @@ pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_head_search_matches, list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
-        list_prs_for_heads_search, parse_open_pr_automerge_node, select_latest_merged_pr_match,
-        select_latest_terminal_pr, select_single_open_pr_match, HeadSearchPr, PrState,
-        TerminalPrState,
+        filter_case_variant_head_search_matches, filter_head_search_matches,
+        list_conflicting_prs_for_heads_search_exhaustive, list_exact_prs_for_heads,
+        list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
+        list_recent_terminal_prs_for_heads, parse_open_pr_automerge_node,
+        select_latest_merged_pr_match, select_single_open_pr_match, HeadSearchPr, PrState,
+        TerminalPrState, EXACT_HEAD_QUERY_LIMIT,
     };
     use crate::test_support::lock_cwd;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1016,26 +1068,55 @@ mod tests {
         (wrapper_dir, path_guard)
     }
 
-    fn install_gh_list_wrapper(
-        open_json: &str,
-        merged_json: &str,
-        all_json: &str,
+    fn graphql_nodes_response(nodes_by_alias: &[(&str, Value)]) -> String {
+        let mut repo = serde_json::Map::new();
+        for (alias, nodes) in nodes_by_alias {
+            repo.insert((*alias).to_string(), json!({ "nodes": nodes }));
+        }
+        json!({ "data": { "repository": repo } }).to_string()
+    }
+
+    fn graphql_search_response(nodes_by_alias: &[(&str, Value)]) -> String {
+        let mut data = serde_json::Map::new();
+        for (alias, nodes) in nodes_by_alias {
+            data.insert((*alias).to_string(), json!({ "nodes": nodes }));
+        }
+        json!({ "data": data }).to_string()
+    }
+
+    fn install_gh_graphql_and_list_wrapper(
+        exact_open_json: &str,
+        exact_merged_json: &str,
+        exact_terminal_json: &str,
+        search_open_json: &str,
+        search_merged_json: &str,
+        search_all_json: &str,
     ) -> (TempDir, TempDir, EnvVarGuard, String) {
         let data_dir = tempfile::tempdir().unwrap();
         let log_path = data_dir.path().join("gh.log");
-        let open_path = data_dir.path().join("open.json");
-        let merged_path = data_dir.path().join("merged.json");
-        let all_path = data_dir.path().join("all.json");
-        fs::write(&open_path, open_json).unwrap();
-        fs::write(&merged_path, merged_json).unwrap();
-        fs::write(&all_path, all_json).unwrap();
+        let exact_open_path = data_dir.path().join("exact-open.json");
+        let exact_merged_path = data_dir.path().join("exact-merged.json");
+        let exact_terminal_path = data_dir.path().join("exact-terminal.json");
+        let search_open_path = data_dir.path().join("search-open.json");
+        let search_merged_path = data_dir.path().join("search-merged.json");
+        let search_all_path = data_dir.path().join("search-all.json");
+        fs::write(&exact_open_path, exact_open_json).unwrap();
+        fs::write(&exact_merged_path, exact_merged_json).unwrap();
+        fs::write(&exact_terminal_path, exact_terminal_json).unwrap();
+        fs::write(&search_open_path, search_open_json).unwrap();
+        fs::write(&search_merged_path, search_merged_json).unwrap();
+        fs::write(&search_all_path, search_all_json).unwrap();
 
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  state=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"--state\" ]; then\n      state=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$state\" in\n    open) cat \"{}\" ;;\n    merged) cat \"{}\" ;;\n    all) cat \"{}\" ;;\n    *) echo \"[]\" ;;\n  esac\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*) cat \"{}\" ;;\n    *\"states:[CLOSED,MERGED]\"*) cat \"{}\" ;;\n    *\"states:[MERGED]\"*) cat \"{}\" ;;\n    *\"is:pr is:open head:\"*) cat \"{}\" ;;\n    *) echo '{{\"data\":{{\"repository\":{{}}}}}}' ;;\n  esac\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  state=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"--state\" ]; then\n      state=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$state\" in\n    open) cat \"{}\" ;;\n    merged) cat \"{}\" ;;\n    all) cat \"{}\" ;;\n    *) echo \"[]\" ;;\n  esac\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
-            open_path.display(),
-            merged_path.display(),
-            all_path.display(),
+            exact_open_path.display(),
+            exact_terminal_path.display(),
+            exact_merged_path.display(),
+            search_open_path.display(),
+            search_open_path.display(),
+            search_merged_path.display(),
+            search_all_path.display(),
         );
         let (wrapper_dir, path_guard) = install_gh_wrapper(&script);
 
@@ -1083,7 +1164,7 @@ mod tests {
     fn filter_head_search_matches_treats_case_only_heads_as_equivalent() {
         let matches = filter_head_search_matches(
             "dank-spr/example",
-            vec![
+            &[
                 head_search_pr(17, "dank-spr/Example", "OPEN", None, None),
                 head_search_pr(18, "dank-spr/other", "OPEN", None, None),
             ],
@@ -1091,6 +1172,21 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].number, 17);
+        assert_eq!(matches[0].head, "dank-spr/Example");
+    }
+
+    #[test]
+    fn filter_case_variant_head_search_matches_drops_exact_spelling() {
+        let matches = filter_case_variant_head_search_matches(
+            "dank-spr/example",
+            &[
+                head_search_pr(17, "dank-spr/example", "OPEN", None, None),
+                head_search_pr(18, "dank-spr/Example", "OPEN", None, None),
+            ],
+        );
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].number, 18);
         assert_eq!(matches[0].head, "dank-spr/Example");
     }
 
@@ -1175,10 +1271,127 @@ mod tests {
     }
 
     #[test]
-    fn list_open_prs_for_heads_batches_gh_calls_by_prefix() {
+    fn list_exact_prs_for_heads_queries_exact_head_refs() {
         let _lock = lock_cwd();
-        let (_wrapper_dir, _data_dir, _path_guard, log_path) = install_gh_list_wrapper(
-            r#"[{"number":17,"headRefName":"skilltest/alpha","baseRefName":"main","state":"OPEN","mergedAt":null,"closedAt":null,"url":"https://github.com/o/r/pull/17","autoMergeRequest":null},{"number":18,"headRefName":"skilltest/beta","baseRefName":"skilltest/alpha","state":"OPEN","mergedAt":null,"closedAt":null,"url":"https://github.com/o/r/pull/18","autoMergeRequest":null}]"#,
+        let exact_open_json = graphql_nodes_response(&[
+            (
+                "pr0",
+                json!([{
+                    "number": 17,
+                    "headRefName": "skilltest/alpha",
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "closedAt": null,
+                    "url": "https://github.com/o/r/pull/17",
+                    "autoMergeRequest": null
+                }]),
+            ),
+            (
+                "pr1",
+                json!([{
+                    "number": 18,
+                    "headRefName": "skilltest/beta",
+                    "baseRefName": "skilltest/alpha",
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "closedAt": null,
+                    "url": "https://github.com/o/r/pull/18",
+                    "autoMergeRequest": null
+                }]),
+            ),
+        ]);
+        let (_wrapper_dir, _data_dir, _path_guard, log_path) = install_gh_graphql_and_list_wrapper(
+            &exact_open_json,
+            &graphql_nodes_response(&[]),
+            &graphql_nodes_response(&[]),
+            "[]",
+            "[]",
+            "[]",
+        );
+
+        let matches_by_head = list_exact_prs_for_heads(
+            &["skilltest/alpha".to_string(), "skilltest/beta".to_string()],
+            &["OPEN"],
+            EXACT_HEAD_QUERY_LIMIT,
+        )
+        .unwrap();
+
+        assert_eq!(matches_by_head["skilltest/alpha"][0].number, 17);
+        assert_eq!(matches_by_head["skilltest/beta"][0].number, 18);
+        let log = fs::read_to_string(log_path).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("api graphql"));
+        assert!(lines[0].contains("states:[OPEN]"));
+        assert!(lines[0].contains("skilltest/alpha"));
+        assert!(lines[0].contains("skilltest/beta"));
+    }
+
+    #[test]
+    fn list_open_prs_for_heads_queries_exact_heads_and_searches_conflicts() {
+        let _lock = lock_cwd();
+        let exact_open_json = graphql_nodes_response(&[
+            (
+                "pr0",
+                json!([{
+                    "number": 17,
+                    "headRefName": "skilltest/alpha",
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "closedAt": null,
+                    "url": "https://github.com/o/r/pull/17",
+                    "autoMergeRequest": null
+                }]),
+            ),
+            (
+                "pr1",
+                json!([{
+                    "number": 18,
+                    "headRefName": "skilltest/beta",
+                    "baseRefName": "skilltest/alpha",
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "closedAt": null,
+                    "url": "https://github.com/o/r/pull/18",
+                    "autoMergeRequest": null
+                }]),
+            ),
+        ]);
+        let open_search_json = graphql_search_response(&[
+            (
+                "pr0",
+                json!([{
+                    "number": 17,
+                    "headRefName": "skilltest/alpha",
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "closedAt": null,
+                    "url": "https://github.com/o/r/pull/17",
+                    "autoMergeRequest": null
+                }]),
+            ),
+            (
+                "pr1",
+                json!([{
+                    "number": 18,
+                    "headRefName": "skilltest/beta",
+                    "baseRefName": "skilltest/alpha",
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "closedAt": null,
+                    "url": "https://github.com/o/r/pull/18",
+                    "autoMergeRequest": null
+                }]),
+            ),
+        ]);
+        let (_wrapper_dir, _data_dir, _path_guard, log_path) = install_gh_graphql_and_list_wrapper(
+            &exact_open_json,
+            &graphql_nodes_response(&[]),
+            &graphql_nodes_response(&[]),
+            &open_search_json,
             "[]",
             "[]",
         );
@@ -1193,16 +1406,53 @@ mod tests {
 
         let log = fs::read_to_string(log_path).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("--search head:skilltest/"));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("api graphql"));
+        assert!(lines[0].contains("states:[OPEN]"));
+        assert!(lines[1].contains("api graphql"));
+        assert!(lines[1].contains("is:pr is:open head:skilltest/alpha"));
+        assert!(lines[1].contains("is:pr is:open head:skilltest/beta"));
+        assert!(lines[1].contains("first:2"));
     }
 
     #[test]
-    fn list_open_or_merged_prs_for_heads_batches_by_state_and_prefix() {
+    fn list_open_or_merged_prs_for_heads_uses_exact_open_then_exact_merged() {
         let _lock = lock_cwd();
-        let (_wrapper_dir, _data_dir, _path_guard, log_path) = install_gh_list_wrapper(
+        let exact_merged_json = graphql_nodes_response(&[
+            (
+                "pr0",
+                json!([{
+                    "number": 21,
+                    "headRefName": "skilltest/alpha",
+                    "baseRefName": "main",
+                    "state": "MERGED",
+                    "mergedAt": "2026-02-01T00:00:00Z",
+                    "closedAt": "2026-02-01T00:00:00Z",
+                    "url": "https://github.com/o/r/pull/21",
+                    "autoMergeRequest": null
+                }]),
+            ),
+            (
+                "pr1",
+                json!([{
+                    "number": 22,
+                    "headRefName": "skilltest/beta",
+                    "baseRefName": "main",
+                    "state": "MERGED",
+                    "mergedAt": "2026-02-02T00:00:00Z",
+                    "closedAt": "2026-02-02T00:00:00Z",
+                    "url": "https://github.com/o/r/pull/22",
+                    "autoMergeRequest": null
+                }]),
+            ),
+        ]);
+        let open_search_json = graphql_search_response(&[("pr0", json!([])), ("pr1", json!([]))]);
+        let (_wrapper_dir, _data_dir, _path_guard, log_path) = install_gh_graphql_and_list_wrapper(
             "[]",
-            r#"[{"number":21,"headRefName":"skilltest/alpha","baseRefName":"main","state":"MERGED","mergedAt":"2026-02-01T00:00:00Z","closedAt":"2026-02-01T00:00:00Z","url":"https://github.com/o/r/pull/21","autoMergeRequest":null},{"number":22,"headRefName":"skilltest/beta","baseRefName":"main","state":"MERGED","mergedAt":"2026-02-02T00:00:00Z","closedAt":"2026-02-02T00:00:00Z","url":"https://github.com/o/r/pull/22","autoMergeRequest":null}]"#,
+            &exact_merged_json,
+            &graphql_nodes_response(&[]),
+            &open_search_json,
+            "[]",
             "[]",
         );
 
@@ -1220,15 +1470,21 @@ mod tests {
 
         let log = fs::read_to_string(log_path).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("--state open"));
-        assert!(lines[1].contains("--state merged"));
-        assert!(lines[0].contains("--search head:skilltest/"));
-        assert!(lines[1].contains("--search head:skilltest/"));
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].contains("api graphql"));
+        assert!(lines[0].contains("states:[OPEN]"));
+        assert!(lines[1].contains("api graphql"));
+        assert!(lines[1].contains("is:pr is:open head:skilltest/alpha"));
+        assert!(lines[1].contains("is:pr is:open head:skilltest/beta"));
+        assert!(lines[2].contains("api graphql"));
+        assert!(lines[2].contains("states:[MERGED]"));
+        assert!(lines[3].contains("pr list --state merged --search head:skilltest/alpha"));
+        assert!(lines[4].contains("pr list --state merged --search head:skilltest/beta"));
     }
 
     #[test]
-    fn list_prs_for_heads_search_retries_capped_prefix_bucket_until_target_found() {
+    fn list_conflicting_prs_for_heads_search_exhaustive_retries_until_full_head_search_is_exhausted(
+    ) {
         let _lock = lock_cwd();
         let data_dir = tempfile::tempdir().unwrap();
         let log_path = data_dir.path().join("gh.log");
@@ -1251,7 +1507,7 @@ mod tests {
         let mut expanded_entries = filler_entries.clone();
         expanded_entries.push(json!({
             "number": 999,
-            "headRefName": "skilltest/target",
+            "headRefName": "skilltest/Target",
             "baseRefName": "main",
             "state": "OPEN",
             "mergedAt": null,
@@ -1277,51 +1533,93 @@ mod tests {
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
 
-        let mut matches_by_head =
-            list_prs_for_heads_search(&["skilltest/target".to_string()], "open").unwrap();
+        let mut matches_by_head = list_conflicting_prs_for_heads_search_exhaustive(
+            &["skilltest/target".to_string()],
+            "open",
+        )
+        .unwrap();
         let matches = matches_by_head.remove("skilltest/target").unwrap();
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].number, 999);
-        assert_eq!(matches[0].head, "skilltest/target");
+        assert_eq!(matches[0].head, "skilltest/Target");
         let log = fs::read_to_string(log_path).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("--limit 100"));
         assert!(lines[1].contains("--limit 200"));
-        assert!(lines[0].contains("--search head:skilltest/"));
-        assert!(lines[1].contains("--search head:skilltest/"));
+        assert!(lines[0].contains("--search head:skilltest/target"));
+        assert!(lines[1].contains("--search head:skilltest/target"));
     }
 
     #[test]
-    // Verifies: terminal PR selection uses the most recent close-or-merge timestamp across states.
-    // Catches: regressions that trust UPDATED_AT ordering or ignore closed PRs in the reuse guard.
-    fn select_latest_terminal_pr_uses_max_terminal_timestamp_across_states() {
-        let nodes = vec![
-            json!({
-                "number": 11,
-                "headRefName": "dank-spr/example",
-                "state": "MERGED",
-                "mergedAt": "2026-02-01T00:00:00Z",
-                "closedAt": "2026-02-01T00:00:00Z",
-                "url": "https://github.com/o/r/pull/11"
-            }),
-            json!({
-                "number": 22,
-                "headRefName": "dank-spr/example",
-                "state": "CLOSED",
-                "mergedAt": null,
-                "closedAt": "2026-02-10T00:00:00Z",
-                "url": "https://github.com/o/r/pull/22"
-            }),
-        ];
+    fn list_recent_terminal_prs_for_heads_queries_recent_closed_search() {
+        let _lock = lock_cwd();
+        let search_json = graphql_search_response(&[
+            (
+                "pr0",
+                json!([
+                    {
+                        "number": 11,
+                        "headRefName": "skilltest/alpha",
+                        "state": "MERGED",
+                        "mergedAt": "2026-02-01T00:00:00Z",
+                        "closedAt": "2026-02-01T00:00:01Z",
+                        "url": "https://github.com/o/r/pull/11"
+                    }
+                ]),
+            ),
+            (
+                "pr1",
+                json!([
+                    {
+                        "number": 22,
+                        "headRefName": "skilltest/Beta",
+                        "state": "CLOSED",
+                        "mergedAt": null,
+                        "closedAt": "2026-02-10T00:00:00Z",
+                        "url": "https://github.com/o/r/pull/22"
+                    }
+                ]),
+            ),
+        ]);
+        let data_dir = tempfile::tempdir().unwrap();
+        let log_path = data_dir.path().join("gh.log");
+        let response_path = data_dir.path().join("search.json");
+        fs::write(&response_path, search_json).unwrap();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  cat \"{}\"\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            log_path.display(),
+            response_path.display(),
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let closed_since = time::OffsetDateTime::parse(
+            "2026-02-01T12:34:56Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
-        let selected = select_latest_terminal_pr(&nodes, "dank-spr/example")
-            .unwrap()
-            .unwrap();
+        let prs = list_recent_terminal_prs_for_heads(
+            &["skilltest/alpha".to_string(), "skilltest/beta".to_string()],
+            closed_since,
+        )
+        .unwrap();
 
-        assert_eq!(selected.number, 22);
-        assert_eq!(selected.state, TerminalPrState::Closed);
-        assert_eq!(selected.terminal_at, "2026-02-10T00:00:00Z");
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 11);
+        assert_eq!(prs[0].state, TerminalPrState::Merged);
+        assert_eq!(prs[0].terminal_at, "2026-02-01T00:00:00Z");
+        assert_eq!(prs[1].number, 22);
+        assert_eq!(prs[1].state, TerminalPrState::Closed);
+        assert_eq!(prs[1].terminal_at, "2026-02-10T00:00:00Z");
+
+        let log = fs::read_to_string(log_path).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("api graphql"));
+        assert!(lines[0]
+            .contains("is:pr is:closed head:skilltest/alpha closed:>=2026-02-01 sort:closed-desc"));
+        assert!(lines[0]
+            .contains("is:pr is:closed head:skilltest/beta closed:>=2026-02-01 sort:closed-desc"));
     }
 }

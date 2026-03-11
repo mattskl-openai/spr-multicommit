@@ -264,10 +264,12 @@ pub fn prep_squash(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_prep_window;
+    use super::{prep_squash, resolve_prep_window};
     use crate::cli::PrepSelection;
+    use crate::config::{ListOrder, PrDescriptionMode};
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
+    use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
 
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
@@ -301,5 +303,30 @@ mod tests {
         }));
 
         assert_eq!(resolve_prep_window(&groups, &selection).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn prep_squash_rejects_case_colliding_branch_names_from_local_stack() {
+        let _lock = lock_cwd();
+        let dir = init_case_conflicting_stack_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let err = prep_squash(
+            "main",
+            "dank-spr/",
+            "ignore",
+            PrDescriptionMode::Overwrite,
+            ListOrder::RecentOnBottom,
+            PrepSelection::All,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+            "unexpected error: {err}"
+        );
     }
 }

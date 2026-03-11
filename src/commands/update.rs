@@ -13,7 +13,7 @@ use crate::config::{ListOrder, PrDescriptionMode};
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
     fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_open_prs_for_heads,
-    list_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
+    list_recent_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
 };
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{derive_groups_between_with_ignored, split_groups_for_update, Group};
@@ -133,9 +133,10 @@ fn enforce_branch_reuse_guard(
         if heads_without_open_prs.is_empty() {
             Ok(())
         } else {
-            let terminal_prs = list_terminal_prs_for_heads(&heads_without_open_prs)?;
             let now = OffsetDateTime::now_utc();
             let guard_window = branch_reuse_guard_window(branch_reuse_guard_days);
+            let terminal_prs =
+                list_recent_terminal_prs_for_heads(&heads_without_open_prs, now - guard_window)?;
             for terminal_pr in terminal_prs {
                 let terminal_at = parse_github_timestamp_rfc3339(&terminal_pr.terminal_at)
                     .with_context(|| {
@@ -796,14 +797,15 @@ pub fn build_from_tags(
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_reuse_guard_window, build_from_groups, head_key, heads_without_open_prs,
-        ignored_boundary_warning, parse_github_timestamp_rfc3339, pr_number_for_head,
-        recent_pr_age, recent_pr_age_blocks_recreation, terminal_pr_action,
+        branch_reuse_guard_window, build_from_groups, build_from_tags, head_key,
+        heads_without_open_prs, ignored_boundary_warning, parse_github_timestamp_rfc3339,
+        pr_number_for_head, recent_pr_age, recent_pr_age_blocks_recreation, terminal_pr_action,
     };
     use crate::branch_names::group_branch_identities;
     use crate::config::{ListOrder, PrDescriptionMode};
     use crate::github::TerminalPrState;
     use crate::parsing::{split_groups_for_update, Group};
+    use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
     use std::collections::HashMap;
     use time::{Duration as TimeDuration, OffsetDateTime};
 
@@ -936,5 +938,32 @@ mod tests {
         let parsed = parse_github_timestamp_rfc3339("2026-02-20T12:34:56Z").unwrap();
         let expected = OffsetDateTime::from_unix_timestamp(1_771_590_896).unwrap();
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn build_from_tags_rejects_case_colliding_publishable_groups() {
+        let _lock = lock_cwd();
+        let dir = init_case_conflicting_stack_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let err = build_from_tags(
+            "main",
+            "HEAD",
+            "dank-spr/",
+            "ignore",
+            true,
+            true,
+            PrDescriptionMode::Overwrite,
+            None,
+            ListOrder::RecentOnBottom,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+            "unexpected error: {err}"
+        );
     }
 }

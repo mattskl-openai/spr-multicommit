@@ -387,7 +387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("gh.log");
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"number\":17,\"headRefName\":\"dank-spr/Alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}}]'\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*) echo '{{\"data\":{{\"repository\":{{\"pr0\":{{\"nodes\":[]}}}}}}}}' ;;\n    *\"is:pr is:open head:dank-spr/alpha\"*) echo '{{\"data\":{{\"pr0\":{{\"nodes\":[{{\"number\":17,\"headRefName\":\"dank-spr/Alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}}]}}}}}}' ;;\n    *) echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
@@ -400,7 +400,8 @@ mod tests {
             .to_string()
             .contains("Exact headRefName matches are required here"));
         let log = fs::read_to_string(log_path).unwrap();
-        assert!(log.contains("pr list --state open --search head:dank-spr/"));
+        assert!(log.contains("api graphql"));
+        assert!(log.contains("is:pr is:open head:dank-spr/alpha"));
     }
 
     #[test]
