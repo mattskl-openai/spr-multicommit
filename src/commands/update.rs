@@ -111,9 +111,19 @@ fn pr_number_for_head(
 /// Fail `spr update` early when branch-name reuse matches a recently closed or merged PR.
 ///
 /// The guard only runs when PR creation is enabled, the CLI override is not set, and the
-/// threshold is non-zero. It reuses the caller-provided `prs_by_head` map so only heads without
-/// open PRs are queried for terminal history; querying all heads would duplicate the open-PR
-/// lookup and could produce misleading results when a branch has both open and historical PRs.
+/// threshold is non-zero.
+///
+/// 1. Open PRs are resolved first, and this guard only examines heads that do not already have an
+///    open PR.
+/// 2. For each remaining head, GitHub GraphQL `search(query: ...)` is used with
+///    `is:pr is:closed head:<full-head> closed:>=<date> sort:closed-desc`.
+/// 3. That `head:` search is case-insensitive for the branch spellings `spr` cares about, so any
+///    recent terminal PR on the same head identity is a candidate block.
+/// 4. The returned `mergedAt` or `closedAt` timestamp is then parsed and compared precisely in
+///    Rust because GitHub's `closed:` search qualifier is date-based, not full-RFC3339.
+///
+/// Querying all heads here would duplicate the open-PR lookup and could misreport a branch that
+/// already has an exact open PR as a reuse conflict against its own history.
 ///
 /// # Errors
 ///
