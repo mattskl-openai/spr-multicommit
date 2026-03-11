@@ -165,6 +165,12 @@ fn list_prs_for_search_query(query: &str, state: &str, limit: usize) -> Result<V
     serde_json::from_str(&json).map_err(Into::into)
 }
 
+/// Fetch PRs by exact GitHub head ref using `repository.pullRequests(headRefName: ...)`.
+///
+/// This is the structured GraphQL path, and `headRefName` matching is treated as exact and
+/// case-sensitive here. Callers use it for the normal "what PR is on this exact branch?" lookup.
+/// Case-variant remote heads are intentionally not discovered by this helper; conflict detection
+/// stays in the separate search-based helpers below.
 fn list_exact_prs_for_heads(
     heads: &[String],
     states: &[&str],
@@ -241,6 +247,14 @@ fn list_prs_for_search_query_exhaustive(query: &str, state: &str) -> Result<Vec<
     }
 }
 
+/// Fetch open PRs that collide with the requested heads under case-folding.
+///
+/// Unlike `list_exact_prs_for_heads`, this uses GitHub's search semantics via GraphQL
+/// `search(query: ...)` with a full `head:<branch>` query string. In practice this search path is
+/// case-insensitive for the branch spellings that `spr` cares about, so it can surface
+/// case-variant spellings for the same head identity. Exact-spelling matches are filtered out
+/// locally because exact-head multiplicity is already handled by the structured GraphQL lookup;
+/// this helper only answers whether any additional case-insensitive open hit exists.
 fn list_open_conflicting_prs_for_heads_search(
     heads: &[String],
 ) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
@@ -292,6 +306,13 @@ fn list_open_conflicting_prs_for_heads_search(
     Ok(matches_by_head)
 }
 
+/// Fetch conflicting PRs through the `gh pr list --search head:<branch>` path, exhausting paging.
+///
+/// This is still a search-based lookup, not an exact `headRefName` GraphQL filter. In practice
+/// GitHub's `head:` search semantics are case-insensitive for the branch spellings that `spr`
+/// cares about, so this path can surface case-variant spellings for a full branch name. Callers
+/// should treat it as conflict discovery only and continue to use exact GraphQL lookups for
+/// normal branch-to-PR resolution.
 fn list_conflicting_prs_for_heads_search_exhaustive(
     heads: &[String],
     state: &str,
@@ -664,8 +685,19 @@ pub fn graphql_escape(s: &str) -> String {
 
 /// Fetch open PRs for a specific set of head branches.
 ///
-/// Matching requires an exact `headRefName` for reuse and treats case-only
-/// variants as conflicts instead of silently reusing them.
+/// Matching requires an exact `headRefName` for reuse and treats case-only variants as conflicts
+/// instead of silently reusing them.
+///
+/// 1. A batched exact GraphQL lookup asks `pullRequests(headRefName: ...)` for open PRs on the
+///    exact branch spellings.
+/// 2. A separate GraphQL `search(query: ...)` probe asks for open PRs on the same `head:<full-head>`
+///    identities under GitHub's case-insensitive search semantics.
+/// 3. The search probe drops exact-spelling matches locally, so only case-variant spellings remain.
+/// 4. Resolution then accepts exactly one exact open PR and no variants, returns `None` for no
+///    matches, and errors for everything else.
+///
+/// Callers that skip the search probe can silently reuse `Foo` for local branch `foo`, which is
+/// exactly the ambiguity this path is meant to reject.
 pub fn list_open_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfo>> {
     let mut out: Vec<PrInfo> = Vec::new();
     if heads.is_empty() {
@@ -747,12 +779,14 @@ fn parse_github_datetime_rfc3339(s: &str, context: &str) -> Result<OffsetDateTim
 
 /// Fetches the newest recent closed-or-merged PR for each requested head branch.
 ///
-/// The query is bounded by the caller's coarse closed-date cutoff and sorted by GitHub's
-/// `closed` qualifier, so the branch-reuse guard can answer "is there any recent terminal PR on
-/// this case-insensitive head identity?" with one search result per head instead of scanning full
-/// history. Callers should still compare the returned timestamp precisely because GitHub's search
-/// qualifier is date-based, not full-RFC3339. The returned `terminal_at` remains state-specific:
-/// `mergedAt` for merged PRs and `closedAt` for manually closed PRs.
+/// This is a search-based GraphQL query (`search(query: ...)`), not an exact
+/// `pullRequests(headRefName: ...)` lookup. It intentionally leans on GitHub's case-insensitive
+/// `head:` search semantics rather than the exact, case-sensitive `headRefName` filter so the
+/// branch-reuse guard can ask "is there any recent terminal PR on this case-insensitive head
+/// identity?" without enumerating full history. Callers should still compare the returned
+/// timestamp precisely because GitHub's `closed:` qualifier is date-based, not full RFC3339. The
+/// returned `terminal_at` remains state-specific: `mergedAt` for merged PRs and `closedAt` for
+/// manually closed PRs.
 pub fn list_recent_terminal_prs_for_heads(
     heads: &[String],
     closed_since: OffsetDateTime,
