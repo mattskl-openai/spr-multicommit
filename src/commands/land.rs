@@ -281,10 +281,12 @@ pub fn land_flatten_until(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_land_take_count, resolve_landed_pr_segment};
+    use super::{land_until, resolve_land_take_count, resolve_landed_pr_segment};
+    use crate::cli::LandCmd;
     use crate::github::PrInfo;
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
+    use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
     use std::collections::HashMap;
 
     fn groups(tags: &[&str]) -> Vec<Group> {
@@ -366,6 +368,31 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "No open PR found for local group 'sigma' (branch 'skilltest/sigma')"
+        );
+    }
+
+    #[test]
+    fn land_until_rejects_case_colliding_branch_names_from_local_stack() {
+        let _lock = lock_cwd();
+        let dir = init_case_conflicting_stack_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let err = land_until(
+            "main",
+            "dank-spr/",
+            "ignore",
+            &InclusiveSelector::All,
+            true,
+            LandCmd::Flatten,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+            "unexpected error: {err}"
         );
     }
 }

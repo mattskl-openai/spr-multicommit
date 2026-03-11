@@ -1070,7 +1070,7 @@ mod tests {
     use crate::commands::RewriteCommandOutcome;
     use crate::config::DirtyWorktreePolicy;
     use crate::parsing::{derive_local_groups_with_ignored, Group};
-    use crate::test_support::{lock_cwd, DirGuard};
+    use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
     use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1162,6 +1162,30 @@ mod tests {
         git(repo, ["rev-parse", "--abbrev-ref", "HEAD"].as_slice())
             .trim()
             .to_string()
+    }
+
+    #[test]
+    fn absorb_branch_tails_rejects_case_colliding_branch_names_from_local_stack() {
+        let _lock = lock_cwd();
+        let dir = init_case_conflicting_stack_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let err = absorb_branch_tails(
+            "main",
+            "dank-spr/",
+            "ignore",
+            true,
+            DirtyWorktreePolicy::Halt,
+            AbsorbOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+            "unexpected error: {err}"
+        );
     }
 
     fn current_path() -> String {

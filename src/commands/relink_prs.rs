@@ -106,6 +106,10 @@ mod tests {
         git(repo, ["init", "-b", "main"].as_slice());
         git(repo, ["config", "user.email", "spr@example.com"].as_slice());
         git(repo, ["config", "user.name", "SPR Tests"].as_slice());
+        git(
+            repo,
+            ["remote", "add", "origin", "https://github.com/o/r.git"].as_slice(),
+        );
         write_file(repo, "story.txt", "base\n");
         git(repo, ["add", "story.txt"].as_slice());
         git(repo, ["commit", "-m", "init"].as_slice());
@@ -143,16 +147,32 @@ mod tests {
         let repo = dir.path().to_path_buf();
         let _guard = DirGuard::change_to(&repo);
         let log_path = repo.join("gh.log");
+        let exact_open_path = repo.join("exact-open.json");
+        fs::write(
+            &exact_open_path,
+            "{\"data\":{\"repository\":{\"pr0\":{\"nodes\":[{\"number\":17,\"headRefName\":\"skilltest/alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}]},\"pr1\":{\"nodes\":[{\"number\":22,\"headRefName\":\"skilltest/beta\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/22\",\"autoMergeRequest\":null}]}}}}",
+        )
+        .unwrap();
+        let search_open_path = repo.join("search-open.json");
+        fs::write(
+            &search_open_path,
+            "{\"data\":{\"pr0\":{\"nodes\":[]},\"pr1\":{\"nodes\":[]}}}",
+        )
+        .unwrap();
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"number\":17,\"headRefName\":\"skilltest/alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}},{{\"number\":22,\"headRefName\":\"skilltest/beta\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/22\",\"autoMergeRequest\":null}}]'\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"edit\" ]; then\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*) cat \"{}\" ;;\n    *\"is:pr is:open head:skilltest/alpha\"*) cat \"{}\" ;;\n    *) echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"edit\" ]; then\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
+            exact_open_path.display(),
+            search_open_path.display(),
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
 
         relink_prs("main", "skilltest/", "ignore", false).unwrap();
 
         let log = log_contents(&log_path);
-        assert!(log.contains("pr list --state open --search head:skilltest/"));
+        assert!(log.contains("api graphql"));
+        assert!(log.contains("is:pr is:open head:skilltest/alpha"));
+        assert!(log.contains("is:pr is:open head:skilltest/beta"));
         assert!(log.contains("pr edit #22 --base skilltest/alpha"));
         assert!(!log.contains("pr edit #17 --base"));
     }
@@ -165,7 +185,7 @@ mod tests {
         let _guard = DirGuard::change_to(&repo);
         let log_path = repo.join("gh.log");
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"number\":17,\"headRefName\":\"skilltest/Alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}}]'\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"edit\" ]; then\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*) echo '{{\"data\":{{\"repository\":{{\"pr0\":{{\"nodes\":[]}},\"pr1\":{{\"nodes\":[]}}}}}}}}' ;;\n    *\"is:pr is:open head:skilltest/alpha\"*) echo '{{\"data\":{{\"pr0\":{{\"nodes\":[{{\"number\":17,\"headRefName\":\"skilltest/Alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}}]}},\"pr1\":{{\"nodes\":[]}}}}}}' ;;\n    *) echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"edit\" ]; then\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
@@ -176,7 +196,8 @@ mod tests {
             .to_string()
             .contains("Exact headRefName matches are required here"));
         let log = log_contents(&log_path);
-        assert!(log.contains("pr list --state open --search head:skilltest/"));
+        assert!(log.contains("api graphql"));
+        assert!(log.contains("is:pr is:open head:skilltest/alpha"));
         assert!(!log.contains("pr edit"));
     }
 }
