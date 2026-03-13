@@ -136,6 +136,18 @@ pub enum Cmd {
         // no options; uses global flags
     },
 
+    /// Find the owning stack branch for a PR branch or report that the target is already a stack branch
+    #[command(
+        long_about = "Find the owning stack branch for a PR branch using repo-local stack metadata.\n\nTargets may be omitted (use the current branch), a local branch name, a remote-qualified branch name such as `origin/dank-spr/alpha`, or a GitHub PR URL. This command is strict and metadata-backed: it does not scan unrelated branches or guess a likely owner."
+    )]
+    ResolveStack {
+        /// Optional target: current branch, local branch, remote-qualified branch, or PR URL
+        target: Option<String>,
+        /// Emit machine-readable JSON result states such as `found`, `stale_metadata`, or `tombstoned`
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Land PRs (merge variants) and halt early on case-colliding synthetic branch names
     Land {
         // Target PR index is provided via global --until. For `flatten`, 0 means the top PR. For `per-pr`, 0 means all
@@ -201,6 +213,7 @@ impl Cmd {
         match self {
             Self::Restack { json, .. }
             | Self::Absorb { json, .. }
+            | Self::ResolveStack { json, .. }
             | Self::Resume { json, .. }
             | Self::Land { json, .. }
             | Self::FixPr { json, .. }

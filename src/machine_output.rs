@@ -22,6 +22,7 @@ pub enum MachineCommand {
     Absorb,
     Move,
     FixPr,
+    ResolveStack,
     Resume,
     Land,
 }

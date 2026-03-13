@@ -69,7 +69,7 @@ pub fn absorb_branch_tails(
             Ok(RewriteCommandOutcome::Completed)
         }
         AbsorbPlanValidation::ReadyToRewrite => {
-            execute_absorb_plan(&plan, dry, dirty_worktree_policy)
+            execute_absorb_plan(base, prefix, ignore_tag, &plan, dry, dirty_worktree_policy)
         }
     }
 }
@@ -937,6 +937,9 @@ fn build_replay_ops_for_commits(
 /// Executes a validated absorb rewrite plan by rebuilding the current stack in
 /// a temporary worktree and resetting the checked-out branch to the new tip.
 fn execute_absorb_plan(
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
     plan: &RewritePlan,
     dry: bool,
     dirty_worktree_policy: DirtyWorktreePolicy,
@@ -982,6 +985,13 @@ fn execute_absorb_plan(
                     post_success_hint: Some(
                         "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
                             .to_string(),
+                    ),
+                    metadata_refresh_context: Some(
+                        crate::stack_metadata::RefreshMetadataContext {
+                            base: base.to_string(),
+                            prefix: prefix.to_string(),
+                            ignore_tag: ignore_tag.to_string(),
+                        },
                     ),
                 },
             )

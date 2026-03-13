@@ -8,6 +8,7 @@
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{error, info};
 
@@ -32,6 +33,14 @@ pub fn git_ro(args: &[&str]) -> Result<String> {
     }
     verbose_log_cmd("git", args);
     run("git", args)
+}
+
+pub fn git_ro_in(path: &str, args: &[&str]) -> Result<String> {
+    let mut argv = Vec::with_capacity(args.len() + 2);
+    argv.push("-C");
+    argv.push(path);
+    argv.extend_from_slice(args);
+    git_ro(argv.as_slice())
 }
 
 pub fn git_rw(dry: bool, args: &[&str]) -> Result<String> {
@@ -181,6 +190,59 @@ pub fn repo_root() -> Result<Option<String>> {
     }
 }
 
+fn canonicalize_existing_path(path: &Path) -> Result<PathBuf> {
+    std::fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize path {}", path.display()))
+}
+
+fn resolve_reported_git_path(reported: &str, base_path: Option<&str>) -> Result<PathBuf> {
+    let path = PathBuf::from(reported.trim());
+    let absolute = if path.is_absolute() {
+        path
+    } else if let Some(base_path) = base_path {
+        Path::new(base_path).join(path)
+    } else {
+        std::env::current_dir()
+            .with_context(|| "current directory is unavailable")?
+            .join(path)
+    };
+    canonicalize_existing_path(&absolute)
+}
+
+pub fn git_common_dir() -> Result<PathBuf> {
+    let raw = git_ro(["rev-parse", "--git-common-dir"].as_slice())?;
+    resolve_reported_git_path(raw.trim(), None)
+}
+
+pub fn git_common_dir_at(path: &str) -> Result<PathBuf> {
+    let raw = git_ro_in(path, ["rev-parse", "--git-common-dir"].as_slice())?;
+    resolve_reported_git_path(raw.trim(), Some(path))
+}
+
+pub fn git_current_branch() -> Result<String> {
+    Ok(git_ro(["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
+        .trim()
+        .to_string())
+}
+
+pub fn git_current_branch_at(path: &str) -> Result<String> {
+    Ok(
+        git_ro_in(path, ["rev-parse", "--abbrev-ref", "HEAD"].as_slice())?
+            .trim()
+            .to_string(),
+    )
+}
+
+pub fn git_ref_exists_at(path: &str, reference: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["-C", path, "rev-parse", "--verify", "--quiet", reference])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to inspect git reference {}", reference))?;
+    Ok(status.success())
+}
+
 /// Discover the repository's default branch via `origin/HEAD`.
 ///
 /// This runs `git symbolic-ref --short refs/remotes/origin/HEAD` and expects
@@ -252,6 +314,12 @@ pub fn git_is_ancestor(ancestor: &str, descendant: &str) -> Result<bool> {
 /// Resolves a revision to its full object id.
 pub fn git_rev_parse(revision: &str) -> Result<String> {
     Ok(git_ro(["rev-parse", revision].as_slice())?
+        .trim()
+        .to_string())
+}
+
+pub fn git_rev_parse_at(path: &str, revision: &str) -> Result<String> {
+    Ok(git_ro_in(path, ["rev-parse", revision].as_slice())?
         .trim()
         .to_string())
 }

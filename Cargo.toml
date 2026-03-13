@@ -13,7 +13,8 @@ serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 indicatif = "0.17"
-time = { version = "0.3", features = ["parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+uuid = { version = "1.18", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.10"

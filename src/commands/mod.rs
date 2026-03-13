@@ -7,6 +7,7 @@ pub mod list;
 pub mod r#move;
 pub mod prep;
 pub mod relink_prs;
+pub mod resolve_stack;
 pub mod restack;
 pub mod rewrite_resume;
 pub mod update;
@@ -20,6 +21,7 @@ pub use list::list_prs_display;
 pub use prep::prep_squash;
 pub use r#move::{move_groups_after, MoveExecutionOptions};
 pub use relink_prs::relink_prs;
+pub use resolve_stack::{looks_like_pr_url, resolve_stack, ResolveStackOutput};
 pub use restack::{restack_after, restack_after_count};
 pub use rewrite_resume::{
     resume_rewrite, RewriteCommandKind, RewriteCommandOutcome, RewriteSuspendedState,

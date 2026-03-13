@@ -255,6 +255,13 @@ pub fn move_groups_after(
                         "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
                             .to_string(),
                     ),
+                    metadata_refresh_context: Some(
+                        crate::stack_metadata::RefreshMetadataContext {
+                            base: base.to_string(),
+                            prefix: prefix.to_string(),
+                            ignore_tag: ignore_tag.to_string(),
+                        },
+                    ),
                 },
             )
         },
@@ -431,10 +438,16 @@ mod tests {
             let resume_state: RewriteResumeState =
                 serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
                     .expect("parse resume state");
-            let paused_step = &resume_state.steps[resume_state.suspended_step_index];
             let paused_subject = git(
                 &repo,
-                ["log", "-n", "1", "--format=%s", &paused_step.source_sha].as_slice(),
+                [
+                    "log",
+                    "-n",
+                    "1",
+                    "--format=%s",
+                    &resume_state.paused_step.source_sha,
+                ]
+                .as_slice(),
             );
             let resolved_contents = if paused_subject.trim() == "feat: gamma pr:gamma" {
                 "gamma-1\n"

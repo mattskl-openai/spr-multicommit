@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use crate::commands::common::{
     self, CherryPickEmptyPolicy, CherryPickOp, DeferredDirtyWorktreeRestore, DirtyWorktreeOutcome,
 };
-use crate::git::{git_rev_list_range, git_ro, git_rw, repo_root};
+use crate::git::{git_common_dir, git_rev_list_range, git_ro, git_rw, repo_root};
 
 const REWRITE_RESUME_SCHEMA_VERSION: u32 = 1;
 
@@ -83,16 +83,6 @@ pub struct RewriteReplayStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RewritePausedStepProof {
-    pub source_sha: String,
-    pub expected_parent: String,
-    pub expected_message: String,
-    pub expected_author_name: String,
-    pub expected_author_email: String,
-    pub expected_author_date: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RewriteResumeState {
     pub schema_version: u32,
     pub command_kind: RewriteCommandKind,
@@ -104,13 +94,13 @@ pub struct RewriteResumeState {
     pub temp_worktree_path: String,
     pub backup_tag: Option<String>,
     pub paused_head: String,
-    #[serde(default)]
-    pub paused_step_proof: Option<RewritePausedStepProof>,
-    pub suspended_step_index: usize,
-    pub steps: Vec<RewriteReplayStep>,
+    pub paused_step: RewriteReplayStep,
+    pub remaining_operations: Vec<CherryPickOp>,
     #[serde(default)]
     pub deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore,
     pub post_success_hint: Option<String>,
+    #[serde(default)]
+    pub metadata_refresh_context: Option<crate::stack_metadata::RefreshMetadataContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,36 +117,13 @@ pub struct RewriteSession {
     pub operations: Vec<CherryPickOp>,
     pub deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore,
     pub post_success_hint: Option<String>,
+    pub metadata_refresh_context: Option<crate::stack_metadata::RefreshMetadataContext>,
 }
 
 impl DirtyWorktreeOutcome for RewriteCommandOutcome {
     fn keeps_dirty_worktree_restore_deferred(&self) -> bool {
         matches!(self, Self::Suspended { .. })
     }
-}
-
-pub fn build_replay_steps(ops: &[CherryPickOp]) -> Result<Vec<RewriteReplayStep>> {
-    let mut steps = Vec::new();
-    for op in ops {
-        match op {
-            CherryPickOp::Commit { sha, empty_policy } => steps.push(RewriteReplayStep {
-                source_sha: sha.clone(),
-                empty_policy: *empty_policy,
-            }),
-            CherryPickOp::Range {
-                first,
-                last,
-                empty_policy,
-            } => {
-                let commits = git_rev_list_range(&format!("{first}^"), last)?;
-                steps.extend(commits.into_iter().map(|source_sha| RewriteReplayStep {
-                    source_sha,
-                    empty_policy: *empty_policy,
-                }));
-            }
-        }
-    }
-    Ok(steps)
 }
 
 pub fn current_repo_root() -> Result<String> {
@@ -169,7 +136,7 @@ pub fn prepare_resume_path_for_new_session(
     original_branch: &str,
     original_head: &str,
 ) -> Result<PathBuf> {
-    let git_common_dir = current_common_git_dir()?;
+    let git_common_dir = git_common_dir()?;
     let resume_path = default_resume_path(
         &git_common_dir,
         command_kind,
@@ -214,23 +181,26 @@ pub fn prepare_resume_path_for_new_session(
 }
 
 pub fn run_rewrite_session(dry: bool, session: RewriteSession) -> Result<RewriteCommandOutcome> {
-    let git_common_dir = current_common_git_dir()?;
+    let git_common_dir = git_common_dir()?;
     let state = RewriteResumeState {
         schema_version: REWRITE_RESUME_SCHEMA_VERSION,
         command_kind: session.command_kind,
         git_common_dir: git_common_dir.display().to_string(),
         original_worktree_root: session.original_worktree_root,
         original_branch: session.original_branch,
-        original_head: session.original_head,
+        original_head: session.original_head.clone(),
         temp_branch: session.temp_branch,
         temp_worktree_path: session.temp_worktree_path.clone(),
         backup_tag: session.backup_tag,
         paused_head: head_at(&session.temp_worktree_path)?,
-        paused_step_proof: None,
-        suspended_step_index: 0,
-        steps: Vec::new(),
+        paused_step: RewriteReplayStep {
+            source_sha: session.original_head,
+            empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+        },
+        remaining_operations: Vec::new(),
         deferred_dirty_worktree_restore: session.deferred_dirty_worktree_restore,
         post_success_hint: session.post_success_hint,
+        metadata_refresh_context: session.metadata_refresh_context,
     };
     continue_rewrite_operations(
         dry,
@@ -248,18 +218,9 @@ pub fn resume_rewrite(dry: bool, path: &Path) -> Result<RewriteCommandOutcome> {
     }
 
     let resume_path = absolute_path(path)?;
-    let mut state = read_resume_state(&resume_path)?;
+    let state = read_resume_state(&resume_path)?;
     validate_resume_state_against_current_repo(&resume_path, &state)?;
     validate_temp_worktree_exists(&state)?;
-
-    if state.suspended_step_index >= state.steps.len() {
-        bail!(
-            "resume file {} refers to step {} but only records {} replay steps",
-            resume_path.display(),
-            state.suspended_step_index,
-            state.steps.len()
-        );
-    }
 
     if cherry_pick_head_exists(&state.temp_worktree_path) {
         if head_at(&state.temp_worktree_path)? != state.paused_head {
@@ -287,7 +248,6 @@ pub fn resume_rewrite(dry: bool, path: &Path) -> Result<RewriteCommandOutcome> {
                 state.temp_worktree_path
             )
         });
-        let mut skipped_current_step = false;
         if let Err(err) = continue_result {
             if cherry_pick_head_exists(&state.temp_worktree_path)
                 && worktree_status_lines(&state.temp_worktree_path)?.is_empty()
@@ -313,56 +273,15 @@ pub fn resume_rewrite(dry: bool, path: &Path) -> Result<RewriteCommandOutcome> {
                         state.temp_worktree_path
                     )
                 });
-                if let Err(skip_err) = skip_result {
-                    if cherry_pick_head_exists(&state.temp_worktree_path) {
-                        let consumed_steps = validated_advanced_step_count(&state)? + 1;
-                        state.suspended_step_index += consumed_steps;
-                        state.paused_head = head_at(&state.temp_worktree_path)?;
-                        state.paused_step_proof = state
-                            .steps
-                            .get(state.suspended_step_index)
-                            .map(|step| build_paused_step_proof(&state.paused_head, step))
-                            .transpose()?;
-                        write_resume_state(&resume_path, &state)?;
-                        emit_suspend_instructions(&resume_path, &state);
-                        return Ok(RewriteCommandOutcome::Suspended(Box::new(
-                            suspended_state_from_resume_state(&resume_path, &state)?,
-                        )));
-                    }
-                    return Err(skip_err);
-                }
-                skipped_current_step = true;
-            } else if cherry_pick_head_exists(&state.temp_worktree_path) {
-                let consumed_steps = validated_advanced_step_count(&state)?;
-                if consumed_steps == 0 {
-                    return Err(err);
-                }
-                state.suspended_step_index += consumed_steps;
-                state.paused_head = head_at(&state.temp_worktree_path)?;
-                state.paused_step_proof = state
-                    .steps
-                    .get(state.suspended_step_index)
-                    .map(|step| build_paused_step_proof(&state.paused_head, step))
-                    .transpose()?;
-                write_resume_state(&resume_path, &state)?;
-                emit_suspend_instructions(&resume_path, &state);
-                return Ok(RewriteCommandOutcome::Suspended(Box::new(
-                    suspended_state_from_resume_state(&resume_path, &state)?,
-                )));
+                skip_result?;
             } else {
                 return Err(err);
             }
         }
-        let mut consumed_steps = validated_advanced_step_count(&state)?;
-        if skipped_current_step {
-            consumed_steps += 1;
-        }
-        state.suspended_step_index += consumed_steps;
-        state.paused_step_proof = None;
-        persist_resume_progress(&resume_path, &state)?;
     } else {
-        let consumed_steps = validated_advanced_step_count(&state)?;
-        if consumed_steps == 0 {
+        let advanced_commits =
+            advanced_commits_since_paused_head(&state.temp_worktree_path, &state.paused_head)?;
+        if advanced_commits.is_empty() {
             bail!(
                 "resume file {} expects an in-progress cherry-pick in {}, but `CHERRY_PICK_HEAD` is missing and HEAD did not advance from {}",
                 resume_path.display(),
@@ -372,21 +291,19 @@ pub fn resume_rewrite(dry: bool, path: &Path) -> Result<RewriteCommandOutcome> {
         } else {
             validate_manual_continue_commit(&state)?;
             info!(
-                "Detected manual cherry-pick progress of {} step(s) in {}; resuming remaining replay steps.",
-                consumed_steps,
+                "Detected one manual `git cherry-pick --continue` in {}; resuming the remaining replay operations.",
                 state.temp_worktree_path
             );
-            state.suspended_step_index += consumed_steps;
-            state.paused_step_proof = None;
-            persist_resume_progress(&resume_path, &state)?;
         }
     }
 
-    continue_rewrite_steps(
+    let remaining_operations = state.remaining_operations.clone();
+    continue_rewrite_operations(
         false,
         state,
         RewriteConflictPolicy::Suspend,
         &resume_path,
+        &remaining_operations,
         true,
     )
 }
@@ -404,21 +321,13 @@ fn continue_rewrite_operations(
             let conflict = cherry_pick_head_exists(&state.temp_worktree_path);
             if conflict && conflict_policy == RewriteConflictPolicy::Suspend {
                 state.paused_head = head_at(&state.temp_worktree_path)?;
-                state.steps = remaining_steps_after_conflicted_operation(
+                let (paused_step, remaining_operations) = split_conflicted_operation(
                     &state.temp_worktree_path,
                     op,
                     &operations[op_index + 1..],
                 )?;
-                state.suspended_step_index = 0;
-                state.paused_step_proof = Some(build_paused_step_proof(
-                    &state.paused_head,
-                    state.steps.first().ok_or_else(|| {
-                        anyhow!(
-                            "{} suspended without recording a paused replay step",
-                            state.command_kind.command_name()
-                        )
-                    })?,
-                )?);
+                state.paused_step = paused_step;
+                state.remaining_operations = remaining_operations;
                 write_resume_state(resume_path, &state)?;
                 emit_suspend_instructions(resume_path, &state);
                 return Ok(RewriteCommandOutcome::Suspended(Box::new(
@@ -437,54 +346,6 @@ fn continue_rewrite_operations(
                 )
             });
         }
-    }
-
-    finish_rewrite(dry, state, resume_path, restore_dirty_worktree_on_success)
-}
-
-fn continue_rewrite_steps(
-    dry: bool,
-    mut state: RewriteResumeState,
-    conflict_policy: RewriteConflictPolicy,
-    resume_path: &Path,
-    restore_dirty_worktree_on_success: bool,
-) -> Result<RewriteCommandOutcome> {
-    let mut next_index = state.suspended_step_index;
-    while next_index < state.steps.len() {
-        let step = &state.steps[next_index];
-        if let Err(err) = common::cherry_pick_commit(
-            dry,
-            &state.temp_worktree_path,
-            &step.source_sha,
-            step.empty_policy,
-        ) {
-            let conflict = cherry_pick_head_exists(&state.temp_worktree_path);
-            if conflict && conflict_policy == RewriteConflictPolicy::Suspend {
-                state.paused_head = head_at(&state.temp_worktree_path)?;
-                state.suspended_step_index = next_index;
-                state.paused_step_proof = Some(build_paused_step_proof(&state.paused_head, step)?);
-                write_resume_state(resume_path, &state)?;
-                emit_suspend_instructions(resume_path, &state);
-                return Ok(RewriteCommandOutcome::Suspended(Box::new(
-                    suspended_state_from_resume_state(resume_path, &state)?,
-                )));
-            }
-
-            if conflict {
-                abort_cherry_pick_best_effort(dry, &state.temp_worktree_path);
-            }
-            cleanup_temp_state_best_effort(dry, &state.temp_worktree_path, &state.temp_branch);
-            return Err(err).with_context(|| {
-                format!(
-                    "{} failed; temp rewrite state was cleaned up",
-                    state.command_kind.command_name()
-                )
-            });
-        }
-        next_index += 1;
-        state.suspended_step_index = next_index;
-        state.paused_step_proof = None;
-        persist_resume_progress(resume_path, &state)?;
     }
 
     finish_rewrite(dry, state, resume_path, restore_dirty_worktree_on_success)
@@ -513,6 +374,18 @@ fn finish_rewrite(
         ]
         .as_slice(),
     )?;
+    let metadata_refresh_result = if dry {
+        Ok(())
+    } else if let Some(metadata_refresh_context) = &state.metadata_refresh_context {
+        crate::stack_metadata::refresh_metadata_for_branch(
+            &state.original_worktree_root,
+            &state.original_branch,
+            metadata_refresh_context,
+            Some(Path::new(&state.git_common_dir)),
+        )
+    } else {
+        Ok(())
+    };
     let restore_result = if restore_dirty_worktree_on_success {
         state
             .deferred_dirty_worktree_restore
@@ -531,6 +404,7 @@ fn finish_rewrite(
         info!("{post_success_hint}");
     }
     restore_result?;
+    metadata_refresh_result?;
     Ok(RewriteCommandOutcome::Completed)
 }
 
@@ -546,17 +420,6 @@ fn suspended_state_from_resume_state(
 ) -> Result<RewriteSuspendedState> {
     let conflicted_paths =
         conflicted_paths_from_status_lines(&worktree_status_lines(&state.temp_worktree_path)?);
-    let paused_source_sha = state
-        .steps
-        .get(state.suspended_step_index)
-        .map(|step| step.source_sha.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "resume state refers to missing step {} out of {} replay steps",
-                state.suspended_step_index,
-                state.steps.len()
-            )
-        })?;
     Ok(RewriteSuspendedState {
         command_kind: state.command_kind,
         original_worktree_root: state.original_worktree_root.clone(),
@@ -564,7 +427,7 @@ fn suspended_state_from_resume_state(
         temp_branch: state.temp_branch.clone(),
         temp_worktree_path: state.temp_worktree_path.clone(),
         resume_path: resume_path.to_path_buf(),
-        paused_source_sha,
+        paused_source_sha: state.paused_step.source_sha.clone(),
         conflicted_paths,
         post_success_hint: state.post_success_hint.clone(),
     })
@@ -629,16 +492,19 @@ fn run_cherry_pick_op(dry: bool, tmp_path: &str, op: &CherryPickOp) -> Result<()
     }
 }
 
-fn remaining_steps_after_conflicted_operation(
+fn split_conflicted_operation(
     tmp_path: &str,
     op: &CherryPickOp,
     later_operations: &[CherryPickOp],
-) -> Result<Vec<RewriteReplayStep>> {
-    let mut steps = match op {
-        CherryPickOp::Commit { sha, empty_policy } => vec![RewriteReplayStep {
-            source_sha: sha.clone(),
-            empty_policy: *empty_policy,
-        }],
+) -> Result<(RewriteReplayStep, Vec<CherryPickOp>)> {
+    match op {
+        CherryPickOp::Commit { sha, empty_policy } => Ok((
+            RewriteReplayStep {
+                source_sha: sha.clone(),
+                empty_policy: *empty_policy,
+            },
+            later_operations.to_vec(),
+        )),
         CherryPickOp::Range {
             first,
             last,
@@ -657,52 +523,48 @@ fn remaining_steps_after_conflicted_operation(
                         last
                     )
                 })?;
-            commits[paused_index..]
-                .iter()
-                .map(|source_sha| RewriteReplayStep {
-                    source_sha: source_sha.clone(),
-                    empty_policy: *empty_policy,
-                })
-                .collect()
+            trim_sequencer_todo_to_current_step(tmp_path)?;
+            let paused_step = RewriteReplayStep {
+                source_sha: paused_source_sha,
+                empty_policy: *empty_policy,
+            };
+            let mut remaining_operations = Vec::new();
+            if let Some(remaining_range) = CherryPickOp::from_commits_with_empty_policy(
+                &commits[paused_index + 1..],
+                *empty_policy,
+            ) {
+                remaining_operations.push(remaining_range);
+            }
+            remaining_operations.extend_from_slice(later_operations);
+            Ok((paused_step, remaining_operations))
         }
-    };
-    steps.extend(build_replay_steps(later_operations)?);
-    Ok(steps)
-}
-
-fn build_paused_step_proof(
-    paused_head: &str,
-    step: &RewriteReplayStep,
-) -> Result<RewritePausedStepProof> {
-    let identity = commit_identity(&step.source_sha)?;
-    Ok(RewritePausedStepProof {
-        source_sha: step.source_sha.clone(),
-        expected_parent: paused_head.to_string(),
-        expected_message: identity.message,
-        expected_author_name: identity.author_name,
-        expected_author_email: identity.author_email,
-        expected_author_date: identity.author_date,
-    })
+    }
 }
 
 fn validate_manual_continue_commit(state: &RewriteResumeState) -> Result<()> {
-    let consumed_steps = validated_advanced_step_count(state)?;
-    if consumed_steps == 0 {
+    let advanced_commits =
+        advanced_commits_since_paused_head(&state.temp_worktree_path, &state.paused_head)?;
+    if advanced_commits.len() > 1 {
+        bail!(
+            "temp worktree {} advanced by {} commits beyond paused HEAD {}; only one accidental manual continue is supported",
+            state.temp_worktree_path,
+            advanced_commits.len(),
+            state.paused_head
+        );
+    } else if let Some(actual_sha) = advanced_commits.first() {
+        validate_replayed_commit_matches_step(
+            &state.temp_worktree_path,
+            actual_sha,
+            &state.paused_step,
+            &state.paused_head,
+        )
+    } else {
         bail!(
             "temp worktree {} did not advance any validated replay steps beyond paused HEAD {}",
             state.temp_worktree_path,
             state.paused_head
-        );
-    } else {
-        Ok(())
+        )
     }
-}
-
-fn persist_resume_progress(resume_path: &Path, state: &RewriteResumeState) -> Result<()> {
-    if resume_path.exists() {
-        write_resume_state(resume_path, state)?;
-    }
-    Ok(())
 }
 
 fn commit_identity(sha: &str) -> Result<CommitIdentity> {
@@ -760,33 +622,6 @@ fn commit_identity_from_args(args: &[&str]) -> Result<CommitIdentity> {
     })
 }
 
-fn validated_advanced_step_count(state: &RewriteResumeState) -> Result<usize> {
-    let advanced_commits =
-        advanced_commits_since_paused_head(&state.temp_worktree_path, &state.paused_head)?;
-    let remaining_steps = &state.steps[state.suspended_step_index..];
-    if advanced_commits.len() > remaining_steps.len() {
-        bail!(
-            "temp worktree {} advanced by {} commits beyond paused HEAD {}, but only {} replay step(s) remain",
-            state.temp_worktree_path,
-            advanced_commits.len(),
-            state.paused_head,
-            remaining_steps.len()
-        );
-    }
-
-    let mut expected_parent = state.paused_head.clone();
-    for (advanced_commit, step) in advanced_commits.iter().zip(remaining_steps.iter()) {
-        validate_replayed_commit_matches_step(
-            &state.temp_worktree_path,
-            advanced_commit,
-            step,
-            &expected_parent,
-        )?;
-        expected_parent = advanced_commit.clone();
-    }
-    Ok(advanced_commits.len())
-}
-
 fn validate_replayed_commit_matches_step(
     tmp_path: &str,
     actual_sha: &str,
@@ -831,6 +666,49 @@ fn validate_replayed_commit_matches_step(
         );
     } else {
         Ok(())
+    }
+}
+
+fn trim_sequencer_todo_to_current_step(tmp_path: &str) -> Result<()> {
+    let todo_path = git_dir_at(tmp_path)?.join("sequencer").join("todo");
+    let todo = fs::read_to_string(&todo_path)
+        .with_context(|| format!("failed to read sequencer todo {}", todo_path.display()))?;
+    let trimmed = trim_todo_to_first_action(&todo)?;
+    fs::write(&todo_path, trimmed)
+        .with_context(|| format!("failed to rewrite sequencer todo {}", todo_path.display()))
+}
+
+fn trim_todo_to_first_action(todo: &str) -> Result<String> {
+    let mut kept_lines = Vec::new();
+    let mut kept_action = false;
+    for line in todo.lines() {
+        if kept_action {
+            continue;
+        }
+        kept_lines.push(line.to_string());
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            kept_action = true;
+        }
+    }
+    if !kept_action {
+        bail!("sequencer todo did not contain a cherry-pick action to keep");
+    } else {
+        let mut trimmed = kept_lines.join("\n");
+        if todo.ends_with('\n') {
+            trimmed.push('\n');
+        }
+        Ok(trimmed)
+    }
+}
+
+fn git_dir_at(tmp_path: &str) -> Result<PathBuf> {
+    let raw = git_ro(["-C", tmp_path, "rev-parse", "--git-dir"].as_slice())?;
+    let path = PathBuf::from(raw.trim());
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(Path::new(tmp_path).join(path))
     }
 }
 
@@ -883,7 +761,7 @@ fn validate_resume_state_against_current_repo(
     path: &Path,
     state: &RewriteResumeState,
 ) -> Result<()> {
-    let current_common_dir = current_common_git_dir()?;
+    let current_common_dir = git_common_dir()?;
     let expected_common_dir = canonicalize_existing_path(Path::new(&state.git_common_dir))
         .with_context(|| {
             format!(
@@ -961,12 +839,6 @@ fn validate_original_worktree_target(state: &RewriteResumeState) -> Result<()> {
 
     Ok(())
 }
-
-fn current_common_git_dir() -> Result<PathBuf> {
-    let raw = git_ro(["rev-parse", "--git-common-dir"].as_slice())?;
-    canonicalize_existing_path(&absolute_path(Path::new(raw.trim()))?)
-}
-
 fn default_resume_path(
     git_common_dir: &Path,
     command_kind: RewriteCommandKind,
@@ -1163,11 +1035,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        build_replay_steps, conflicted_paths_from_status_lines, default_resume_path,
+        conflicted_paths_from_status_lines, default_resume_path,
         prepare_resume_path_for_new_session, resume_rewrite, run_rewrite_session,
         sanitize_branch_for_filename, suspend_instruction_lines, RewriteCommandKind,
-        RewriteCommandOutcome, RewriteConflictPolicy, RewriteResumeState, RewriteSession,
-        REWRITE_RESUME_SCHEMA_VERSION,
+        RewriteCommandOutcome, RewriteConflictPolicy, RewriteReplayStep, RewriteResumeState,
+        RewriteSession, REWRITE_RESUME_SCHEMA_VERSION,
     };
     use crate::commands::common::{
         CherryPickEmptyPolicy, CherryPickOp, DeferredDirtyWorktreeRestore,
@@ -1221,6 +1093,20 @@ mod tests {
         }
     }
 
+    fn git_dir(repo: &Path) -> PathBuf {
+        let raw = git(repo, ["rev-parse", "--git-dir"].as_slice());
+        let path = PathBuf::from(raw.trim());
+        if path.is_absolute() {
+            path
+        } else {
+            repo.join(path)
+        }
+    }
+
+    fn sequencer_todo(repo: &Path) -> String {
+        fs::read_to_string(git_dir(repo).join("sequencer").join("todo")).expect("read todo")
+    }
+
     fn resolve_keep_both(repo: &Path, contents: &str) {
         fs::write(repo.join("story.txt"), contents).expect("resolve conflict");
         git(repo, ["add", "story.txt"].as_slice());
@@ -1267,6 +1153,7 @@ mod tests {
             }],
             deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore::Noop,
             post_success_hint: None,
+            metadata_refresh_context: None,
         };
 
         let outcome = run_rewrite_session(false, session).expect("run rewrite session");
@@ -1278,40 +1165,7 @@ mod tests {
         (dir, repo, resume_path)
     }
 
-    #[test]
-    fn build_replay_steps_expands_ranges_to_single_commits() {
-        let _lock = lock_cwd();
-        let dir = init_conflict_repo();
-        let repo = dir.path().to_path_buf();
-        let _guard = DirGuard::change_to(&repo);
-
-        let first = commit_file(&repo, "alpha.txt", "alpha-1\n", "feat: alpha");
-        let second = commit_file(&repo, "alpha.txt", "alpha-1\nalpha-2\n", "feat: alpha 2");
-        let steps = build_replay_steps(&[
-            CherryPickOp::Commit {
-                sha: first.clone(),
-                empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
-            },
-            CherryPickOp::Range {
-                first,
-                last: second.clone(),
-                empty_policy: CherryPickEmptyPolicy::KeepRedundantCommits,
-            },
-        ])
-        .expect("flatten replay steps");
-
-        assert_eq!(steps.len(), 3);
-        assert_eq!(steps[1].source_sha, steps[0].source_sha);
-        assert_eq!(steps[2].source_sha, second);
-        assert_eq!(
-            steps[2].empty_policy,
-            CherryPickEmptyPolicy::KeepRedundantCommits
-        );
-    }
-
-    #[test]
-    fn run_rewrite_session_uses_range_replay_before_first_conflict() {
-        let _lock = lock_cwd();
+    fn suspended_range_session_repo() -> (TempDir, PathBuf, PathBuf, String, String, String) {
         let dir = init_conflict_repo();
         let repo = dir.path().to_path_buf();
         let _guard = DirGuard::change_to(&repo);
@@ -1319,12 +1173,12 @@ mod tests {
         git(&repo, ["checkout", "-b", "stack"].as_slice());
         let first = commit_file(&repo, "story.txt", "stack-1\n", "feat: first");
         let second = commit_file(&repo, "extra.txt", "stack-2\n", "feat: second");
-        let original_head = second.clone();
+        let third = commit_file(&repo, "more.txt", "stack-3\n", "feat: third");
+        let original_head = third.clone();
 
         git(&repo, ["checkout", "main"].as_slice());
         let base_head = commit_file(&repo, "story.txt", "base-updated\n", "feat: base update");
         git(&repo, ["checkout", "stack"].as_slice());
-
         let short = git(&repo, ["rev-parse", "--short", "HEAD"].as_slice())
             .trim()
             .to_string();
@@ -1349,35 +1203,138 @@ mod tests {
                 original_head,
                 resume_path: resume_path.clone(),
                 temp_branch: tmp_branch,
-                temp_worktree_path: tmp_path.clone(),
+                temp_worktree_path: tmp_path,
                 backup_tag: None,
                 operations: vec![CherryPickOp::Range {
                     first: first.clone(),
-                    last: second.clone(),
+                    last: third.clone(),
                     empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
                 }],
                 deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore::Noop,
                 post_success_hint: None,
+                metadata_refresh_context: None,
             },
         )
-        .expect("run rewrite session");
+        .expect("run range rewrite session");
+
+        let resume_path = match outcome {
+            RewriteCommandOutcome::Completed => panic!("expected suspended rewrite"),
+            RewriteCommandOutcome::Suspended(state) => state.resume_path.clone(),
+        };
+
+        (dir, repo, resume_path, first, second, third)
+    }
+
+    fn suspended_repeated_range_conflict_repo() -> (
+        TempDir,
+        PathBuf,
+        PathBuf,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) {
+        let dir = init_conflict_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        git(&repo, ["checkout", "-b", "stack"].as_slice());
+        let first = commit_file(&repo, "story.txt", "stack-1\n", "feat: first");
+        let second = commit_file(&repo, "extra.txt", "stack-2\n", "feat: second");
+        let third = commit_file(&repo, "notes.txt", "stack-notes\n", "feat: third");
+        let fourth = commit_file(&repo, "tail-a.txt", "tail-a\n", "feat: fourth");
+        let fifth = commit_file(&repo, "tail-b.txt", "tail-b\n", "feat: fifth");
+        let original_head = fifth.clone();
+
+        git(&repo, ["checkout", "main"].as_slice());
+        fs::write(repo.join("story.txt"), "base-updated\n").expect("write base story");
+        fs::write(repo.join("notes.txt"), "base-notes\n").expect("write base notes");
+        git(&repo, ["add", "story.txt", "notes.txt"].as_slice());
+        git(&repo, ["commit", "-m", "feat: base update"].as_slice());
+        let base_head = git(&repo, ["rev-parse", "HEAD"].as_slice())
+            .trim()
+            .to_string();
+        git(&repo, ["checkout", "stack"].as_slice());
+        let short = git(&repo, ["rev-parse", "--short", "HEAD"].as_slice())
+            .trim()
+            .to_string();
+        let (tmp_path, tmp_branch) =
+            crate::commands::common::create_temp_worktree(false, "restack", &base_head, &short)
+                .expect("create temp worktree");
+        let resume_path = prepare_resume_path_for_new_session(
+            false,
+            RewriteCommandKind::Restack,
+            "stack",
+            &original_head,
+        )
+        .expect("prepare resume path");
+
+        let outcome = run_rewrite_session(
+            false,
+            RewriteSession {
+                command_kind: RewriteCommandKind::Restack,
+                conflict_policy: RewriteConflictPolicy::Suspend,
+                original_worktree_root: repo.display().to_string(),
+                original_branch: "stack".to_string(),
+                original_head,
+                resume_path: resume_path.clone(),
+                temp_branch: tmp_branch,
+                temp_worktree_path: tmp_path,
+                backup_tag: None,
+                operations: vec![CherryPickOp::Range {
+                    first: first.clone(),
+                    last: fifth.clone(),
+                    empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+                }],
+                deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore::Noop,
+                post_success_hint: None,
+                metadata_refresh_context: None,
+            },
+        )
+        .expect("run repeated range rewrite session");
+
+        let resume_path = match outcome {
+            RewriteCommandOutcome::Completed => panic!("expected suspended rewrite"),
+            RewriteCommandOutcome::Suspended(state) => state.resume_path.clone(),
+        };
+
+        (dir, repo, resume_path, first, second, third, fourth, fifth)
+    }
+
+    #[test]
+    fn suspend_trims_range_todo_and_persists_range_suffix() {
+        let _lock = lock_cwd();
+        let (dir, repo, resume_path, first, second, third) = suspended_range_session_repo();
+        let _keep_dir_alive = dir.path();
+        let _guard = DirGuard::change_to(&repo);
+
+        let resume_state: RewriteResumeState =
+            serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
+                .expect("parse resume state");
+        let temp_repo = Path::new(&resume_state.temp_worktree_path);
+        let todo = sequencer_todo(temp_repo);
 
         assert!(
-            matches!(outcome, RewriteCommandOutcome::Suspended(_)),
-            "expected range replay to suspend"
+            todo.contains("feat: first")
+                && !todo.contains("feat: second")
+                && !todo.contains("feat: third"),
+            "expected the suspended sequencer todo to keep only the current pick: {todo}"
         );
-        let git_dir_raw = git(Path::new(&tmp_path), ["rev-parse", "--git-dir"].as_slice());
-        let git_dir = PathBuf::from(git_dir_raw.trim());
-        let git_dir = if git_dir.is_absolute() {
-            git_dir
-        } else {
-            Path::new(&tmp_path).join(git_dir)
-        };
-        let sequencer_todo =
-            fs::read_to_string(git_dir.join("sequencer").join("todo")).expect("read todo");
-        assert!(
-            sequencer_todo.contains("feat: second") && sequencer_todo.contains(&second[..7]),
-            "expected the range sequencer todo to mention the later commit: {sequencer_todo}"
+        assert_eq!(
+            resume_state.paused_step,
+            RewriteReplayStep {
+                source_sha: first,
+                empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+            }
+        );
+        assert_eq!(
+            resume_state.remaining_operations,
+            vec![CherryPickOp::Range {
+                first: second,
+                last: third,
+                empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+            }]
         );
     }
 
@@ -1416,7 +1373,7 @@ mod tests {
     #[test]
     fn resume_rewrite_tolerates_one_manual_continue() {
         let _lock = lock_cwd();
-        let (dir, repo, resume_path) = suspended_session_repo();
+        let (dir, repo, resume_path, _first, _second, _third) = suspended_range_session_repo();
         let _keep_dir_alive = dir.path();
         let _guard = DirGuard::change_to(&repo);
 
@@ -1424,14 +1381,30 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
                 .expect("parse resume state");
         let temp_repo = Path::new(&resume_state.temp_worktree_path);
-        resolve_keep_both(temp_repo, "base-updated\nstack-change\n");
+        resolve_keep_both(temp_repo, "base-updated\nstack-1\n");
         git(temp_repo, ["cherry-pick", "--continue"].as_slice());
+        assert!(
+            !temp_repo.join("extra.txt").exists() && !temp_repo.join("more.txt").exists(),
+            "manual continue should finish only the paused commit before spr resume relaunches the suffix"
+        );
 
         let outcome = resume_rewrite(false, &resume_path).expect("resume after manual continue");
         assert_eq!(outcome, RewriteCommandOutcome::Completed);
         assert!(
             !resume_path.exists(),
             "resume file should be removed after the resumed replay finishes"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("story.txt")).expect("read final story"),
+            "base-updated\nstack-1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("extra.txt")).expect("read final extra"),
+            "stack-2\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("more.txt")).expect("read final more"),
+            "stack-3\n"
         );
     }
 
@@ -1523,7 +1496,7 @@ mod tests {
     #[test]
     fn resume_rewrite_rejects_multiple_manual_commits() {
         let _lock = lock_cwd();
-        let (dir, repo, resume_path) = suspended_session_repo();
+        let (dir, repo, resume_path, _first, _second, _third) = suspended_range_session_repo();
         let _keep_dir_alive = dir.path();
         let _guard = DirGuard::change_to(&repo);
 
@@ -1531,7 +1504,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
                 .expect("parse resume state");
         let temp_repo = Path::new(&resume_state.temp_worktree_path);
-        resolve_keep_both(temp_repo, "base-updated\nstack-change\n");
+        resolve_keep_both(temp_repo, "base-updated\nstack-1\n");
         git(temp_repo, ["cherry-pick", "--continue"].as_slice());
         commit_file(
             temp_repo,
@@ -1543,9 +1516,52 @@ mod tests {
         let err = resume_rewrite(false, &resume_path).expect_err("extra manual commit should fail");
         let err_text = format!("{err:#}");
         assert!(
-            err_text.contains("only 1 replay step(s) remain")
-                || err_text.contains("only one accidental manual continue is supported"),
+            err_text.contains("only one accidental manual continue is supported"),
             "unexpected error: {err_text}"
+        );
+    }
+
+    #[test]
+    fn second_conflict_resuspends_with_new_suffix_range() {
+        let _lock = lock_cwd();
+        let (dir, repo, resume_path, _first, _second, third, fourth, fifth) =
+            suspended_repeated_range_conflict_repo();
+        let _keep_dir_alive = dir.path();
+        let _guard = DirGuard::change_to(&repo);
+
+        let first_resume_state: RewriteResumeState =
+            serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
+                .expect("parse resume state");
+        resolve_keep_both(
+            Path::new(&first_resume_state.temp_worktree_path),
+            "base-updated\nstack-1\n",
+        );
+
+        let resumed = resume_rewrite(false, &resume_path).expect("resume into second conflict");
+        let second_resume_path = match resumed {
+            RewriteCommandOutcome::Completed => panic!("expected second suspension"),
+            RewriteCommandOutcome::Suspended(state) => state.resume_path.clone(),
+        };
+        let second_resume_state: RewriteResumeState = serde_json::from_str(
+            &fs::read_to_string(&second_resume_path).expect("read second resume state"),
+        )
+        .expect("parse second resume state");
+        let todo = sequencer_todo(Path::new(&second_resume_state.temp_worktree_path));
+
+        assert!(
+            todo.contains("feat: third")
+                && !todo.contains("feat: fourth")
+                && !todo.contains("feat: fifth"),
+            "expected the second suspended todo to keep only the current conflicted pick: {todo}"
+        );
+        assert_eq!(second_resume_state.paused_step.source_sha, third);
+        assert_eq!(
+            second_resume_state.remaining_operations,
+            vec![CherryPickOp::Range {
+                first: fourth,
+                last: fifth,
+                empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+            }]
         );
     }
 
@@ -1608,11 +1624,14 @@ mod tests {
             temp_worktree_path: "/tmp/spr-restack-abcdef0".to_string(),
             backup_tag: None,
             paused_head: "abcdef0123456789".to_string(),
-            paused_step_proof: None,
-            suspended_step_index: 0,
-            steps: vec![],
+            paused_step: RewriteReplayStep {
+                source_sha: "abcdef0123456789".to_string(),
+                empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+            },
+            remaining_operations: vec![],
             deferred_dirty_worktree_restore: DeferredDirtyWorktreeRestore::Noop,
             post_success_hint: None,
+            metadata_refresh_context: None,
         };
 
         let lines =

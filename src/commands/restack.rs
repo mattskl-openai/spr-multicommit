@@ -87,7 +87,7 @@ fn resolve_restack_after_count(groups: &[Group], after: &AfterSelector) -> Resul
 }
 
 fn restack_after_resolved(
-    base: &str,
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
     leading_ignored: Vec<String>,
     groups: Vec<Group>,
     after: usize,
@@ -105,6 +105,7 @@ fn restack_after_resolved(
             let (cur_branch, short) = common::get_current_branch_and_short()?;
             let original_head = git_rev_parse("HEAD")?;
             let original_worktree_root = rewrite_resume::current_repo_root()?;
+            let metadata_refresh_context = metadata_context.clone();
             if remaining.is_empty() && kept_ignored_segments.is_empty() {
                 if options.safe {
                     let _ = common::create_backup_tag(options.dry, "restack", &cur_branch, &short)?;
@@ -113,9 +114,17 @@ fn restack_after_resolved(
                     "Skipping all {} PR(s); syncing current branch {} to {}",
                     groups.len(),
                     cur_branch,
-                    base
+                    metadata_context.base
                 );
-                common::reset_current_branch_to(options.dry, base)?;
+                common::reset_current_branch_to(options.dry, &metadata_context.base)?;
+                if !options.dry {
+                    crate::stack_metadata::refresh_metadata_for_branch(
+                        &original_worktree_root,
+                        &cur_branch,
+                        &metadata_refresh_context,
+                        None,
+                    )?;
+                }
                 Ok(RewriteCommandOutcome::Completed)
             } else {
                 let resume_path = rewrite_resume::prepare_resume_path_for_new_session(
@@ -135,8 +144,12 @@ fn restack_after_resolved(
                     None
                 };
 
-                let (tmp_path, tmp_branch) =
-                    common::create_temp_worktree(options.dry, "restack", base, &short)?;
+                let (tmp_path, tmp_branch) = common::create_temp_worktree(
+                    options.dry,
+                    "restack",
+                    &metadata_context.base,
+                    &short,
+                )?;
                 let ops = build_cherry_pick_plan(&kept_ignored_segments, &remaining);
                 let outcome = rewrite_resume::run_rewrite_session(
                     options.dry,
@@ -159,12 +172,13 @@ fn restack_after_resolved(
                         operations: ops,
                         deferred_dirty_worktree_restore,
                         post_success_hint: None,
+                        metadata_refresh_context: Some(metadata_refresh_context),
                     },
                 )?;
                 if outcome == RewriteCommandOutcome::Completed {
                     info!(
                         "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
-                        after, cur_branch, base
+                        after, cur_branch, metadata_context.base
                     );
                 }
                 Ok(outcome)
@@ -191,8 +205,7 @@ fn restack_after_resolved(
 ///
 /// Returns errors from git operations (fetch, worktree creation, cherry-picks, reset).
 pub fn restack_after(
-    base: &str,
-    ignore_tag: &str,
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
     after: &AfterSelector,
     safe: bool,
     dry: bool,
@@ -202,14 +215,14 @@ pub fn restack_after(
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
     let (_merge_base, leading_ignored, groups) =
-        derive_local_groups_with_ignored(base, ignore_tag)?;
+        derive_local_groups_with_ignored(&metadata_context.base, &metadata_context.ignore_tag)?;
     if groups.is_empty() {
         info!("No local PR groups found; nothing to restack.");
         Ok(RewriteCommandOutcome::Completed)
     } else {
         let after = resolve_restack_after_count(&groups, after)?;
         restack_after_resolved(
-            base,
+            metadata_context,
             leading_ignored,
             groups,
             after,
@@ -225,8 +238,7 @@ pub fn restack_after(
 
 /// Restack the local stack by keeping the first `after` groups in place.
 pub fn restack_after_count(
-    base: &str,
-    ignore_tag: &str,
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
     after: usize,
     safe: bool,
     dry: bool,
@@ -236,12 +248,12 @@ pub fn restack_after_count(
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
     let (_merge_base, leading_ignored, groups) =
-        derive_local_groups_with_ignored(base, ignore_tag)?;
+        derive_local_groups_with_ignored(&metadata_context.base, &metadata_context.ignore_tag)?;
     if groups.is_empty() {
         Ok(RewriteCommandOutcome::Completed)
     } else {
         restack_after_resolved(
-            base,
+            metadata_context,
             leading_ignored,
             groups,
             after,
@@ -268,6 +280,14 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    fn metadata_context() -> crate::stack_metadata::RefreshMetadataContext {
+        crate::stack_metadata::RefreshMetadataContext {
+            base: "main".to_string(),
+            prefix: "dank-spr/".to_string(),
+            ignore_tag: "ignore".to_string(),
+        }
+    }
 
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
@@ -399,8 +419,7 @@ mod tests {
         let _guard = DirGuard::change_to(&repo);
 
         let outcome = super::restack_after(
-            "main",
-            "ignore",
+            &metadata_context(),
             &AfterSelector::Group(GroupSelector::LocalPr(1)),
             false,
             false,

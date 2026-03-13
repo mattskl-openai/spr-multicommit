@@ -45,6 +45,9 @@ spr update
 spr list pr
 spr list commit
 
+# Discover which stack branch owns a canonical PR branch
+spr resolve-stack dank-spr/alpha
+
 # After appending commits directly to canonical local per-PR branches,
 # fold those tails back into the checked-out stack branch.
 spr absorb
@@ -253,6 +256,39 @@ Override example for intentionally keeping both an earlier copied follow-up comm
 
 ```bash
 spr absorb --allow-replayed-duplicates
+```
+
+### spr resolve-stack
+
+Resolve a canonical PR branch back to its owning stack branch using repo-local
+metadata stored under the repository common Git directory:
+
+- Metadata path: `<git-common-dir>/spr/stack_metadata_v1.json`
+- Metadata is refreshed after successful `spr update`, `spr restack`,
+  `spr absorb`, `spr move`, `spr fix-pr`, `spr resume`, and `spr land` when it
+  also finishes the local follow-on restack
+- Supported targets:
+  - no argument: current branch
+  - local branch name such as `dank-spr/alpha`
+  - remote-qualified branch name such as `origin/dank-spr/alpha`
+  - GitHub PR URL
+- JSON mode returns typed states such as `found`, `already_stack_branch`,
+  `missing_metadata`, `stale_metadata`, `tombstoned`, `ambiguous`, and
+  `invalid_target`
+- This command is strict and local-only after target normalization: it does not
+  scan unrelated branches or repair stale metadata
+
+Examples:
+
+```bash
+# PR branch -> owning stack branch
+spr resolve-stack dank-spr/alpha
+
+# Current branch
+spr resolve-stack
+
+# Automation-friendly JSON
+spr resolve-stack --json https://github.com/org/repo/pull/123
 ```
 
 ### spr resume
