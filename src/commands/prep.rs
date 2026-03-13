@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use tracing::info;
 
+use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
 use crate::git::{git_ro, git_rw};
 use crate::github::{append_warning_to_pr, list_open_prs_for_heads};
 use crate::limit::Limit;
@@ -43,6 +44,7 @@ pub fn prep_squash(
         info!("Nothing to prep");
         return Ok(());
     }
+    let branch_identities = group_branch_identities(&groups, prefix)?;
 
     // Determine selected range of groups to prep (squash)
     let (start_idx, end_idx_exclusive) = resolve_prep_window(&groups, &selection)?;
@@ -231,9 +233,13 @@ pub fn prep_squash(
     // Add a warning to the first PR not included in the push
     if let Some(next_idx) = next_idx_opt {
         if next_idx < groups.len() {
-            let next_branch = format!("{}{}", prefix, groups[next_idx].tag);
+            let next_branch = branch_identities[next_idx].exact.clone();
             let prs = list_open_prs_for_heads(std::slice::from_ref(&next_branch))?;
-            if let Some(pr) = prs.iter().find(|p| p.head == next_branch) {
+            let next_key = canonical_branch_conflict_key(&next_branch);
+            if let Some(pr) = prs
+                .iter()
+                .find(|pr| canonical_branch_conflict_key(&pr.head) == next_key)
+            {
                 match pr_description_mode {
                     crate::config::PrDescriptionMode::Overwrite => {
                         append_warning_to_pr(
@@ -258,10 +264,12 @@ pub fn prep_squash(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_prep_window;
+    use super::{prep_squash, resolve_prep_window};
     use crate::cli::PrepSelection;
+    use crate::config::{ListOrder, PrDescriptionMode};
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
+    use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
 
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
@@ -295,5 +303,30 @@ mod tests {
         }));
 
         assert_eq!(resolve_prep_window(&groups, &selection).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn prep_squash_rejects_case_colliding_branch_names_from_local_stack() {
+        let _lock = lock_cwd();
+        let dir = init_case_conflicting_stack_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let err = prep_squash(
+            "main",
+            "dank-spr/",
+            "ignore",
+            PrDescriptionMode::Overwrite,
+            ListOrder::RecentOnBottom,
+            PrepSelection::All,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+            "unexpected error: {err}"
+        );
     }
 }

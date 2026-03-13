@@ -13,6 +13,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use tracing::info;
 
+use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
 use crate::config::ListOrder;
 use crate::github::{
     fetch_pr_ci_review_status, list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
@@ -138,14 +139,19 @@ pub fn list_prs_display(
         info!("No groups discovered; nothing to list.");
         return Ok(());
     }
+    let branch_identities = group_branch_identities(&groups, prefix)?;
 
     // Fetch PRs to annotate with numbers and statuses when available.
     // Optimize by querying only the heads in this local stack rather than scanning many PRs.
-    let heads: Vec<String> = groups
+    let heads: Vec<String> = branch_identities
         .iter()
-        .map(|g| format!("{}{}", prefix, g.tag))
+        .map(|identity| identity.exact.clone())
         .collect();
     let prs = list_open_or_merged_prs_for_heads(&heads)?; // may be empty; that's fine
+    let prs_by_head: HashMap<_, _> = prs
+        .iter()
+        .map(|pr| (canonical_branch_conflict_key(&pr.head), pr))
+        .collect();
     let mut status_map: HashMap<u64, PrCiReviewStatus> = HashMap::new();
     if !prs.is_empty() {
         let numbers: Vec<u64> = prs
@@ -165,8 +171,9 @@ pub fn list_prs_display(
     let display_indices = list_order.display_indices(groups.len());
     for group_idx in display_indices {
         let g = &groups[group_idx];
-        let head_branch = format!("{}{}", prefix, g.tag);
-        let pr = prs.iter().find(|p| p.head == head_branch);
+        let identity = &branch_identities[group_idx];
+        let head_branch = &identity.exact;
+        let pr = prs_by_head.get(&identity.conflict_key).copied();
         let num = pr.map(|p| p.number);
         let pr_state = pr.map(|p| p.state);
         let count = g.commits.len();
@@ -187,7 +194,7 @@ pub fn list_prs_display(
                 local_pr_num,
                 stable_handle: &stable_handle,
                 short,
-                head_branch: &head_branch,
+                head_branch,
                 pr_number: num,
                 count,
             })
@@ -222,13 +229,18 @@ pub fn list_commits_display(
         info!("No groups discovered; nothing to list.");
         return Ok(());
     }
+    let branch_identities = group_branch_identities(&groups, prefix)?;
 
     // Fetch PRs to annotate groups with remote numbers when available
-    let heads: Vec<String> = groups
+    let heads: Vec<String> = branch_identities
         .iter()
-        .map(|g| format!("{}{}", prefix, g.tag))
+        .map(|identity| identity.exact.clone())
         .collect();
     let prs = list_open_prs_for_heads(&heads)?; // may be empty; that's fine
+    let prs_by_head: HashMap<_, _> = prs
+        .iter()
+        .map(|pr| (canonical_branch_conflict_key(&pr.head), pr))
+        .collect();
 
     // Precompute global commit numbering in bottom-up stack order.
     let mut group_start_idx: Vec<usize> = Vec::with_capacity(groups.len());
@@ -241,14 +253,15 @@ pub fn list_commits_display(
     let display_indices = list_order.display_indices(groups.len());
     for group_idx in display_indices {
         let g = &groups[group_idx];
-        let head_branch = format!("{}{}", prefix, g.tag);
-        let num = prs.iter().find(|p| p.head == head_branch).map(|p| p.number);
+        let identity = &branch_identities[group_idx];
+        let head_branch = &identity.exact;
+        let num = prs_by_head.get(&identity.conflict_key).map(|pr| pr.number);
         let stable_handle = stable_handle_text(&g.tag);
 
         // Group separator with local PR number
         info!(
             "{}",
-            format_commit_group_header(group_idx + 1, &stable_handle, num, &head_branch)
+            format_commit_group_header(group_idx + 1, &stable_handle, num, head_branch)
         );
 
         let start_idx = group_start_idx[group_idx];

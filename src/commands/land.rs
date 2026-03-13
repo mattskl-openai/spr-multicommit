@@ -1,6 +1,8 @@
 use anyhow::{bail, Result};
+use std::collections::HashMap;
 use tracing::warn;
 
+use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
 use crate::cli::LandCmd;
 use crate::git::{gh_rw, git_ro, git_rw, sanitize_gh_base_ref, to_remote_ref};
 use crate::github::{
@@ -18,15 +20,18 @@ fn resolve_land_take_count(
 
 fn resolve_landed_pr_segment<'a>(
     groups: &[crate::parsing::Group],
-    prefix: &str,
-    prs: &'a [crate::github::PrInfo],
+    branch_identities: &[crate::branch_names::SyntheticBranchIdentity],
+    prs_by_head: &HashMap<
+        crate::branch_names::CanonicalBranchConflictKey,
+        &'a crate::github::PrInfo,
+    >,
     until: &InclusiveSelector,
 ) -> Result<(usize, Vec<&'a crate::github::PrInfo>)> {
     let take_n = resolve_land_take_count(groups, until)?;
     let mut segment: Vec<&crate::github::PrInfo> = Vec::with_capacity(take_n);
-    for g in &groups[..take_n] {
-        let head_branch = format!("{}{}", prefix, g.tag);
-        if let Some(pr) = prs.iter().find(|p| p.head == head_branch) {
+    for (g, identity) in groups[..take_n].iter().zip(branch_identities.iter()) {
+        let head_branch = &identity.exact;
+        if let Some(pr) = prs_by_head.get(&identity.conflict_key).copied() {
             segment.push(pr);
         } else {
             bail!(
@@ -53,16 +58,21 @@ pub fn land_until(
     if groups.is_empty() {
         bail!("No local groups found; nothing to land.");
     }
+    let branch_identities = group_branch_identities(&groups, prefix)?;
     let take_n = resolve_land_take_count(&groups, until)?;
-    let heads: Vec<String> = groups[..take_n]
+    let heads: Vec<String> = branch_identities[..take_n]
         .iter()
-        .map(|g| format!("{}{}", prefix, g.tag))
+        .map(|identity| identity.exact.clone())
         .collect();
     let prs = list_open_prs_for_heads(&heads)?;
+    let prs_by_head: HashMap<_, _> = prs
+        .iter()
+        .map(|pr| (canonical_branch_conflict_key(&pr.head), pr))
+        .collect();
     if prs.is_empty() {
         bail!("No open PRs with head starting with `{prefix}`.");
     }
-    let (_, ordered) = resolve_landed_pr_segment(&groups, prefix, &prs, until)?;
+    let (_, ordered) = resolve_landed_pr_segment(&groups, &branch_identities, &prs_by_head, until)?;
     let segment = ordered.as_slice();
 
     // Safety validation: CI and Reviews must be passing/approved for all PRs being landed
@@ -271,10 +281,13 @@ pub fn land_flatten_until(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_land_take_count, resolve_landed_pr_segment};
+    use super::{land_until, resolve_land_take_count, resolve_landed_pr_segment};
+    use crate::cli::LandCmd;
     use crate::github::PrInfo;
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
+    use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
+    use std::collections::HashMap;
 
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
@@ -309,11 +322,22 @@ mod tests {
     #[test]
     fn land_until_only_requires_open_prs_for_landed_prefix() {
         let groups = groups(&["rho", "sigma"]);
-        let prs = vec![pr(14, "skilltest/rho")];
+        let branch_identities =
+            crate::branch_names::group_branch_identities(&groups, "skilltest/").unwrap();
+        let prs = [pr(14, "skilltest/rho")];
+        let prs_by_head: HashMap<_, _> = prs
+            .iter()
+            .map(|pr| {
+                (
+                    crate::branch_names::canonical_branch_conflict_key(&pr.head),
+                    pr,
+                )
+            })
+            .collect();
         let until = InclusiveSelector::Group(GroupSelector::LocalPr(1));
 
         let (take_n, ordered) =
-            resolve_landed_pr_segment(&groups, "skilltest/", &prs, &until).unwrap();
+            resolve_landed_pr_segment(&groups, &branch_identities, &prs_by_head, &until).unwrap();
 
         assert_eq!(take_n, 1);
         assert_eq!(ordered.len(), 1);
@@ -324,14 +348,51 @@ mod tests {
     #[test]
     fn land_until_still_requires_prs_for_every_group_being_landed() {
         let groups = groups(&["rho", "sigma"]);
-        let prs = vec![pr(14, "skilltest/rho")];
+        let branch_identities =
+            crate::branch_names::group_branch_identities(&groups, "skilltest/").unwrap();
+        let prs = [pr(14, "skilltest/rho")];
+        let prs_by_head: HashMap<_, _> = prs
+            .iter()
+            .map(|pr| {
+                (
+                    crate::branch_names::canonical_branch_conflict_key(&pr.head),
+                    pr,
+                )
+            })
+            .collect();
         let until = InclusiveSelector::Group(GroupSelector::LocalPr(2));
 
-        let err = resolve_landed_pr_segment(&groups, "skilltest/", &prs, &until).unwrap_err();
+        let err = resolve_landed_pr_segment(&groups, &branch_identities, &prs_by_head, &until)
+            .unwrap_err();
 
         assert_eq!(
             err.to_string(),
             "No open PR found for local group 'sigma' (branch 'skilltest/sigma')"
+        );
+    }
+
+    #[test]
+    fn land_until_rejects_case_colliding_branch_names_from_local_stack() {
+        let _lock = lock_cwd();
+        let dir = init_case_conflicting_stack_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let err = land_until(
+            "main",
+            "dank-spr/",
+            "ignore",
+            &InclusiveSelector::All,
+            true,
+            LandCmd::Flatten,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+            "unexpected error: {err}"
         );
     }
 }

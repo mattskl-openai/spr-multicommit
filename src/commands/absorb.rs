@@ -14,6 +14,7 @@ use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
+use crate::branch_names::{group_branch_identities, synthetic_branch_name};
 use crate::commands::common::{self, CherryPickEmptyPolicy, CherryPickOp};
 use crate::commands::rewrite_resume::{
     self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
@@ -410,6 +411,7 @@ fn build_plan_for_current_stack(
             },
         ))
     } else {
+        group_branch_identities(&groups, prefix)?;
         let stack_head = git_rev_parse("HEAD")?;
         let preliminary_group_plans = groups
             .into_iter()
@@ -482,7 +484,7 @@ fn classify_source_branch_preliminary(
     stack_merge_base: &str,
     stack_head: &str,
 ) -> Result<PreliminarySourceBranchRecord> {
-    let branch_name = format!("{}{}", prefix, group.tag);
+    let branch_name = synthetic_branch_name(prefix, &group.tag);
     let stack_prefix = build_stack_prefix(group, stack_merge_base)?;
     let group_tip = stack_prefix
         .commits
@@ -1068,7 +1070,7 @@ mod tests {
     use crate::commands::RewriteCommandOutcome;
     use crate::config::DirtyWorktreePolicy;
     use crate::parsing::{derive_local_groups_with_ignored, Group};
-    use crate::test_support::{lock_cwd, DirGuard};
+    use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
     use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1160,6 +1162,30 @@ mod tests {
         git(repo, ["rev-parse", "--abbrev-ref", "HEAD"].as_slice())
             .trim()
             .to_string()
+    }
+
+    #[test]
+    fn absorb_branch_tails_rejects_case_colliding_branch_names_from_local_stack() {
+        let _lock = lock_cwd();
+        let dir = init_case_conflicting_stack_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+
+        let err = absorb_branch_tails(
+            "main",
+            "dank-spr/",
+            "ignore",
+            true,
+            DirtyWorktreePolicy::Halt,
+            AbsorbOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+            "unexpected error: {err}"
+        );
     }
 
     fn current_path() -> String {

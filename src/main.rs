@@ -3,6 +3,7 @@ use clap::{error::ErrorKind, Parser};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
+mod branch_names;
 mod cli;
 mod commands;
 mod config;
@@ -123,10 +124,7 @@ fn resolve_base_prefix(
             }
         }
     };
-    let mut prefix = prefix.unwrap_or_else(|| cfg.prefix.clone());
-    // normalize: strip trailing '/' then ensure exactly one trailing '/'
-    prefix = prefix.trim_end_matches('/').to_string();
-    prefix.push('/');
+    let prefix = crate::config::normalize_prefix(&prefix.unwrap_or_else(|| cfg.prefix.clone()))?;
     let mut ignore_tag = cfg.ignore_tag.clone();
     if ignore_tag.trim().is_empty() {
         ignore_tag = "ignore".to_string();
@@ -242,6 +240,7 @@ fn run_cli(
                 }
                 let (groups, skipped_handles) =
                     crate::parsing::split_groups_for_update(&leading_ignored, all_groups);
+                crate::branch_names::group_branch_identities(&groups, &prefix)?;
                 let limit = if let Some(extent) = extent {
                     match extent {
                         crate::cli::Extent::Pr { to, n, legacy_n } => {
