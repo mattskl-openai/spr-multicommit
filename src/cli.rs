@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Subcommand, Debug, Clone)]
@@ -26,22 +26,50 @@ pub enum PrepSelection {
     All,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    #[default]
+    Human,
+    Json,
+}
+
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct OutputArgs {
+    /// Emit a single machine-readable JSON object to stdout
+    #[arg(long = "json")]
+    json_requested: bool,
+}
+
+impl OutputArgs {
+    #[cfg(test)]
+    pub fn human() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    pub fn json() -> Self {
+        Self {
+            json_requested: true,
+        }
+    }
+
+    pub fn format(self) -> OutputFormat {
+        if self.json_requested {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Human
+        }
+    }
+}
+
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub enum ListWhat {
     /// List PRs in the stack (halts early if live groups derive case-colliding synthetic branch names)
     #[command(alias = "p")]
-    Pr {
-        /// Emit a single machine-readable JSON object to stdout
-        #[arg(long)]
-        json: bool,
-    },
+    Pr,
     /// List commits in the stack (halts early if live groups derive case-colliding synthetic branch names)
     #[command(alias = "c")]
-    Commit {
-        /// Emit a single machine-readable JSON object to stdout
-        #[arg(long)]
-        json: bool,
-    },
+    Commit,
 }
 
 #[derive(Subcommand, Debug)]
@@ -75,9 +103,8 @@ pub enum Cmd {
         #[arg(long)]
         allow_branch_reuse: bool,
 
-        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
 
         /// Limit how much to update (optional sub-mode)
         #[command(subcommand)]
@@ -97,9 +124,8 @@ pub enum Cmd {
         #[arg(long)]
         safe: bool,
 
-        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch
@@ -111,14 +137,15 @@ pub enum Cmd {
         #[arg(long)]
         allow_replayed_duplicates: bool,
 
-        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// Prepare PRs for landing (e.g., squash) and halt early on case-colliding synthetic branch names
     Prep {
         // selection is provided via global --until/--exact flags
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// Resume a suspended local rewrite from a resume-state file
@@ -130,14 +157,15 @@ pub enum Cmd {
         #[arg(value_name = "PATH")]
         path: PathBuf,
 
-        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// List entities and halt early on case-colliding synthetic branch names
     #[command(alias = "ls")]
     List {
+        #[command(flatten)]
+        output: OutputArgs,
         #[command(subcommand)]
         what: ListWhat,
     },
@@ -145,9 +173,8 @@ pub enum Cmd {
     /// Status overview (alias for `list pr`) with the same early synthetic branch-collision guard
     #[command(alias = "stat")]
     Status {
-        /// Emit a single machine-readable JSON object to stdout
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// Find the owning stack branch for a PR branch or report that the target is already a stack branch
@@ -157,9 +184,8 @@ pub enum Cmd {
     ResolveStack {
         /// Optional target: current branch, local branch, remote-qualified branch, or PR URL
         target: Option<String>,
-        /// Emit machine-readable JSON result states such as `found`, `stale_metadata`, or `tombstoned`
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// Land PRs (merge variants) and halt early on case-colliding synthetic branch names
@@ -173,20 +199,23 @@ pub enum Cmd {
         /// Skip automatic restack after landing (default: restack remaining commits with `--after N`)
         #[arg(long = "no-restack")]
         no_restack: bool,
-        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// Relink PR stack to match local commit stack and halt early on case-colliding synthetic branch names
     RelinkPrs {
         // dry-run is provided via global --dry-run
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// Delete remote branches with the configured prefix whose PRs are all closed
     #[command(alias = "clean")]
     Cleanup {
         // dry-run is provided via global --dry-run
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// Move the last M commits (top of stack) to the tail of a selected PR group
@@ -200,9 +229,8 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
-        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 
     /// Reorder local PR groups by moving one or a range to come after a target PR, halting early on case-colliding synthetic branch names
@@ -216,28 +244,27 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
-        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
 impl Cmd {
-    pub fn json_mode(&self) -> bool {
+    pub fn output_format(&self) -> OutputFormat {
         match self {
-            Self::Restack { json, .. }
-            | Self::Absorb { json, .. }
-            | Self::ResolveStack { json, .. }
-            | Self::Resume { json, .. }
-            | Self::Land { json, .. }
-            | Self::FixPr { json, .. }
-            | Self::Status { json, .. }
-            | Self::Move { json, .. } => *json,
-            Self::List {
-                what: ListWhat::Pr { json, .. } | ListWhat::Commit { json, .. },
-            } => *json,
-            Self::Update { json, .. } => *json,
-            Self::Prep {} | Self::RelinkPrs {} | Self::Cleanup {} => false,
+            Self::Restack { output, .. }
+            | Self::Absorb { output, .. }
+            | Self::ResolveStack { output, .. }
+            | Self::Resume { output, .. }
+            | Self::Land { output, .. }
+            | Self::FixPr { output, .. }
+            | Self::Status { output, .. }
+            | Self::Prep { output }
+            | Self::RelinkPrs { output }
+            | Self::Cleanup { output }
+            | Self::Move { output, .. } => output.format(),
+            Self::List { output, .. } => output.format(),
+            Self::Update { output, .. } => output.format(),
         }
     }
 }
@@ -284,7 +311,7 @@ pub struct Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Cmd};
+    use super::{Cli, Cmd, OutputFormat};
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
 
@@ -295,7 +322,7 @@ mod tests {
         match cli.cmd {
             Cmd::Absorb {
                 allow_replayed_duplicates,
-                json: _,
+                output: _,
             } => assert!(allow_replayed_duplicates),
             other => panic!("unexpected command: {:?}", other),
         }
@@ -331,9 +358,9 @@ mod tests {
         .unwrap();
 
         match cli.cmd {
-            Cmd::Resume { path, json } => {
+            Cmd::Resume { path, output } => {
                 assert_eq!(path, PathBuf::from(".git/spr/resume/restack-example.json"));
-                assert!(json);
+                assert_eq!(output.format(), OutputFormat::Json);
             }
             other => panic!("unexpected command: {:?}", other),
         }
@@ -353,20 +380,20 @@ mod tests {
     #[test]
     fn rewrite_commands_report_json_mode() {
         let restack = Cli::try_parse_from(["spr", "restack", "--after", "1", "--json"]).unwrap();
-        assert!(restack.cmd.json_mode());
+        assert_eq!(restack.cmd.output_format(), OutputFormat::Json);
 
         let land = Cli::try_parse_from(["spr", "land", "--json"]).unwrap();
-        assert!(land.cmd.json_mode());
+        assert_eq!(land.cmd.output_format(), OutputFormat::Json);
 
-        let list = Cli::try_parse_from(["spr", "list", "pr", "--json"]).unwrap();
-        assert!(list.cmd.json_mode());
+        let list = Cli::try_parse_from(["spr", "list", "--json", "pr"]).unwrap();
+        assert_eq!(list.cmd.output_format(), OutputFormat::Json);
     }
 
     #[test]
     fn update_json_flag_enables_json_mode() {
         let cli = Cli::try_parse_from(["spr", "update", "--json"]).unwrap();
 
-        assert!(cli.cmd.json_mode());
+        assert_eq!(cli.cmd.output_format(), OutputFormat::Json);
     }
 
     #[test]
@@ -375,23 +402,27 @@ mod tests {
 
         match cli.cmd {
             Cmd::Update {
-                json: true,
+                output,
                 extent: Some(super::Extent::Pr { legacy_n, .. }),
                 ..
-            } => assert_eq!(legacy_n, Some(1)),
+            } => {
+                assert_eq!(output.format(), OutputFormat::Json);
+                assert_eq!(legacy_n, Some(1));
+            }
             other => panic!("unexpected command: {:?}", other),
         }
     }
 
     #[test]
-    fn list_pr_json_flag_parses_after_leaf_subcommand() {
-        let cli = Cli::try_parse_from(["spr", "list", "pr", "--json"]).unwrap();
+    fn list_pr_json_flag_parses_before_leaf_subcommand() {
+        let cli = Cli::try_parse_from(["spr", "list", "--json", "pr"]).unwrap();
 
         match cli.cmd {
             Cmd::List {
-                what: super::ListWhat::Pr { json },
+                output,
+                what: super::ListWhat::Pr,
             } => {
-                assert!(json);
+                assert_eq!(output.format(), OutputFormat::Json);
             }
             other => panic!("unexpected command: {:?}", other),
         }
@@ -399,16 +430,24 @@ mod tests {
 
     #[test]
     fn list_command_parses_json_flag() {
-        let cli = Cli::try_parse_from(["spr", "list", "commit", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["spr", "list", "--json", "commit"]).unwrap();
 
         match cli.cmd {
             Cmd::List {
-                what: super::ListWhat::Commit { json },
+                output,
+                what: super::ListWhat::Commit,
             } => {
-                assert!(json);
+                assert_eq!(output.format(), OutputFormat::Json);
             }
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn list_json_flag_after_leaf_subcommand_is_rejected() {
+        let err = Cli::try_parse_from(["spr", "list", "pr", "--json"]).unwrap_err();
+
+        assert!(err.to_string().contains("unexpected argument '--json'"));
     }
 
     #[test]
@@ -416,8 +455,8 @@ mod tests {
         let cli = Cli::try_parse_from(["spr", "status", "--json"]).unwrap();
 
         match cli.cmd {
-            Cmd::Status { json } => {
-                assert!(json);
+            Cmd::Status { output } => {
+                assert_eq!(output.format(), OutputFormat::Json);
             }
             other => panic!("unexpected command: {:?}", other),
         }
@@ -438,7 +477,10 @@ mod tests {
         let cli = Cli::try_parse_from(["spr", "status", "--cd", "/tmp/example"]).unwrap();
 
         assert_eq!(cli.cd, Some(PathBuf::from("/tmp/example")));
-        assert!(matches!(cli.cmd, Cmd::Status { json: false }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Status { output } if output.format() == OutputFormat::Human
+        ));
     }
 
     #[test]
@@ -446,6 +488,9 @@ mod tests {
         let cli = Cli::try_parse_from(["spr", "--cd", "/tmp/example", "status"]).unwrap();
 
         assert_eq!(cli.cd, Some(PathBuf::from("/tmp/example")));
-        assert!(matches!(cli.cmd, Cmd::Status { json: false }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Status { output } if output.format() == OutputFormat::Human
+        ));
     }
 }

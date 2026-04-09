@@ -308,18 +308,27 @@ Behavior:
 
 Machine-readable `--json` mode:
 
-- Supported on `spr list pr`, `spr list commit`, `spr status`, `spr restack`, `spr absorb`,
-- Supported on `spr move`, `spr fix-pr`, `spr land`, `spr resume`, and `spr update`
-- `spr update --json` writes one summary object with repo context, resolved extent metadata, warnings, and per-group branch or PR actions
+- Supported on `spr list pr`, `spr list commit`, `spr status`, `spr update`, `spr prep`,
+  `spr relink-prs`, `spr cleanup`, `spr restack`, `spr absorb`, `spr move`, `spr fix-pr`,
+  `spr land`, `spr resume`, and `spr resolve-stack`
 - In `--json` mode, stdout is exactly one JSON object and stderr is normally empty
-- `spr list pr --json`, `spr list commit --json`, and `spr status --json` use a read-only output
-  envelope and never suspend
-- Read-only JSON includes `repo_root`, `current_branch`, `base_branch`, `prefix`, and
-  `remote_metadata_state`
-- Read-only JSON always emits groups and commits in canonical bottom-up stack order, even when
-  `list_order: recent_on_top` changes the human display order
-- Read-only JSON error payloads use typed `error_kind` values such as
-  `synthetic_branch_name_collision`, `invalid_arguments`, and `internal`
+- Summary-style commands (`list pr`, `list commit`, `status`, `update`, `prep`, `relink-prs`,
+  and `cleanup`) share the same top-level shape: `schema_version`, `command`,
+  `result: "summary"`, and `data`
+- `spr list --json pr`, `spr list --json commit`, and `spr status --json` always emit canonical
+  bottom-up stack order, even when `list_order: recent_on_top` changes the human display order.
+  Each group's `remote.kind` encodes whether there is no matching PR, a PR without CI/review
+  data, or a PR with typed CI/review status.
+- `spr update --json` writes repo context, resolved extent metadata, warnings, skipped groups, and
+  per-group branch or PR actions
+- `spr prep --json` writes the resolved selection, selected-group rewrite actions, replay counts,
+  next-child warning action, and the nested update summary for the rewritten tip
+- `spr relink-prs --json` writes the expected local head/base chain plus one decision per PR head
+- `spr cleanup --json` writes remote candidates, open-PR heads, per-branch decisions, and the
+  delete batch
+- JSON errors across commands use one typed error envelope with `result: "error"` plus
+  `error_kind` values such as `synthetic_branch_name_collision`, `invalid_arguments`, and
+  `internal`
 - Exit codes are:
   - `0` for completed
   - `1` for hard error, including CLI parse failures when `--json` was requested
@@ -417,7 +426,7 @@ Before listing, `spr list pr` validates that no two live PR groups derive
 synthetic branch names that collide under case-insensitive comparison. If they
 do, it halts before loading GitHub PR state.
 
-`spr list pr --json` emits one read-only JSON object instead of human-formatted lines.
+`spr list --json pr` emits one read-only JSON object instead of human-formatted lines.
 The payload always uses canonical bottom-up group order, includes remote PR metadata plus explicit
 CI/review state when available, and reports case-colliding synthetic branch failures as a typed
 `synthetic_branch_name_collision` error payload.
@@ -433,7 +442,7 @@ Alias for `spr list pr`.
 `spr status` runs the same early synthetic branch-collision validation as
 `spr list pr` before printing anything.
 
-`spr status --json` emits the same read-only payload shape as `spr list pr --json`, but keeps the
+`spr status --json` emits the same read-only payload shape as `spr list --json pr`, but keeps the
 top-level command identity as `status`.
 
 ### spr list commit
@@ -444,8 +453,8 @@ Before listing, `spr list commit` validates that no two live PR groups derive
 synthetic branch names that collide under case-insensitive comparison. If they
 do, it halts before loading GitHub PR state.
 
-`spr list commit --json` emits one read-only JSON object instead of human-formatted lines.
-The payload uses the same canonical bottom-up group order as `spr list pr --json`, keeps canonical
+`spr list --json commit` emits one read-only JSON object instead of human-formatted lines.
+The payload uses the same canonical bottom-up group order as `spr list --json pr`, keeps canonical
 global commit indices, and ignores `list_order` in JSON mode.
 
 Aliases:
@@ -540,6 +549,9 @@ Behavior:
 - Rewrites local history to ensure selected PRs become single-commit groups
 - Pushes branches (respects `--dry-run`)
 - Adds a warning to the next PR not included in the push
+- `--json` writes the typed prep summary instead of human log lines
+- In `--dry-run`, prep still computes the hypothetical rewritten commit chain so the JSON summary
+  reflects the rewritten stack instead of the current branch tip
 
 ### spr fix-pr
 
@@ -586,6 +598,7 @@ Behavior:
 - Batches GitHub lookups for open PRs
 - Deletes all eligible branches in a single `git push --delete` call
 - Respects `--dry-run`
+- `--json` writes the typed cleanup summary instead of human log lines
 
 Examples:
 
@@ -608,6 +621,7 @@ Behavior:
 - Before comparing local and remote connectivity, `spr relink-prs` validates
   that no two live PR groups derive synthetic branch names that collide under
   case-insensitive comparison. If they do, it halts before any GitHub edit.
+- `--json` writes the typed relink summary instead of human log lines
 
 Dry run behavior
 ----------------

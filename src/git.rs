@@ -57,7 +57,8 @@ pub fn git_rw(dry: bool, args: &[&str]) -> Result<String> {
         let sub = args.get(idx).copied().unwrap_or("");
         let is_push = sub == "push";
         let is_worktree = sub == "worktree";
-        let allow = (in_tmp && !is_push) || is_worktree;
+        let is_commit_tree = sub == "commit-tree";
+        let allow = (in_tmp && !is_push) || is_worktree || is_commit_tree;
         if allow {
             info!("DRY-RUN (exec): git {}", shellish(args));
             return run("git", args);

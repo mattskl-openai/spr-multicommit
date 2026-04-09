@@ -1,23 +1,10 @@
 use serde::Serialize;
 
 use crate::config::PrDescriptionMode;
-use crate::json_command::{JsonCommand, EXIT_SUCCESS};
+use crate::json_output::JsonCommand;
+use crate::summary_output::SummaryOutput;
 
-const UPDATE_OUTPUT_SCHEMA_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct UpdateOutput {
-    pub schema_version: u32,
-    pub command: JsonCommand,
-    #[serde(flatten)]
-    pub payload: UpdatePayload,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "result", rename_all = "snake_case")]
-pub enum UpdatePayload {
-    Summary { data: UpdateSummaryData },
-}
+pub type UpdateOutput = SummaryOutput<UpdateSummaryData>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpdateSummaryData {
@@ -130,16 +117,6 @@ impl UpdateSummaryData {
     }
 }
 
-impl UpdateOutput {
-    pub fn summary(data: UpdateSummaryData) -> Self {
-        Self {
-            schema_version: UPDATE_OUTPUT_SCHEMA_VERSION,
-            command: JsonCommand::Update,
-            payload: UpdatePayload::Summary { data },
-        }
-    }
-
-    pub fn exit_code(&self) -> i32 {
-        EXIT_SUCCESS
-    }
+pub fn summary(data: UpdateSummaryData) -> UpdateOutput {
+    SummaryOutput::new(JsonCommand::Update, data)
 }

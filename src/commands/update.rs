@@ -16,11 +16,14 @@ use crate::github::{
     list_recent_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
 };
 use crate::limit::{apply_limit_groups, Limit};
-use crate::parsing::{derive_groups_between_with_ignored, split_groups_for_update, Group};
+use crate::parsing::Group;
 use crate::update_output::{
     SkippedUpdateGroupData, UpdateEditAction, UpdateExecutionData, UpdateGroupData, UpdatePrAction,
     UpdatePushAction, UpdateSkippedReason,
 };
+
+#[cfg(test)]
+use crate::parsing::{derive_groups_between_with_ignored, split_groups_for_update};
 
 /// Replace the existing spr stack block with `new_block`, or append it if missing.
 ///
@@ -374,10 +377,6 @@ fn skipped_group_data(skipped_handles: &[String]) -> Vec<SkippedUpdateGroupData>
             reason: UpdateSkippedReason::IgnoredBoundary,
         })
         .collect()
-}
-
-fn stable_handle_text(tag: &str) -> String {
-    format!("pr:{tag}")
 }
 
 fn update_warnings(skipped_handles: &[String]) -> Vec<String> {
@@ -883,7 +882,7 @@ fn build_from_groups_internal(
         .map(
             |(group_idx, ((group, identity), planned_push))| UpdateGroupData {
                 local_pr_number: group_idx + 1,
-                stable_handle: stable_handle_text(&group.tag),
+                stable_handle: common::stable_handle_text(&group.tag),
                 head_branch: identity.exact.clone(),
                 base_ref: desired_base_by_head
                     .get(&identity.exact)
@@ -972,6 +971,7 @@ pub fn build_from_groups(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn build_from_tags(
     base: &str,
     from: &str,

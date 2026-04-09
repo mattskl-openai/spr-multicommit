@@ -654,6 +654,10 @@ pub fn build_head_base_chain(
     Ok(expected)
 }
 
+pub fn stable_handle_text(tag: &str) -> String {
+    format!("pr:{tag}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
