@@ -1,6 +1,7 @@
 pub mod absorb;
 pub mod cleanup;
 pub mod common;
+pub mod drop_merged_prefix;
 pub mod fix_pr;
 pub mod land;
 pub mod list;
@@ -14,6 +15,7 @@ pub mod update;
 
 pub use absorb::{absorb_branch_tails, AbsorbOptions, CopiedLaterStackCommitPolicy};
 pub use cleanup::{cleanup_remote_branches, print_cleanup_summary};
+pub use drop_merged_prefix::drop_merged_prefix;
 pub use fix_pr::fix_pr_tail;
 pub use land::{land_flatten_until, land_per_pr_until};
 #[allow(unused_imports)]
