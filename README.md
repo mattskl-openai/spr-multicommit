@@ -207,10 +207,14 @@ Options:
   - `top` or `last` or `all`: skip all PRs; ignored commits (pr:ignore blocks) are preserved, so the branch may remain ahead of base
   - `label` or `pr:<label>`: keep that stable group and everything below it in place even if local PR numbers renumber
 - `--safe`: create a local backup tag at current `HEAD` before rebasing
+- `--preview`: print the resolved high-level plan and stop before fetch, backup tags, temp worktrees, resume files, cherry-picks, branch resets, metadata writes, pushes, or GitHub calls
+- `--json`: with `--preview`, write exactly one preview object to stdout
 
 Behavior:
 
 - Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest; ignore blocks are preserved but excluded from grouping)
+- `spr restack --after ... --preview` uses local refs only and reports that remote freshness, replay conflicts, tests, hooks, GitHub mergeability, and update/push results have not been validated
+- Normal human `spr restack --after ...` prints the same high-level plan immediately before it starts the rewrite phase
 - Drops the first N groups, then rebuilds the remaining commits onto `--base` via a temp worktree
   - Ignored commits attached to dropped groups are kept before the remaining stack
   - Ignored commits attached to kept groups move with those groups
@@ -358,6 +362,12 @@ Machine-readable `--json` mode:
 - `spr relink-prs --json` writes the expected local head/base chain plus one decision per PR head
 - `spr cleanup --json` writes remote candidates, open-PR heads, per-branch decisions, and the
   delete batch
+- `spr restack --preview --json` writes one preview object with `result: "preview"` and
+  a `data` object containing the local base ref/SHA, current branch/HEAD, selected dropped groups,
+  remaining groups, ignored-segment count, planned cherry-pick operation count, operations that a
+  real run would perform, and the checks not validated by preview
+- `spr restack --json` without `--preview` keeps the rewrite lifecycle contract:
+  it writes one completed or suspended object, not a preview object
 - JSON errors across commands use one typed error envelope with `result: "error"` plus
   `error_kind` values such as `synthetic_branch_name_collision`, `invalid_arguments`, and
   `internal`
@@ -661,6 +671,8 @@ Dry run behavior
 - `--dry-run` prints most state-changing `git`/`gh` commands instead of executing
 - For safety, some local operations may still execute in temporary worktrees to better mirror behavior
 - In dry-run, set `--assume-existing-prs` with `spr update` to show `gh pr edit` instead of `gh pr create`
+- `spr restack --preview` is not a dry-run rewrite: it only prints the resolved plan and does not
+  fetch, create rewrite state, or exercise cherry-pick conflict handling
 
 Notes
 -----
@@ -700,6 +712,12 @@ spr restack --after 2 --safe
 
 # Restack only the groups above the stable beta group
 spr restack --after beta
+
+# Preview that restack plan without fetching or rewriting
+spr restack --after beta --preview
+
+# Emit the restack preview as one JSON object
+spr restack --after beta --preview --json
 
 # Land top PR only using config default mode (flatten by default)
 spr land --until 1

@@ -22,6 +22,7 @@ use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
 use crate::git::git_rev_parse;
 use crate::git::git_rw;
 use crate::parsing::{derive_local_groups_with_ignored, Group};
+use crate::restack_output::{render_human_preview, RestackPreviewData, RestackPreviewGroup};
 use crate::selectors::{resolve_after_count, AfterSelector};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,21 @@ struct RestackExecutionOptions {
     dry: bool,
     conflict_policy: RestackConflictPolicy,
     dirty_worktree_policy: DirtyWorktreePolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestackPlan {
+    pub base_ref: String,
+    pub base_sha: Option<String>,
+    pub base_ref_was_refreshed: bool,
+    pub current_branch: String,
+    pub original_head: String,
+    pub after_selector: String,
+    pub resolved_after_count: usize,
+    pub dropped_groups: Vec<Group>,
+    pub remaining_groups: Vec<Group>,
+    pub kept_ignored_segments: Vec<Vec<String>>,
+    pub operations: Vec<CherryPickOp>,
 }
 
 /// Build the ordered cherry-pick plan that reconstructs the restacked history.
@@ -86,16 +102,175 @@ fn resolve_restack_after_count(groups: &[Group], after: &AfterSelector) -> Resul
     resolve_after_count(groups, after)
 }
 
-fn restack_after_resolved(
+fn group_preview(group: &Group) -> RestackPreviewGroup {
+    RestackPreviewGroup {
+        stable_handle: format!("pr:{}", group.tag),
+        commit_count: group.commits.len(),
+        ignored_after_count: group.ignored_after.len(),
+    }
+}
+
+impl RestackPlan {
+    fn preview_data(&self, safe_requested: bool) -> RestackPreviewData {
+        let would_change_branch =
+            !self.dropped_groups.is_empty() || !self.remaining_groups.is_empty();
+        let would_create_temp_worktree =
+            !self.remaining_groups.is_empty() || !self.kept_ignored_segments.is_empty();
+        let mut not_validated = if self.base_ref_was_refreshed {
+            Vec::new()
+        } else {
+            vec!["remote freshness".to_string()]
+        };
+        not_validated.extend(
+            [
+                "cherry-pick conflicts",
+                "tests",
+                "pre-push hooks",
+                "GitHub mergeability",
+                "spr update result",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+
+        RestackPreviewData {
+            base_ref: self.base_ref.clone(),
+            base_sha: self.base_sha.clone(),
+            base_ref_was_refreshed: self.base_ref_was_refreshed,
+            current_branch: self.current_branch.clone(),
+            original_head: self.original_head.clone(),
+            after_selector: self.after_selector.clone(),
+            resolved_after_count: self.resolved_after_count,
+            dropped_groups: self.dropped_groups.iter().map(group_preview).collect(),
+            remaining_groups: self.remaining_groups.iter().map(group_preview).collect(),
+            kept_ignored_segment_count: self.kept_ignored_segments.len(),
+            planned_cherry_pick_operation_count: self.operations.len(),
+            would_fetch_origin_when_executed: !self.base_ref_was_refreshed,
+            would_create_backup_tag: safe_requested && would_change_branch,
+            would_create_temp_worktree,
+            would_reset_current_branch: would_change_branch,
+            would_refresh_stack_metadata: would_change_branch,
+            not_validated,
+        }
+    }
+}
+
+fn build_restack_plan(
     metadata_context: &crate::stack_metadata::RefreshMetadataContext,
     leading_ignored: Vec<String>,
     groups: Vec<Group>,
     after: usize,
-    options: RestackExecutionOptions,
-) -> Result<RewriteCommandOutcome> {
+    after_selector: String,
+    base_ref_was_refreshed: bool,
+) -> Result<RestackPlan> {
     let after = std::cmp::min(after, groups.len());
     let kept_ignored_segments = build_kept_ignored_segments(leading_ignored, &groups, after);
-    let remaining = groups[after..].to_vec();
+    let dropped_groups = groups[..after].to_vec();
+    let remaining_groups = groups[after..].to_vec();
+    let operations = build_cherry_pick_plan(&kept_ignored_segments, &remaining_groups);
+    let (current_branch, _) = common::get_current_branch_and_short()?;
+    let original_head = git_rev_parse("HEAD")?;
+
+    Ok(RestackPlan {
+        base_ref: metadata_context.base.clone(),
+        base_sha: git_rev_parse(&metadata_context.base).ok(),
+        base_ref_was_refreshed,
+        current_branch,
+        original_head,
+        after_selector,
+        resolved_after_count: after,
+        dropped_groups,
+        remaining_groups,
+        kept_ignored_segments,
+        operations,
+    })
+}
+
+fn collect_restack_plan(
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
+    after: &AfterSelector,
+    base_ref_was_refreshed: bool,
+) -> Result<Option<RestackPlan>> {
+    let (_merge_base, leading_ignored, groups) =
+        derive_local_groups_with_ignored(&metadata_context.base, &metadata_context.ignore_tag)?;
+    if groups.is_empty() {
+        Ok(None)
+    } else {
+        let resolved_after_count = resolve_restack_after_count(&groups, after)?;
+        build_restack_plan(
+            metadata_context,
+            leading_ignored,
+            groups,
+            resolved_after_count,
+            after.to_string(),
+            base_ref_was_refreshed,
+        )
+        .map(Some)
+    }
+}
+
+fn collect_restack_plan_after_count(
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
+    after: usize,
+    base_ref_was_refreshed: bool,
+) -> Result<Option<RestackPlan>> {
+    let (_merge_base, leading_ignored, groups) =
+        derive_local_groups_with_ignored(&metadata_context.base, &metadata_context.ignore_tag)?;
+    if groups.is_empty() {
+        Ok(None)
+    } else {
+        build_restack_plan(
+            metadata_context,
+            leading_ignored,
+            groups,
+            after,
+            after.to_string(),
+            base_ref_was_refreshed,
+        )
+        .map(Some)
+    }
+}
+
+pub fn preview_restack_after(
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
+    after: &AfterSelector,
+    safe_requested: bool,
+) -> Result<RestackPreviewData> {
+    if let Some(plan) = collect_restack_plan(metadata_context, after, false)? {
+        Ok(plan.preview_data(safe_requested))
+    } else {
+        let (current_branch, _) = common::get_current_branch_and_short()?;
+        let original_head = git_rev_parse("HEAD")?;
+        Ok(RestackPlan {
+            base_ref: metadata_context.base.clone(),
+            base_sha: git_rev_parse(&metadata_context.base).ok(),
+            base_ref_was_refreshed: false,
+            current_branch,
+            original_head,
+            after_selector: after.to_string(),
+            resolved_after_count: 0,
+            dropped_groups: Vec::new(),
+            remaining_groups: Vec::new(),
+            kept_ignored_segments: Vec::new(),
+            operations: Vec::new(),
+        }
+        .preview_data(safe_requested))
+    }
+}
+
+fn log_human_restack_plan(plan: &RestackPlan, safe_requested: bool) {
+    let data = plan.preview_data(safe_requested);
+    for line in render_human_preview("Restack plan", &data).lines() {
+        info!("{line}");
+    }
+}
+
+fn restack_after_resolved(
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
+    plan: RestackPlan,
+    options: RestackExecutionOptions,
+) -> Result<RewriteCommandOutcome> {
+    log_human_restack_plan(&plan, options.safe);
 
     common::with_dirty_worktree_policy(
         options.dry,
@@ -106,13 +281,13 @@ fn restack_after_resolved(
             let original_head = git_rev_parse("HEAD")?;
             let original_worktree_root = rewrite_resume::current_repo_root()?;
             let metadata_refresh_context = metadata_context.clone();
-            if remaining.is_empty() && kept_ignored_segments.is_empty() {
+            if plan.remaining_groups.is_empty() && plan.kept_ignored_segments.is_empty() {
                 if options.safe {
                     let _ = common::create_backup_tag(options.dry, "restack", &cur_branch, &short)?;
                 }
                 info!(
                     "Skipping all {} PR(s); syncing current branch {} to {}",
-                    groups.len(),
+                    plan.dropped_groups.len(),
                     cur_branch,
                     metadata_context.base
                 );
@@ -150,7 +325,6 @@ fn restack_after_resolved(
                     &metadata_context.base,
                     &short,
                 )?;
-                let ops = build_cherry_pick_plan(&kept_ignored_segments, &remaining);
                 let outcome = rewrite_resume::run_rewrite_session(
                     options.dry,
                     RewriteSession {
@@ -169,7 +343,7 @@ fn restack_after_resolved(
                         temp_branch: tmp_branch,
                         temp_worktree_path: tmp_path,
                         backup_tag,
-                        operations: ops,
+                        operations: plan.operations.clone(),
                         deferred_dirty_worktree_restore,
                         post_success_hint: None,
                         metadata_refresh_context: Some(metadata_refresh_context),
@@ -178,7 +352,7 @@ fn restack_after_resolved(
                 if outcome == RewriteCommandOutcome::Completed {
                     info!(
                         "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
-                        after, cur_branch, metadata_context.base
+                        plan.resolved_after_count, cur_branch, metadata_context.base
                     );
                 }
                 Ok(outcome)
@@ -214,18 +388,10 @@ pub fn restack_after(
 ) -> Result<RewriteCommandOutcome> {
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
-    let (_merge_base, leading_ignored, groups) =
-        derive_local_groups_with_ignored(&metadata_context.base, &metadata_context.ignore_tag)?;
-    if groups.is_empty() {
-        info!("No local PR groups found; nothing to restack.");
-        Ok(RewriteCommandOutcome::Completed)
-    } else {
-        let after = resolve_restack_after_count(&groups, after)?;
+    if let Some(plan) = collect_restack_plan(metadata_context, after, true)? {
         restack_after_resolved(
             metadata_context,
-            leading_ignored,
-            groups,
-            after,
+            plan,
             RestackExecutionOptions {
                 safe,
                 dry,
@@ -233,6 +399,9 @@ pub fn restack_after(
                 dirty_worktree_policy,
             },
         )
+    } else {
+        info!("No local PR groups found; nothing to restack.");
+        Ok(RewriteCommandOutcome::Completed)
     }
 }
 
@@ -247,16 +416,10 @@ pub fn restack_after_count(
 ) -> Result<RewriteCommandOutcome> {
     git_rw(dry, ["fetch", "origin"].as_slice())?;
 
-    let (_merge_base, leading_ignored, groups) =
-        derive_local_groups_with_ignored(&metadata_context.base, &metadata_context.ignore_tag)?;
-    if groups.is_empty() {
-        Ok(RewriteCommandOutcome::Completed)
-    } else {
+    if let Some(plan) = collect_restack_plan_after_count(metadata_context, after, true)? {
         restack_after_resolved(
             metadata_context,
-            leading_ignored,
-            groups,
-            after,
+            plan,
             RestackExecutionOptions {
                 safe,
                 dry,
@@ -264,12 +427,17 @@ pub fn restack_after_count(
                 dirty_worktree_policy,
             },
         )
+    } else {
+        Ok(RewriteCommandOutcome::Completed)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cherry_pick_plan, build_kept_ignored_segments, resolve_restack_after_count};
+    use super::{
+        build_cherry_pick_plan, build_kept_ignored_segments, build_restack_plan,
+        preview_restack_after, resolve_restack_after_count,
+    };
     use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp};
     use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
     use crate::commands::RewriteCommandOutcome;
@@ -371,6 +539,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_restack_plan_selects_dropped_remaining_ignored_and_ops() {
+        let plan = build_restack_plan(
+            &metadata_context(),
+            vec!["lead1".to_string()],
+            groups(&["alpha", "beta", "gamma"]),
+            2,
+            "pr:beta".to_string(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.after_selector, "pr:beta");
+        assert_eq!(plan.resolved_after_count, 2);
+        assert_eq!(
+            plan.dropped_groups
+                .iter()
+                .map(|group| group.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(
+            plan.remaining_groups
+                .iter()
+                .map(|group| group.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gamma"]
+        );
+        assert_eq!(plan.kept_ignored_segments, vec![vec!["lead1".to_string()]]);
+        assert_eq!(plan.operations.len(), 2);
+    }
+
     fn init_restack_conflict_repo() -> TempDir {
         let dir = tempfile::tempdir().expect("create temp dir");
         let repo = dir.path().join("repo");
@@ -403,6 +603,69 @@ mod tests {
         commit_file(&repo, "story.txt", "base-updated\n", "feat: base update");
         git(&repo, ["checkout", "stack"].as_slice());
         dir
+    }
+
+    fn init_restack_preview_repo() -> TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        git(&repo, ["init", "-b", "main"].as_slice());
+        git(
+            &repo,
+            ["config", "user.email", "spr@example.com"].as_slice(),
+        );
+        git(&repo, ["config", "user.name", "SPR Tests"].as_slice());
+        commit_file(&repo, "base.txt", "base\n", "init");
+
+        git(&repo, ["checkout", "-b", "stack"].as_slice());
+        commit_file(&repo, "alpha.txt", "alpha\n", "feat: alpha pr:alpha");
+        commit_file(&repo, "beta.txt", "beta\n", "feat: beta pr:beta");
+        dir
+    }
+
+    fn read_preview_side_effect_snapshot(repo: &Path) -> String {
+        [
+            git(repo, ["rev-parse", "HEAD"].as_slice()),
+            git(repo, ["branch", "--format=%(refname:short)"].as_slice()),
+            git(repo, ["tag", "--list"].as_slice()),
+            git(repo, ["worktree", "list", "--porcelain"].as_slice()),
+            fs::read_dir(repo.join(".git/spr/resume"))
+                .map(|entries| entries.count().to_string())
+                .unwrap_or_else(|_| "<no-resume-dir>".to_string()),
+        ]
+        .join("\n---\n")
+    }
+
+    #[test]
+    fn restack_preview_reports_plan_and_leaves_git_state_unchanged() {
+        let _lock = lock_cwd();
+        let dir = init_restack_preview_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let before = read_preview_side_effect_snapshot(&repo);
+
+        let preview = preview_restack_after(
+            &metadata_context(),
+            &AfterSelector::Group(GroupSelector::Stable(StableHandle {
+                tag: "alpha".to_string(),
+            })),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(preview.current_branch, "stack");
+        assert_eq!(preview.after_selector, "pr:alpha");
+        assert_eq!(preview.resolved_after_count, 1);
+        assert_eq!(preview.dropped_groups[0].stable_handle, "pr:alpha");
+        assert_eq!(preview.remaining_groups[0].stable_handle, "pr:beta");
+        assert!(preview.would_fetch_origin_when_executed);
+        assert!(preview.would_create_backup_tag);
+        assert!(preview.would_create_temp_worktree);
+        assert!(preview.would_reset_current_branch);
+        assert!(preview
+            .not_validated
+            .contains(&"cherry-pick conflicts".to_string()));
+        assert_eq!(read_preview_side_effect_snapshot(&repo), before);
     }
 
     fn resolve_restack_conflict(temp_repo: &Path) {

@@ -17,6 +17,7 @@ mod maintenance_output;
 mod parsing;
 mod pr_labels;
 mod read_only_output;
+mod restack_output;
 mod selectors;
 mod stack_metadata;
 mod summary_output;
@@ -87,6 +88,7 @@ enum CommandOutput {
     None,
     Machine(crate::machine_output::MachineOutput),
     ReadOnly(crate::read_only_output::ReadOnlyOutput),
+    RestackPreview(crate::restack_output::RestackPreviewOutput),
     ResolveStack(crate::commands::ResolveStackOutput),
     Update(crate::update_output::UpdateOutput),
     Maintenance(Box<crate::maintenance_output::MaintenanceOutput>),
@@ -382,22 +384,33 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
         crate::cli::Cmd::Restack {
             after,
             safe,
+            preview,
             output: _,
         } => {
             set_dry_run_env(cli.dry_run, false);
-            Ok(CommandOutput::Machine(ensure_rewrite_completed(
-                output_format,
-                "spr restack",
-                crate::machine_output::MachineCommand::Restack,
-                crate::commands::restack_after(
-                    &metadata_refresh_context,
-                    &after,
-                    safe,
-                    cli.dry_run,
-                    restack_conflict_policy,
-                    dirty_worktree_policy,
-                )?,
-            )?))
+            if preview {
+                Ok(CommandOutput::RestackPreview(
+                    crate::restack_output::preview(crate::commands::preview_restack_after(
+                        &metadata_refresh_context,
+                        &after,
+                        safe,
+                    )?),
+                ))
+            } else {
+                Ok(CommandOutput::Machine(ensure_rewrite_completed(
+                    output_format,
+                    "spr restack",
+                    crate::machine_output::MachineCommand::Restack,
+                    crate::commands::restack_after(
+                        &metadata_refresh_context,
+                        &after,
+                        safe,
+                        cli.dry_run,
+                        restack_conflict_policy,
+                        dirty_worktree_policy,
+                    )?,
+                )?))
+            }
         }
         crate::cli::Cmd::DropMergedPrefix { safe, output: _ } => {
             set_dry_run_env(cli.dry_run, false);
@@ -753,6 +766,14 @@ fn main() {
                 if output_format == crate::cli::OutputFormat::Json {
                     println!("{}", serde_json::to_string(&output).unwrap());
                     std::process::exit(output.exit_code());
+                }
+            }
+            CommandOutput::RestackPreview(output) => {
+                if output_format == crate::cli::OutputFormat::Json {
+                    println!("{}", serde_json::to_string(&output).unwrap());
+                    std::process::exit(output.exit_code());
+                } else {
+                    println!("{}", output.render_human());
                 }
             }
             CommandOutput::Update(output) => {
@@ -1414,6 +1435,47 @@ mod tests {
                 }
             }
             other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_cli_restack_preview_json_returns_preview_payload() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "restack",
+            "--after",
+            "pr:alpha",
+            "--preview",
+            "--json",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::RestackPreview(output) => {
+                assert_eq!(
+                    output.result,
+                    crate::restack_output::RestackPreviewResult::Preview
+                );
+                assert_eq!(output.data.current_branch, "stack");
+                assert_eq!(output.data.after_selector, "pr:alpha");
+                assert_eq!(output.data.dropped_groups[0].stable_handle, "pr:alpha");
+                assert_eq!(output.data.remaining_groups[0].stable_handle, "pr:beta");
+                assert!(output
+                    .data
+                    .not_validated
+                    .contains(&"remote freshness".to_string()));
+            }
+            other => panic!("unexpected output: {:?}", other),
         }
     }
 
