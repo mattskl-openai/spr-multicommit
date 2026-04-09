@@ -5,11 +5,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum PrDescriptionMode {

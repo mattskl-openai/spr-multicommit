@@ -8,24 +8,11 @@
 use serde::Serialize;
 
 use crate::commands::{RewriteCommandKind, RewriteSuspendedState};
+pub use crate::json_command::{
+    JsonCommand as MachineCommand, EXIT_FAILURE, EXIT_SUCCESS, EXIT_SUSPENDED,
+};
 
 pub const MACHINE_OUTPUT_SCHEMA_VERSION: u32 = 1;
-pub const EXIT_SUCCESS: i32 = 0;
-pub const EXIT_FAILURE: i32 = 1;
-pub const EXIT_SUSPENDED: i32 = 2;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum MachineCommand {
-    Cli,
-    Restack,
-    Absorb,
-    Move,
-    FixPr,
-    ResolveStack,
-    Resume,
-    Land,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

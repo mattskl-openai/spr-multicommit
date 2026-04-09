@@ -11,7 +11,7 @@ Stack-friendly CLI to manage, update, and land stacked GitHub pull requests.
 Installation
 ------------
 
-- Requires `git` in `PATH`. GitHub CLI `gh` (authenticated) is required for GitHub-backed commands such as `spr update`, `spr list`, and `spr land`, and also for `spr move` because it checks the bottom PR's auto-merge state before rewriting the stack.
+- Requires `git` in `PATH`. GitHub CLI `gh` (authenticated) is required for GitHub-backed commands such as `spr update` without `--no-pr`, `spr list`, and `spr land`, and also for `spr move` because it checks the bottom PR's auto-merge state before rewriting the stack.
 - Build from source:
 
 ```bash
@@ -166,9 +166,10 @@ Aliases:
 Key options:
 
 - `--from <REF>`: commit range upper bound when parsing tags (default `HEAD`) (untested)
-- `--no-pr`: only (re)create branches; skip PR creation/updates (untested)
+- `--no-pr`: only (re)create branches; skip PR creation/updates; this path stays Git-only in `--json` mode
 - `--pr-description-mode <overwrite|stack_only>`: override `pr_description_mode` for this update run
 - `--allow-branch-reuse`: bypass the recent closed-or-merged branch-name reuse guard
+- `--json`: write exactly one update summary object to stdout
 - Extent (optional subcommand):
   - `pr --to <N|label|pr:<label>>`: canonical selector for limiting updates to the first N PRs from the bottom
   - `pr --n <N>`: legacy numeric-only form
@@ -308,7 +309,8 @@ Behavior:
 Machine-readable `--json` mode:
 
 - Supported on `spr list pr`, `spr list commit`, `spr status`, `spr restack`, `spr absorb`,
-  `spr move`, `spr fix-pr`, `spr land`, and `spr resume`
+- Supported on `spr move`, `spr fix-pr`, `spr land`, `spr resume`, and `spr update`
+- `spr update --json` writes one summary object with repo context, resolved extent metadata, warnings, and per-group branch or PR actions
 - In `--json` mode, stdout is exactly one JSON object and stderr is normally empty
 - `spr list pr --json`, `spr list commit --json`, and `spr status --json` use a read-only output
   envelope and never suspend

@@ -30,4 +30,4 @@ pub use restack::{restack_after, restack_after_count};
 pub use rewrite_resume::{
     resume_rewrite, RewriteCommandKind, RewriteCommandOutcome, RewriteSuspendedState,
 };
-pub use update::{build_from_groups, build_from_tags};
+pub use update::{build_from_groups, build_from_groups_with_summary, build_from_tags};
