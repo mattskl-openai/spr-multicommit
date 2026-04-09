@@ -5,12 +5,12 @@
 //! are reachable from the configured base, and then rewrites only the checked-out
 //! local stack. It never lands, closes, retargets, comments on, or pushes PRs.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
 use crate::branch_names::group_branch_identities;
-use crate::commands::common::{self, DirtyWorktreeOutcome};
+use crate::commands::common::{self, DirtyWorktreeOutcome, NativeRebaseOutcome};
 use crate::commands::restack_after_count;
 use crate::commands::rewrite_resume::RewriteCommandOutcome;
 use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
@@ -181,32 +181,15 @@ fn run_native_rebase(
     boundary_commit: &str,
     cur_branch: &str,
 ) -> Result<FastLocalRewriteOutcome> {
-    if dry {
-        let _ = git_rw(
-            true,
-            ["rebase", "--onto", base, boundary_commit, cur_branch].as_slice(),
-        )?;
-        Ok(FastLocalRewriteOutcome::Completed)
-    } else if let Err(rebase_err) = git_rw(
-        false,
-        ["rebase", "--onto", base, boundary_commit, cur_branch].as_slice(),
-    ) {
-        if let Err(abort_err) = git_rw(false, ["rebase", "--abort"].as_slice()) {
-            let repo = crate::git::repo_root()?.unwrap_or_else(|| ".".to_string());
-            Err(rebase_err).with_context(|| {
-                format!(
-                    "native drop-merged-prefix rebase failed, and `git rebase --abort` also failed: {abort_err:#}. Inspect {} and run `git rebase --abort` there before retrying.",
-                    repo
-                )
-            })
-        } else {
+    let args = ["rebase", "--onto", base, boundary_commit, cur_branch];
+    match common::run_native_rebase_with_abort(dry, args.as_slice(), "native drop-merged-prefix")? {
+        NativeRebaseOutcome::Completed => Ok(FastLocalRewriteOutcome::Completed),
+        NativeRebaseOutcome::Aborted => {
             warn!(
-                "Native drop-merged-prefix rebase failed and was aborted; falling back to existing restack replay: {rebase_err:#}"
+                "Native drop-merged-prefix rebase failed and was aborted; falling back to existing restack replay"
             );
             Ok(FastLocalRewriteOutcome::FallbackRequired)
         }
-    } else {
-        Ok(FastLocalRewriteOutcome::Completed)
     }
 }
 

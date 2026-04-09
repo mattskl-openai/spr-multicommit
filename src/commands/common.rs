@@ -1,8 +1,9 @@
 //! Shared git helpers for stack-rewriting commands.
 //!
-//! These helpers centralize the mechanics used by `restack`, `move`, and
-//! `fix-pr`: naming temporary branches/worktrees, creating safety backups, and
-//! resetting the current branch to a rebuilt tip.
+//! These helpers centralize the mechanics used by branch-rewriting commands:
+//! naming temporary branches/worktrees, creating safety backups, resetting the
+//! current branch to a rebuilt tip, and aborting native Git rewrites before
+//! falling back to a temp-worktree replay.
 //!
 //! A subtle but important invariant is that backup tag names include the
 //! short SHA of `HEAD`. When a rewrite command fails before `HEAD` changes, a
@@ -33,7 +34,7 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::config::DirtyWorktreePolicy;
-use crate::git::{git_ro, git_rw, normalize_branch_name};
+use crate::git::{git_ro, git_rw, normalize_branch_name, repo_root};
 use crate::parsing::Group;
 
 /// Returns the current branch name and the short SHA of `HEAD`.
@@ -111,6 +112,49 @@ pub fn create_temp_worktree(
         .as_slice(),
     )?;
     Ok((tmp_path, tmp_branch))
+}
+
+/// Result of an in-place Git rebase whose failure path was already aborted.
+///
+/// Callers that receive `Aborted` may choose a fallback executor. Commands that
+/// need stronger guarantees should verify their command-specific checkout
+/// invariants before falling back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeRebaseOutcome {
+    Completed,
+    Aborted,
+}
+
+/// Runs a native `git rebase` command and aborts it before returning fallback.
+///
+/// `args` must be the complete `git` argument vector for one rebase command,
+/// such as `["rebase", "--onto", ...]`. A failed rebase returns `Aborted` only
+/// after `git rebase --abort` succeeds; if the abort also fails, the original
+/// rebase error is returned with context that tells the user where to repair the
+/// repository.
+pub fn run_native_rebase_with_abort(
+    dry: bool,
+    args: &[&str],
+    command_label: &str,
+) -> Result<NativeRebaseOutcome> {
+    if dry {
+        let _ = git_rw(true, args)?;
+        Ok(NativeRebaseOutcome::Completed)
+    } else if let Err(rebase_err) = git_rw(false, args) {
+        if let Err(abort_err) = git_rw(false, ["rebase", "--abort"].as_slice()) {
+            let repo = repo_root()?.unwrap_or_else(|| ".".to_string());
+            Err(rebase_err).with_context(|| {
+                format!(
+                    "{command_label} rebase failed, and `git rebase --abort` also failed: {abort_err:#}. Inspect {} and run `git rebase --abort` there before retrying.",
+                    repo
+                )
+            })
+        } else {
+            Ok(NativeRebaseOutcome::Aborted)
+        }
+    } else {
+        Ok(NativeRebaseOutcome::Completed)
+    }
 }
 
 /// A single parsed entry from `git worktree list --porcelain`.

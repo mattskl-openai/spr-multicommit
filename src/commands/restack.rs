@@ -1,28 +1,33 @@
 //! Restack a local PR stack while keeping ignored commits on the branch.
 //!
 //! This command rebuilds the portion of the stack that comes after the first
-//! `N` PR groups by cherry-picking those commits onto the latest `base` in a
-//! temporary worktree and branch. Once the cherry-picks succeed, the current
-//! branch is hard-reset to the rebuilt tip and the temp state is removed.
+//! `N` PR groups onto the latest `base`. Clean suffix-shaped plans run as an
+//! in-place Git rebase. Other plans, or rebase attempts that do not complete
+//! cleanly, fall back to the temp-worktree cherry-pick executor.
 //!
 //! Conflict handling is policy-driven via the `restack_conflict` config key.
 //! The default `halt` behavior suspends the replay, leaves the temp worktree
 //! in place, and writes a resume file for `spr resume <path>`. The `rollback`
 //! behavior preserves the historical cleanup-on-conflict path.
 
-use anyhow::Result;
-use tracing::info;
+use anyhow::{bail, Context, Result};
+use std::path::Path;
+use tracing::{info, warn};
 
 use crate::commands::common;
-use crate::commands::common::CherryPickOp;
+use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp, NativeRebaseOutcome};
 use crate::commands::rewrite_resume::{
     self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
 };
 use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
+use crate::git::git_rev_list_range;
 use crate::git::git_rev_parse;
+use crate::git::git_ro;
 use crate::git::git_rw;
 use crate::parsing::{derive_local_groups_with_ignored, Group};
-use crate::restack_output::{render_human_preview, RestackPreviewData, RestackPreviewGroup};
+use crate::restack_output::{
+    render_human_preview, RestackExecutorPlan, RestackPreviewData, RestackPreviewGroup,
+};
 use crate::selectors::{resolve_after_count, AfterSelector};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +51,22 @@ pub struct RestackPlan {
     pub remaining_groups: Vec<Group>,
     pub kept_ignored_segments: Vec<Vec<String>>,
     pub operations: Vec<CherryPickOp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FastRestackPlan {
+    upstream_exclusive: String,
+    original_head: String,
+    commit_count: usize,
+}
+
+impl FastRestackPlan {
+    fn executor_plan(&self) -> RestackExecutorPlan {
+        RestackExecutorPlan::NativeRebase {
+            upstream_exclusive: self.upstream_exclusive.clone(),
+            commit_count: self.commit_count,
+        }
+    }
 }
 
 /// Build the ordered cherry-pick plan that reconstructs the restacked history.
@@ -93,6 +114,88 @@ fn build_kept_ignored_segments(
     segments
 }
 
+fn commit_parent(sha: &str) -> Result<String> {
+    git_rev_parse(&format!("{sha}^")).with_context(|| format!("failed to find parent of {sha}"))
+}
+
+fn expand_cherry_pick_op(operation: &CherryPickOp) -> Result<Option<Vec<String>>> {
+    match operation {
+        CherryPickOp::Commit { sha, empty_policy } => {
+            if *empty_policy == CherryPickEmptyPolicy::StopOnEmpty {
+                Ok(Some(vec![sha.clone()]))
+            } else {
+                Ok(None)
+            }
+        }
+        CherryPickOp::Range {
+            first,
+            last,
+            empty_policy,
+        } => {
+            if *empty_policy != CherryPickEmptyPolicy::StopOnEmpty {
+                Ok(None)
+            } else {
+                let upstream_exclusive = commit_parent(first)?;
+                let expanded = git_rev_list_range(&upstream_exclusive, last)?;
+                if expanded.first() == Some(first) && expanded.last() == Some(last) {
+                    Ok(Some(expanded))
+                } else {
+                    bail!(
+                        "cherry-pick range {}^..{} expanded to unexpected endpoints {:?}..{:?}",
+                        first,
+                        last,
+                        expanded.first(),
+                        expanded.last()
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn expand_cherry_pick_ops(operations: &[CherryPickOp]) -> Result<Option<Vec<String>>> {
+    let mut expanded = Some(Vec::new());
+    for operation in operations {
+        expanded = if let Some(mut current) = expanded {
+            if let Some(mut operation_commits) = expand_cherry_pick_op(operation)? {
+                current.append(&mut operation_commits);
+                Some(current)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    }
+    Ok(expanded)
+}
+
+fn plan_fast_suffix_rebase(
+    original_head: &str,
+    operations: &[CherryPickOp],
+) -> Result<Option<FastRestackPlan>> {
+    if operations.is_empty() {
+        Ok(None)
+    } else if let Some(expanded_operations) = expand_cherry_pick_ops(operations)? {
+        let first_replayed = expanded_operations
+            .first()
+            .expect("non-empty operations expand to non-empty commits");
+        let upstream_exclusive = commit_parent(first_replayed)?;
+        let suffix = git_rev_list_range(&upstream_exclusive, original_head)?;
+        if suffix == expanded_operations {
+            Ok(Some(FastRestackPlan {
+                upstream_exclusive,
+                original_head: original_head.to_string(),
+                commit_count: expanded_operations.len(),
+            }))
+        } else {
+            Ok(None)
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 /// Emit user-facing rollback and manual-continue instructions for a halted restack.
 ///
 /// The instructions are explicit about the temp worktree location because a
@@ -111,11 +214,38 @@ fn group_preview(group: &Group) -> RestackPreviewGroup {
 }
 
 impl RestackPlan {
-    fn preview_data(&self, safe_requested: bool) -> RestackPreviewData {
+    fn planned_executor(&self, allow_native_rebase: bool) -> Result<RestackExecutorPlan> {
+        if self.dropped_groups.is_empty() && self.remaining_groups.is_empty() {
+            Ok(RestackExecutorPlan::Noop)
+        } else if self.remaining_groups.is_empty() && self.kept_ignored_segments.is_empty() {
+            Ok(RestackExecutorPlan::ResetToBase)
+        } else if allow_native_rebase {
+            if let Some(fast_plan) = plan_fast_suffix_rebase(&self.original_head, &self.operations)?
+            {
+                Ok(fast_plan.executor_plan())
+            } else {
+                Ok(RestackExecutorPlan::TempWorktreeCherryPick {
+                    operation_count: self.operations.len(),
+                })
+            }
+        } else {
+            Ok(RestackExecutorPlan::TempWorktreeCherryPick {
+                operation_count: self.operations.len(),
+            })
+        }
+    }
+
+    fn preview_data(
+        &self,
+        safe_requested: bool,
+        planned_executor: RestackExecutorPlan,
+    ) -> RestackPreviewData {
         let would_change_branch =
             !self.dropped_groups.is_empty() || !self.remaining_groups.is_empty();
-        let would_create_temp_worktree =
-            !self.remaining_groups.is_empty() || !self.kept_ignored_segments.is_empty();
+        let would_create_temp_worktree = matches!(
+            planned_executor,
+            RestackExecutorPlan::TempWorktreeCherryPick { .. }
+        );
         let mut not_validated = if self.base_ref_was_refreshed {
             Vec::new()
         } else {
@@ -145,6 +275,7 @@ impl RestackPlan {
             remaining_groups: self.remaining_groups.iter().map(group_preview).collect(),
             kept_ignored_segment_count: self.kept_ignored_segments.len(),
             planned_cherry_pick_operation_count: self.operations.len(),
+            planned_executor,
             would_fetch_origin_when_executed: !self.base_ref_was_refreshed,
             would_create_backup_tag: safe_requested && would_change_branch,
             would_create_temp_worktree,
@@ -237,11 +368,12 @@ pub fn preview_restack_after(
     safe_requested: bool,
 ) -> Result<RestackPreviewData> {
     if let Some(plan) = collect_restack_plan(metadata_context, after, false)? {
-        Ok(plan.preview_data(safe_requested))
+        let planned_executor = plan.planned_executor(true)?;
+        Ok(plan.preview_data(safe_requested, planned_executor))
     } else {
         let (current_branch, _) = common::get_current_branch_and_short()?;
         let original_head = git_rev_parse("HEAD")?;
-        Ok(RestackPlan {
+        let plan = RestackPlan {
             base_ref: metadata_context.base.clone(),
             base_sha: git_rev_parse(&metadata_context.base).ok(),
             base_ref_was_refreshed: false,
@@ -253,15 +385,111 @@ pub fn preview_restack_after(
             remaining_groups: Vec::new(),
             kept_ignored_segments: Vec::new(),
             operations: Vec::new(),
-        }
-        .preview_data(safe_requested))
+        };
+        let planned_executor = plan.planned_executor(true)?;
+        Ok(plan.preview_data(safe_requested, planned_executor))
     }
 }
 
-fn log_human_restack_plan(plan: &RestackPlan, safe_requested: bool) {
-    let data = plan.preview_data(safe_requested);
+fn log_human_restack_plan(
+    plan: &RestackPlan,
+    safe_requested: bool,
+    planned_executor: RestackExecutorPlan,
+) {
+    let data = plan.preview_data(safe_requested, planned_executor);
     for line in render_human_preview("Restack plan", &data).lines() {
         info!("{line}");
+    }
+}
+
+fn git_path_exists(path_key: &str) -> Result<bool> {
+    let path = git_ro(["rev-parse", "--git-path", path_key].as_slice())?
+        .trim()
+        .to_string();
+    Ok(Path::new(&path).exists())
+}
+
+fn verify_no_rebase_state() -> Result<()> {
+    let stale_paths = ["rebase-apply", "rebase-merge"]
+        .into_iter()
+        .filter_map(|path_key| match git_path_exists(path_key) {
+            Ok(true) => Some(Ok(path_key)),
+            Ok(false) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if stale_paths.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "git rebase abort returned successfully, but rebase state still exists: {}",
+            stale_paths.join(", ")
+        );
+    }
+}
+
+fn verify_fast_rebase_abort_cleanup(original_head: &str) -> Result<()> {
+    let current_head = git_rev_parse("HEAD")?;
+    let status = git_ro(["status", "--porcelain=v1"].as_slice())?;
+    verify_no_rebase_state()?;
+    if current_head != original_head {
+        bail!(
+            "git rebase abort did not restore HEAD: original {}, current {}",
+            original_head,
+            current_head
+        );
+    } else if !status.trim().is_empty() {
+        bail!("git rebase abort left uncommitted work:\n{}", status);
+    } else {
+        Ok(())
+    }
+}
+
+fn try_fast_suffix_rebase(
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
+    metadata_refresh_context: &crate::stack_metadata::RefreshMetadataContext,
+    fast_plan: &FastRestackPlan,
+    cur_branch: &str,
+    original_worktree_root: &str,
+) -> Result<NativeRebaseOutcome> {
+    let rebase_args = [
+        "rebase",
+        "--reapply-cherry-picks",
+        "--empty=stop",
+        "--onto",
+        metadata_context.base.as_str(),
+        fast_plan.upstream_exclusive.as_str(),
+        cur_branch,
+    ];
+    match common::run_native_rebase_with_abort(false, rebase_args.as_slice(), "fast restack")? {
+        NativeRebaseOutcome::Aborted => {
+            verify_fast_rebase_abort_cleanup(&fast_plan.original_head).with_context(|| {
+                format!(
+                    "fast restack rebase failed and abort returned, but the original stack checkout was not restored cleanly; inspect {}",
+                    original_worktree_root
+                )
+            })?;
+            warn!(
+                "Fast restack rebase failed and was aborted; falling back to temp-worktree replay"
+            );
+            Ok(NativeRebaseOutcome::Aborted)
+        }
+        NativeRebaseOutcome::Completed => {
+            crate::stack_metadata::refresh_metadata_for_branch(
+                original_worktree_root,
+                cur_branch,
+                metadata_refresh_context,
+                None,
+            )?;
+            info!(
+                "Fast-restacked {} commit(s) with git rebase --onto {} {} {}",
+                fast_plan.commit_count,
+                metadata_context.base,
+                fast_plan.upstream_exclusive,
+                cur_branch
+            );
+            Ok(NativeRebaseOutcome::Completed)
+        }
     }
 }
 
@@ -270,7 +498,8 @@ fn restack_after_resolved(
     plan: RestackPlan,
     options: RestackExecutionOptions,
 ) -> Result<RewriteCommandOutcome> {
-    log_human_restack_plan(&plan, options.safe);
+    let planned_executor = plan.planned_executor(!options.dry)?;
+    log_human_restack_plan(&plan, options.safe, planned_executor.clone());
 
     common::with_dirty_worktree_policy(
         options.dry,
@@ -302,60 +531,101 @@ fn restack_after_resolved(
                 }
                 Ok(RewriteCommandOutcome::Completed)
             } else {
-                let resume_path = rewrite_resume::prepare_resume_path_for_new_session(
-                    options.dry,
-                    RewriteCommandKind::Restack,
-                    &cur_branch,
-                    &original_head,
-                )?;
-                let backup_tag = if options.safe {
-                    Some(common::create_backup_tag(
+                let (fast_outcome, existing_backup_tag) = match &planned_executor {
+                    RestackExecutorPlan::NativeRebase {
+                        upstream_exclusive,
+                        commit_count,
+                    } => {
+                        let backup_tag = if options.safe {
+                            Some(common::create_backup_tag(
+                                false,
+                                "restack",
+                                &cur_branch,
+                                &short,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let fast_plan = FastRestackPlan {
+                            upstream_exclusive: upstream_exclusive.clone(),
+                            original_head: original_head.clone(),
+                            commit_count: *commit_count,
+                        };
+                        let outcome = try_fast_suffix_rebase(
+                            metadata_context,
+                            &metadata_refresh_context,
+                            &fast_plan,
+                            &cur_branch,
+                            &original_worktree_root,
+                        )?;
+                        (outcome, backup_tag)
+                    }
+                    RestackExecutorPlan::Noop
+                    | RestackExecutorPlan::ResetToBase
+                    | RestackExecutorPlan::TempWorktreeCherryPick { .. } => {
+                        (NativeRebaseOutcome::Aborted, None)
+                    }
+                };
+                if fast_outcome == NativeRebaseOutcome::Completed {
+                    Ok(RewriteCommandOutcome::Completed)
+                } else {
+                    let resume_path = rewrite_resume::prepare_resume_path_for_new_session(
+                        options.dry,
+                        RewriteCommandKind::Restack,
+                        &cur_branch,
+                        &original_head,
+                    )?;
+                    let backup_tag = if existing_backup_tag.is_some() {
+                        existing_backup_tag
+                    } else if options.safe {
+                        Some(common::create_backup_tag(
+                            options.dry,
+                            "restack",
+                            &cur_branch,
+                            &short,
+                        )?)
+                    } else {
+                        None
+                    };
+
+                    let (tmp_path, tmp_branch) = common::create_temp_worktree(
                         options.dry,
                         "restack",
-                        &cur_branch,
+                        &metadata_context.base,
                         &short,
-                    )?)
-                } else {
-                    None
-                };
-
-                let (tmp_path, tmp_branch) = common::create_temp_worktree(
-                    options.dry,
-                    "restack",
-                    &metadata_context.base,
-                    &short,
-                )?;
-                let outcome = rewrite_resume::run_rewrite_session(
-                    options.dry,
-                    RewriteSession {
-                        command_kind: RewriteCommandKind::Restack,
-                        conflict_policy: if options.conflict_policy
-                            == RestackConflictPolicy::Rollback
-                        {
-                            RewriteConflictPolicy::Rollback
-                        } else {
-                            RewriteConflictPolicy::Suspend
+                    )?;
+                    let outcome = rewrite_resume::run_rewrite_session(
+                        options.dry,
+                        RewriteSession {
+                            command_kind: RewriteCommandKind::Restack,
+                            conflict_policy: if options.conflict_policy
+                                == RestackConflictPolicy::Rollback
+                            {
+                                RewriteConflictPolicy::Rollback
+                            } else {
+                                RewriteConflictPolicy::Suspend
+                            },
+                            original_worktree_root,
+                            original_branch: cur_branch.clone(),
+                            original_head,
+                            resume_path,
+                            temp_branch: tmp_branch,
+                            temp_worktree_path: tmp_path,
+                            backup_tag,
+                            operations: plan.operations.clone(),
+                            deferred_dirty_worktree_restore,
+                            post_success_hint: None,
+                            metadata_refresh_context: Some(metadata_refresh_context),
                         },
-                        original_worktree_root,
-                        original_branch: cur_branch.clone(),
-                        original_head,
-                        resume_path,
-                        temp_branch: tmp_branch,
-                        temp_worktree_path: tmp_path,
-                        backup_tag,
-                        operations: plan.operations.clone(),
-                        deferred_dirty_worktree_restore,
-                        post_success_hint: None,
-                        metadata_refresh_context: Some(metadata_refresh_context),
-                    },
-                )?;
-                if outcome == RewriteCommandOutcome::Completed {
-                    info!(
+                    )?;
+                    if outcome == RewriteCommandOutcome::Completed {
+                        info!(
                         "Rebased commits after first {} PR(s) of {} onto {} (including ignored commits)",
                         plan.resolved_after_count, cur_branch, metadata_context.base
                     );
+                    }
+                    Ok(outcome)
                 }
-                Ok(outcome)
             }
         },
     )
@@ -436,15 +706,17 @@ pub fn restack_after_count(
 mod tests {
     use super::{
         build_cherry_pick_plan, build_kept_ignored_segments, build_restack_plan,
-        preview_restack_after, resolve_restack_after_count,
+        plan_fast_suffix_rebase, preview_restack_after, resolve_restack_after_count,
     };
     use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp};
     use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
     use crate::commands::RewriteCommandOutcome;
     use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
     use crate::parsing::Group;
+    use crate::restack_output::RestackExecutorPlan;
     use crate::selectors::{AfterSelector, GroupSelector, StableHandle};
     use crate::test_support::{commit_file, git, lock_cwd, write_file, DirGuard};
+    use std::env;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -623,6 +895,125 @@ mod tests {
         dir
     }
 
+    fn init_suffix_planning_repo() -> (TempDir, Vec<String>) {
+        let dir = crate::test_support::init_repo();
+        let repo = dir.path();
+        let shas = [
+            commit_file(repo, "alpha.txt", "alpha\n", "feat: alpha pr:alpha"),
+            commit_file(
+                repo,
+                "ignore-a.txt",
+                "ignore-a\n",
+                "local ignore A pr:ignore",
+            ),
+            commit_file(repo, "beta.txt", "beta\n", "feat: beta pr:beta"),
+            commit_file(
+                repo,
+                "ignore-b.txt",
+                "ignore-b\n",
+                "local ignore B pr:ignore",
+            ),
+            commit_file(repo, "gamma.txt", "gamma\n", "feat: gamma pr:gamma"),
+        ]
+        .to_vec();
+        (dir, shas)
+    }
+
+    #[test]
+    fn fast_suffix_plan_accepts_exact_contiguous_suffix() {
+        let _lock = lock_cwd();
+        let (dir, shas) = init_suffix_planning_repo();
+        let _guard = DirGuard::change_to(dir.path());
+
+        let plan = plan_fast_suffix_rebase(
+            &shas[4],
+            &[CherryPickOp::Range {
+                first: shas[2].clone(),
+                last: shas[4].clone(),
+                empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+            }],
+        )
+        .unwrap()
+        .expect("beta..gamma is the top suffix");
+
+        assert_eq!(plan.upstream_exclusive, shas[1]);
+        assert_eq!(plan.original_head, shas[4]);
+        assert_eq!(plan.commit_count, 3);
+    }
+
+    #[test]
+    fn fast_suffix_plan_accepts_dropped_group_ignored_commit_when_it_is_in_suffix() {
+        let _lock = lock_cwd();
+        let (dir, shas) = init_suffix_planning_repo();
+        let _guard = DirGuard::change_to(dir.path());
+
+        let plan = plan_fast_suffix_rebase(
+            &shas[4],
+            &[
+                CherryPickOp::Commit {
+                    sha: shas[1].clone(),
+                    empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+                },
+                CherryPickOp::Range {
+                    first: shas[2].clone(),
+                    last: shas[4].clone(),
+                    empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+                },
+            ],
+        )
+        .unwrap()
+        .expect("ignore-A..gamma is the top suffix");
+
+        assert_eq!(plan.upstream_exclusive, shas[0]);
+        assert_eq!(plan.commit_count, 4);
+    }
+
+    #[test]
+    fn fast_suffix_plan_rejects_noncontiguous_kept_ignored_segments() {
+        let _lock = lock_cwd();
+        let (dir, shas) = init_suffix_planning_repo();
+        let _guard = DirGuard::change_to(dir.path());
+
+        let plan = plan_fast_suffix_rebase(
+            &shas[4],
+            &[
+                CherryPickOp::Commit {
+                    sha: shas[1].clone(),
+                    empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+                },
+                CherryPickOp::Commit {
+                    sha: shas[3].clone(),
+                    empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+                },
+                CherryPickOp::Commit {
+                    sha: shas[4].clone(),
+                    empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn fast_suffix_plan_rejects_partial_suffix() {
+        let _lock = lock_cwd();
+        let (dir, shas) = init_suffix_planning_repo();
+        let _guard = DirGuard::change_to(dir.path());
+
+        let plan = plan_fast_suffix_rebase(
+            &shas[4],
+            &[CherryPickOp::Commit {
+                sha: shas[3].clone(),
+                empty_policy: CherryPickEmptyPolicy::StopOnEmpty,
+            }],
+        )
+        .unwrap();
+
+        assert!(plan.is_none());
+    }
+
     fn read_preview_side_effect_snapshot(repo: &Path) -> String {
         [
             git(repo, ["rev-parse", "HEAD"].as_slice()),
@@ -643,6 +1034,9 @@ mod tests {
         let repo = dir.path().join("repo");
         let _guard = DirGuard::change_to(&repo);
         let before = read_preview_side_effect_snapshot(&repo);
+        let alpha_tip = git(&repo, ["rev-parse", "HEAD^"].as_slice())
+            .trim()
+            .to_string();
 
         let preview = preview_restack_after(
             &metadata_context(),
@@ -660,7 +1054,14 @@ mod tests {
         assert_eq!(preview.remaining_groups[0].stable_handle, "pr:beta");
         assert!(preview.would_fetch_origin_when_executed);
         assert!(preview.would_create_backup_tag);
-        assert!(preview.would_create_temp_worktree);
+        assert_eq!(
+            preview.planned_executor,
+            RestackExecutorPlan::NativeRebase {
+                upstream_exclusive: alpha_tip,
+                commit_count: 1,
+            }
+        );
+        assert!(!preview.would_create_temp_worktree);
         assert!(preview.would_reset_current_branch);
         assert!(preview
             .not_validated
@@ -674,12 +1075,168 @@ mod tests {
         git(temp_repo, ["add", "story.txt"].as_slice());
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: String) -> Self {
+            let original = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                env::set_var(self.key, original);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn init_clean_suffix_restack_repo() -> (TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        git(&repo, ["init", "-b", "main"].as_slice());
+        git(
+            &repo,
+            ["config", "user.email", "spr@example.com"].as_slice(),
+        );
+        git(&repo, ["config", "user.name", "SPR Tests"].as_slice());
+        write_file(&repo, "story.txt", "base\n");
+        git(&repo, ["add", "story.txt"].as_slice());
+        git(&repo, ["commit", "-m", "init"].as_slice());
+
+        let origin = dir.path().join("origin.git");
+        git(
+            &repo,
+            ["init", "--bare", origin.to_str().unwrap()].as_slice(),
+        );
+        git(
+            &repo,
+            ["remote", "add", "origin", origin.to_str().unwrap()].as_slice(),
+        );
+        git(&repo, ["push", "-u", "origin", "main"].as_slice());
+
+        git(&repo, ["checkout", "-b", "stack"].as_slice());
+        commit_file(&repo, "alpha.txt", "alpha-1\n", "feat: alpha pr:alpha");
+        commit_file(&repo, "beta.txt", "beta-1\n", "feat: beta pr:beta");
+        let original_stack_tip = git(&repo, ["rev-parse", "HEAD"].as_slice())
+            .trim()
+            .to_string();
+        let original_short = git(&repo, ["rev-parse", "--short", "HEAD"].as_slice())
+            .trim()
+            .to_string();
+
+        git(&repo, ["checkout", "main"].as_slice());
+        commit_file(&repo, "alpha.txt", "alpha-1\n", "feat: base has alpha");
+        git(&repo, ["push", "origin", "main"].as_slice());
+        git(&repo, ["checkout", "stack"].as_slice());
+
+        (dir, original_stack_tip, original_short)
+    }
+
+    #[test]
+    fn restack_clean_suffix_uses_native_rebase_without_temp_worktree() {
+        let _lock = lock_cwd();
+        let (dir, original_stack_tip, original_short) = init_clean_suffix_restack_repo();
+        let repo = dir.path().join("repo");
+        let trace_path = dir.path().join("restack-trace.jsonl");
+        let _trace_guard =
+            EnvVarGuard::set("GIT_TRACE2_EVENT", trace_path.to_string_lossy().to_string());
+        let _guard = DirGuard::change_to(&repo);
+        let preview = preview_restack_after(
+            &metadata_context(),
+            &AfterSelector::Group(GroupSelector::LocalPr(1)),
+            true,
+        )
+        .expect("preview clean suffix restack");
+        assert!(
+            matches!(
+                preview.planned_executor,
+                RestackExecutorPlan::NativeRebase {
+                    commit_count: 1,
+                    ..
+                }
+            ),
+            "clean suffix preview should name the native-rebase executor: {:?}",
+            preview.planned_executor
+        );
+        assert!(
+            !preview.would_create_temp_worktree,
+            "clean suffix preview should predict the native-rebase executor"
+        );
+
+        let outcome = super::restack_after(
+            &metadata_context(),
+            &AfterSelector::Group(GroupSelector::LocalPr(1)),
+            true,
+            false,
+            RestackConflictPolicy::Halt,
+            DirtyWorktreePolicy::Halt,
+        )
+        .expect("restack should complete");
+
+        assert_eq!(outcome, RewriteCommandOutcome::Completed);
+        let trace = fs::read_to_string(&trace_path).expect("read git trace");
+        assert!(
+            trace.contains("\"argv\":[\"git\",\"rebase\""),
+            "trace should contain native git rebase\n{trace}"
+        );
+        assert!(
+            !trace.contains("\"argv\":[\"git\",\"worktree\",\"add\""),
+            "clean suffix restack should not create a rewrite worktree\n{trace}"
+        );
+        assert_eq!(
+            git(
+                &repo,
+                ["log", "--format=%s", "--reverse", "origin/main..HEAD"].as_slice()
+            )
+            .lines()
+            .collect::<Vec<_>>(),
+            vec!["feat: beta pr:beta"]
+        );
+        assert_eq!(
+            git(&repo, ["merge-base", "origin/main", "HEAD"].as_slice())
+                .trim()
+                .to_string(),
+            git(&repo, ["rev-parse", "origin/main"].as_slice())
+                .trim()
+                .to_string()
+        );
+        assert_eq!(
+            git(
+                &repo,
+                [
+                    "rev-parse",
+                    &format!("backup/restack/stack-{original_short}")
+                ]
+                .as_slice()
+            )
+            .trim(),
+            original_stack_tip
+        );
+        let metadata = fs::read_to_string(repo.join(".git/spr/stack_metadata_v1.json"))
+            .expect("read refreshed metadata");
+        assert!(metadata.contains("\"stack\""));
+        assert!(metadata.contains("\"dank-spr/beta\""));
+        assert!(!metadata.contains("\"dank-spr/alpha\""));
+    }
+
     #[test]
     fn restack_halt_policy_suspends_and_resumes_conflict() {
         let _lock = lock_cwd();
         let dir = init_restack_conflict_repo();
         let repo = dir.path().join("repo");
         let _guard = DirGuard::change_to(&repo);
+        let original_head = git(&repo, ["rev-parse", "HEAD"].as_slice())
+            .trim()
+            .to_string();
 
         let outcome = super::restack_after(
             &metadata_context(),
@@ -697,6 +1254,14 @@ mod tests {
         let resume_state: RewriteResumeState =
             serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
                 .expect("parse resume state");
+        assert_eq!(
+            git(&repo, ["rev-parse", "HEAD"].as_slice()).trim(),
+            original_head
+        );
+        assert!(
+            git(&repo, ["status", "--porcelain=v1"].as_slice()).is_empty(),
+            "fast rebase abort plus fallback suspend should leave the original worktree clean"
+        );
         resolve_restack_conflict(Path::new(&resume_state.temp_worktree_path));
 
         let resumed = resume_rewrite(false, &resume_path).expect("resume restack");
