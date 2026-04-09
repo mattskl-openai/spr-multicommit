@@ -30,10 +30,18 @@ pub enum PrepSelection {
 pub enum ListWhat {
     /// List PRs in the stack (halts early if live groups derive case-colliding synthetic branch names)
     #[command(alias = "p")]
-    Pr,
+    Pr {
+        /// Emit a single machine-readable JSON object to stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// List commits in the stack (halts early if live groups derive case-colliding synthetic branch names)
     #[command(alias = "c")]
-    Commit,
+    Commit {
+        /// Emit a single machine-readable JSON object to stdout
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -133,7 +141,9 @@ pub enum Cmd {
     /// Status overview (alias for `list pr`) with the same early synthetic branch-collision guard
     #[command(alias = "stat")]
     Status {
-        // no options; uses global flags
+        /// Emit a single machine-readable JSON object to stdout
+        #[arg(long)]
+        json: bool,
     },
 
     /// Find the owning stack branch for a PR branch or report that the target is already a stack branch
@@ -217,13 +227,12 @@ impl Cmd {
             | Self::Resume { json, .. }
             | Self::Land { json, .. }
             | Self::FixPr { json, .. }
+            | Self::Status { json, .. }
             | Self::Move { json, .. } => *json,
-            Self::Update { .. }
-            | Self::Prep {}
-            | Self::List { .. }
-            | Self::Status {}
-            | Self::RelinkPrs {}
-            | Self::Cleanup {} => false,
+            Self::List {
+                what: ListWhat::Pr { json, .. } | ListWhat::Commit { json, .. },
+            } => *json,
+            Self::Update { .. } | Self::Prep {} | Self::RelinkPrs {} | Self::Cleanup {} => false,
         }
     }
 }
@@ -344,8 +353,34 @@ mod tests {
         let land = Cli::try_parse_from(["spr", "land", "--json"]).unwrap();
         assert!(land.cmd.json_mode());
 
-        let list = Cli::try_parse_from(["spr", "list", "pr"]).unwrap();
-        assert!(!list.cmd.json_mode());
+        let list = Cli::try_parse_from(["spr", "list", "pr", "--json"]).unwrap();
+        assert!(list.cmd.json_mode());
+    }
+
+    #[test]
+    fn list_command_parses_json_flag() {
+        let cli = Cli::try_parse_from(["spr", "list", "commit", "--json"]).unwrap();
+
+        match cli.cmd {
+            Cmd::List {
+                what: super::ListWhat::Commit { json },
+            } => {
+                assert!(json);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn status_command_parses_json_flag() {
+        let cli = Cli::try_parse_from(["spr", "status", "--json"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Status { json } => {
+                assert!(json);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
     }
 
     #[test]
@@ -353,7 +388,7 @@ mod tests {
         let cli = Cli::try_parse_from(["spr", "status", "--cd", "/tmp/example"]).unwrap();
 
         assert_eq!(cli.cd, Some(PathBuf::from("/tmp/example")));
-        assert!(matches!(cli.cmd, Cmd::Status {}));
+        assert!(matches!(cli.cmd, Cmd::Status { json: false }));
     }
 
     #[test]
@@ -361,6 +396,6 @@ mod tests {
         let cli = Cli::try_parse_from(["spr", "--cd", "/tmp/example", "status"]).unwrap();
 
         assert_eq!(cli.cd, Some(PathBuf::from("/tmp/example")));
-        assert!(matches!(cli.cmd, Cmd::Status {}));
+        assert!(matches!(cli.cmd, Cmd::Status { json: false }));
     }
 }

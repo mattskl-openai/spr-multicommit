@@ -7,7 +7,7 @@
 //! become branch names, so branch-conflict decisions must use a canonicalized
 //! comparison key instead of raw string equality.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::parsing::Group;
@@ -33,6 +33,20 @@ pub struct SyntheticBranchIdentity {
     pub conflict_key: CanonicalBranchConflictKey,
 }
 
+/// One live PR group whose synthetic branch name participates in a collision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticBranchCollisionEntry {
+    pub stable_handle: String,
+    pub head_branch: String,
+}
+
+/// Two live PR groups whose derived synthetic branch names collide under case-folding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticBranchNameCollision {
+    pub first: SyntheticBranchCollisionEntry,
+    pub second: SyntheticBranchCollisionEntry,
+}
+
 impl SyntheticBranchIdentity {
     pub fn new(prefix: &str, tag: &str) -> Self {
         let exact = format!("{prefix}{tag}");
@@ -56,6 +70,48 @@ pub fn synthetic_branch_name(prefix: &str, tag: &str) -> String {
     synthetic_branch_identity(prefix, tag).exact
 }
 
+impl std::fmt::Display for SyntheticBranchNameCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Refusing to operate on this stack because {} and {} derive conflicting synthetic branch names (`{}` and `{}`) under case-insensitive comparison. Stable handles remain exact-case, but these branch names are not safe to treat as distinct on a case-insensitive filesystem.",
+            self.first.stable_handle,
+            self.second.stable_handle,
+            self.first.head_branch,
+            self.second.head_branch
+        )
+    }
+}
+
+impl std::error::Error for SyntheticBranchNameCollision {}
+
+/// Return the first case-folding synthetic-branch collision in `groups`, if any.
+pub fn find_synthetic_branch_name_collision(
+    groups: &[Group],
+    prefix: &str,
+) -> Option<SyntheticBranchNameCollision> {
+    let mut seen: HashMap<CanonicalBranchConflictKey, SyntheticBranchCollisionEntry> =
+        HashMap::new();
+    for group in groups {
+        let head_branch = synthetic_branch_name(prefix, &group.tag);
+        let stable_handle = format!("pr:{}", group.tag);
+        let conflict_key = canonical_branch_conflict_key(&head_branch);
+        let entry = SyntheticBranchCollisionEntry {
+            stable_handle,
+            head_branch,
+        };
+        if let Some(previous) = seen.get(&conflict_key) {
+            return Some(SyntheticBranchNameCollision {
+                first: previous.clone(),
+                second: entry,
+            });
+        } else {
+            seen.insert(conflict_key, entry);
+        }
+    }
+    None
+}
+
 /// Derive synthetic branch identities for `groups` and reject canonical collisions.
 ///
 /// The returned vector preserves the input order. On collision, the error names
@@ -65,33 +121,21 @@ pub fn group_branch_identities(
     groups: &[Group],
     prefix: &str,
 ) -> Result<Vec<SyntheticBranchIdentity>> {
-    let mut identities = Vec::with_capacity(groups.len());
-    let mut seen: HashMap<CanonicalBranchConflictKey, (String, String)> = HashMap::new();
-    for group in groups {
-        let identity = synthetic_branch_identity(prefix, &group.tag);
-        if let Some((prior_tag, prior_branch)) = seen.get(&identity.conflict_key) {
-            return Err(anyhow!(
-                "Refusing to operate on this stack because pr:{} and pr:{} derive conflicting synthetic branch names (`{}` and `{}`) under case-insensitive comparison. Stable handles remain exact-case, but these branch names are not safe to treat as distinct on a case-insensitive filesystem.",
-                prior_tag,
-                group.tag,
-                prior_branch,
-                identity.exact
-            ));
-        } else {
-            seen.insert(
-                identity.conflict_key.clone(),
-                (group.tag.clone(), identity.exact.clone()),
-            );
-            identities.push(identity);
-        }
+    if let Some(collision) = find_synthetic_branch_name_collision(groups, prefix) {
+        Err(collision.into())
+    } else {
+        Ok(groups
+            .iter()
+            .map(|group| synthetic_branch_identity(prefix, &group.tag))
+            .collect())
     }
-    Ok(identities)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_branch_conflict_key, group_branch_identities, synthetic_branch_identity,
+        canonical_branch_conflict_key, find_synthetic_branch_name_collision,
+        group_branch_identities, synthetic_branch_identity,
     };
     use crate::parsing::Group;
 
@@ -144,5 +188,17 @@ mod tests {
         assert!(err.to_string().contains("pr:alpha and pr:Alpha"));
         assert!(err.to_string().contains("dank-spr/alpha"));
         assert!(err.to_string().contains("dank-spr/Alpha"));
+    }
+
+    #[test]
+    fn find_synthetic_branch_name_collision_returns_typed_entries() {
+        let collision =
+            find_synthetic_branch_name_collision(&[group("alpha"), group("Alpha")], "dank-spr/")
+                .unwrap();
+
+        assert_eq!(collision.first.stable_handle, "pr:alpha");
+        assert_eq!(collision.first.head_branch, "dank-spr/alpha");
+        assert_eq!(collision.second.stable_handle, "pr:Alpha");
+        assert_eq!(collision.second.head_branch, "dank-spr/Alpha");
     }
 }

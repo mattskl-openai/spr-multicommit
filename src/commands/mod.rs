@@ -16,8 +16,12 @@ pub use absorb::{absorb_branch_tails, AbsorbOptions, CopiedLaterStackCommitPolic
 pub use cleanup::cleanup_remote_branches;
 pub use fix_pr::fix_pr_tail;
 pub use land::{land_flatten_until, land_per_pr_until};
-pub use list::list_commits_display;
-pub use list::list_prs_display;
+#[allow(unused_imports)]
+pub use list::{
+    collect_commit_list_data, collect_commit_list_data_for_json, collect_pr_list_data,
+    collect_pr_list_data_for_json, list_commits_display, list_prs_display, CommitEntryData,
+    CommitGroupData, CommitListData, PrGroupData, PrListData, ReadOnlyQueryError, RemotePrMetadata,
+};
 pub use prep::prep_squash;
 pub use r#move::{move_groups_after, MoveExecutionOptions};
 pub use relink_prs::relink_prs;
