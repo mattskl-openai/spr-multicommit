@@ -10,6 +10,7 @@ use crate::branch_names::{
 };
 use crate::commands::common;
 use crate::config::{ListOrder, PrDescriptionMode};
+use crate::execution::ExecutionMode;
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
     fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_open_prs_for_heads,
@@ -269,7 +270,7 @@ fn is_resource_limit_error(err: &anyhow::Error) -> bool {
         || msg.contains("Resource limits for this query exceeded")
 }
 
-fn run_update_chunk(dry: bool, update_inputs: &[String]) -> Result<()> {
+fn run_update_chunk(execution_mode: ExecutionMode, update_inputs: &[String]) -> Result<()> {
     if update_inputs.is_empty() {
         return Ok(());
     }
@@ -282,21 +283,21 @@ fn run_update_chunk(dry: bool, update_inputs: &[String]) -> Result<()> {
     }
     m.push('}');
     gh_rw(
-        dry,
+        execution_mode,
         ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
     )?;
     Ok(())
 }
 
 fn run_update_chunk_with_retry(
-    dry: bool,
+    execution_mode: ExecutionMode,
     update_inputs: &[String],
     progress_bar: Option<&ProgressBar>,
 ) -> Result<()> {
     if update_inputs.is_empty() {
         return Ok(());
     }
-    match run_update_chunk(dry, update_inputs) {
+    match run_update_chunk(execution_mode, update_inputs) {
         Ok(()) => {
             if let Some(progress_bar) = progress_bar {
                 progress_bar.inc(update_inputs.len() as u64);
@@ -310,8 +311,8 @@ fn run_update_chunk_with_retry(
             );
             let mid = update_inputs.len() / 2;
             let (left, right) = update_inputs.split_at(mid);
-            run_update_chunk_with_retry(dry, left, progress_bar)?;
-            run_update_chunk_with_retry(dry, right, progress_bar)?;
+            run_update_chunk_with_retry(execution_mode, left, progress_bar)?;
+            run_update_chunk_with_retry(execution_mode, right, progress_bar)?;
             Ok(())
         }
         Err(e) => Err(e),
@@ -319,7 +320,7 @@ fn run_update_chunk_with_retry(
 }
 
 fn run_update_mutations(
-    dry: bool,
+    execution_mode: ExecutionMode,
     update_inputs: Vec<String>,
     label: &str,
     max_ops: usize,
@@ -349,7 +350,7 @@ fn run_update_mutations(
         chunk_update_inputs(&update_inputs, max_ops, max_chars)
     };
     for chunk in chunks {
-        if let Err(e) = run_update_chunk_with_retry(dry, &chunk, progress_bar.as_ref()) {
+        if let Err(e) = run_update_chunk_with_retry(execution_mode, &chunk, progress_bar.as_ref()) {
             if let Some(progress_bar) = &progress_bar {
                 progress_bar.finish_and_clear();
             }
@@ -401,7 +402,7 @@ fn build_from_groups_internal(
     prefix: &str,
     skipped_handles: &[String],
     no_pr: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
     mut groups: Vec<Group>,
@@ -410,6 +411,7 @@ fn build_from_groups_internal(
     branch_reuse_guard_days: u32,
     render_progress: bool,
 ) -> Result<UpdateExecutionData> {
+    let dry_run = execution_mode == ExecutionMode::DryRun;
     if groups.is_empty() {
         if skipped_handles.is_empty() {
             info!("No groups discovered; nothing to do.");
@@ -570,7 +572,7 @@ fn build_from_groups_internal(
                 }
                 if !base_updates_pre.is_empty() {
                     run_update_mutations(
-                        dry,
+                        execution_mode,
                         base_updates_pre,
                         "Updating PR bases",
                         MAX_BASE_UPDATES_PER_MUTATION,
@@ -606,11 +608,11 @@ fn build_from_groups_internal(
             );
             progress_bar.set_position(ff_refspecs.len() as u64);
             progress_bar.enable_steady_tick(Duration::from_millis(120));
-            let result = git_rw(dry, &args);
+            let result = git_rw(execution_mode, &args);
             progress_bar.finish_and_clear();
             result?;
         } else {
-            git_rw(dry, &args)?;
+            git_rw(execution_mode, &args)?;
         }
     }
 
@@ -656,11 +658,11 @@ fn build_from_groups_internal(
             );
             progress_bar.set_position(force_refspecs.len() as u64);
             progress_bar.enable_steady_tick(Duration::from_millis(120));
-            let result = git_rw(dry, &args);
+            let result = git_rw(execution_mode, &args);
             progress_bar.finish_and_clear();
             result?;
         } else {
-            git_rw(dry, &args)?;
+            git_rw(execution_mode, &args)?;
         }
     }
 
@@ -689,7 +691,7 @@ fn build_from_groups_internal(
         let branch = identity.exact.clone();
         if !no_pr {
             let was_known = prs_by_head.contains_key(&identity.conflict_key);
-            if dry && !was_known {
+            if dry_run && !was_known {
                 pr_actions_by_group[group_idx] = UpdatePrAction::Created;
                 created_without_number.insert(group_idx);
             } else {
@@ -698,7 +700,7 @@ fn build_from_groups_internal(
                     &sanitize_gh_base_ref(&parent_branch),
                     &group.pr_title()?,
                     &group.pr_body()?,
-                    dry,
+                    execution_mode,
                     &mut prs_by_head,
                 )?;
                 pr_numbers_by_group[group_idx] = Some(number);
@@ -766,7 +768,7 @@ fn build_from_groups_internal(
             .collect();
         let mut body_updates: Vec<String> = Vec::new();
         let mut base_updates: Vec<String> = Vec::new();
-        if dry && !created_without_number.is_empty() {
+        if dry_run && !created_without_number.is_empty() {
             for group_idx in group_index_by_number.values().copied() {
                 description_actions_by_group[group_idx] = UpdateEditAction::Updated;
             }
@@ -824,7 +826,7 @@ fn build_from_groups_internal(
         if !base_updates.is_empty() || !body_updates.is_empty() {
             if !base_updates.is_empty() {
                 run_update_mutations(
-                    dry,
+                    execution_mode,
                     base_updates,
                     "Updating PR bases",
                     MAX_BASE_UPDATES_PER_MUTATION,
@@ -835,7 +837,7 @@ fn build_from_groups_internal(
             }
             if !body_updates.is_empty() {
                 run_update_mutations(
-                    dry,
+                    execution_mode,
                     body_updates,
                     "Updating PR descriptions",
                     MAX_BODY_UPDATES_PER_MUTATION,
@@ -915,7 +917,7 @@ pub fn build_from_groups_with_summary(
     prefix: &str,
     skipped_handles: &[String],
     no_pr: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
     groups: Vec<Group>,
@@ -928,7 +930,7 @@ pub fn build_from_groups_with_summary(
         prefix,
         skipped_handles,
         no_pr,
-        dry,
+        execution_mode,
         pr_description_mode,
         limit,
         groups,
@@ -945,7 +947,7 @@ pub fn build_from_groups(
     prefix: &str,
     skipped_handles: &[String],
     no_pr: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
     groups: Vec<Group>,
@@ -958,7 +960,7 @@ pub fn build_from_groups(
         prefix,
         skipped_handles,
         no_pr,
-        dry,
+        execution_mode,
         pr_description_mode,
         limit,
         groups,
@@ -978,7 +980,7 @@ pub fn build_from_tags(
     prefix: &str,
     ignore_tag: &str,
     no_pr: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     pr_description_mode: PrDescriptionMode,
     limit: Option<Limit>,
     list_order: ListOrder,
@@ -992,7 +994,7 @@ pub fn build_from_tags(
         prefix,
         &skipped_handles,
         no_pr,
-        dry,
+        execution_mode,
         pr_description_mode,
         limit,
         groups,
@@ -1011,6 +1013,7 @@ mod tests {
     };
     use crate::branch_names::group_branch_identities;
     use crate::config::{ListOrder, PrDescriptionMode};
+    use crate::execution::ExecutionMode;
     use crate::github::TerminalPrState;
     use crate::parsing::{split_groups_for_update, Group};
     use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
@@ -1128,7 +1131,7 @@ mod tests {
             "dank-spr/",
             &skipped_handles,
             false,
-            false,
+            ExecutionMode::Apply,
             PrDescriptionMode::Overwrite,
             None,
             pushable_groups,
@@ -1161,7 +1164,7 @@ mod tests {
             "dank-spr/",
             "ignore",
             true,
-            true,
+            ExecutionMode::DryRun,
             PrDescriptionMode::Overwrite,
             None,
             ListOrder::RecentOnBottom,

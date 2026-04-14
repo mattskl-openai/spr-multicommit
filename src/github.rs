@@ -15,6 +15,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::info;
 
 use crate::branch_names::{canonical_branch_conflict_key, CanonicalBranchConflictKey};
+use crate::execution::ExecutionMode;
 use crate::git::{gh_ro, gh_rw, git_ro};
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1104,13 +1105,13 @@ pub fn list_open_pr_heads() -> Result<HashSet<String>> {
 /// Creates a new pull request for the given branch and parent if one does not already exist,
 /// and returns the PR number. If a PR for the branch already exists (as tracked in `prs_by_head`),
 /// returns its number without making any changes. The function updates the `prs_by_head` map as needed.
-/// If `dry` is true, no actual changes are made on GitHub.
+/// In [`ExecutionMode::DryRun`], no actual changes are made on GitHub.
 pub fn upsert_pr_cached(
     branch: &str,
     parent: &str,
     title: &str,
     body: &str,
-    dry: bool,
+    execution_mode: ExecutionMode,
     prs_by_head: &mut HashMap<CanonicalBranchConflictKey, u64>,
 ) -> Result<u64> {
     let branch_key = head_key(branch);
@@ -1122,7 +1123,7 @@ pub fn upsert_pr_cached(
     let (owner, name) = get_repo_owner_name()?;
     let path = format!("repos/{}/{}/pulls", owner, name);
     let created_number = gh_rw(
-        dry,
+        execution_mode,
         [
             "api",
             &path,
@@ -1142,7 +1143,7 @@ pub fn upsert_pr_cached(
         .as_slice(),
     )?;
     let mut num: u64 = created_number.trim().parse().unwrap_or(0);
-    if num == 0 && !dry {
+    if num == 0 && execution_mode == ExecutionMode::Apply {
         if let Some(existing) = get_resolved_open_pr_match(branch)? {
             num = existing.number;
         }
@@ -1155,7 +1156,11 @@ pub fn upsert_pr_cached(
 }
 
 /// Append a warning line to a specific PR body (idempotent). Returns Ok(()) whether updated or skipped.
-pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()> {
+pub fn append_warning_to_pr(
+    number: u64,
+    warning: &str,
+    execution_mode: ExecutionMode,
+) -> Result<()> {
     let bodies = fetch_pr_bodies_graphql(&[number])?;
     if let Some(info) = bodies.get(&number) {
         let body = info.body.clone();
@@ -1177,7 +1182,7 @@ pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()>
         ));
         m.push('}');
         gh_rw(
-            dry,
+            execution_mode,
             ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
         )?;
         info!("Appended warning to PR #{}", number);

@@ -1,6 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::execution::ExecutionMode;
+
 #[derive(Subcommand, Debug, Clone)]
 pub enum Extent {
     /// Update the first N PRs (bottom-up)
@@ -62,6 +64,23 @@ impl OutputArgs {
     }
 }
 
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct DryRunArgs {
+    /// Print state-changing commands instead of executing
+    #[arg(long = "dry-run", visible_alias = "dr")]
+    dry_run: bool,
+}
+
+impl From<DryRunArgs> for ExecutionMode {
+    fn from(args: DryRunArgs) -> Self {
+        if args.dry_run {
+            Self::DryRun
+        } else {
+            Self::Apply
+        }
+    }
+}
+
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub enum ListWhat {
     /// List PRs in the stack (halts early if live groups derive case-colliding synthetic branch names)
@@ -104,6 +123,9 @@ pub enum Cmd {
         allow_branch_reuse: bool,
 
         #[command(flatten)]
+        dry_run: DryRunArgs,
+
+        #[command(flatten)]
         output: OutputArgs,
 
         /// Limit how much to update (optional sub-mode)
@@ -129,6 +151,9 @@ pub enum Cmd {
         preview: bool,
 
         #[command(flatten)]
+        dry_run: DryRunArgs,
+
+        #[command(flatten)]
         output: OutputArgs,
     },
 
@@ -140,6 +165,9 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
+
+        #[command(flatten)]
+        dry_run: DryRunArgs,
 
         #[command(flatten)]
         output: OutputArgs,
@@ -155,12 +183,18 @@ pub enum Cmd {
         allow_replayed_duplicates: bool,
 
         #[command(flatten)]
+        dry_run: DryRunArgs,
+
+        #[command(flatten)]
         output: OutputArgs,
     },
 
     /// Prepare PRs for landing (e.g., squash) and halt early on case-colliding synthetic branch names
     Prep {
         // selection is provided via global --until/--exact flags
+        #[command(flatten)]
+        dry_run: DryRunArgs,
+
         #[command(flatten)]
         output: OutputArgs,
     },
@@ -217,12 +251,16 @@ pub enum Cmd {
         #[arg(long = "no-restack")]
         no_restack: bool,
         #[command(flatten)]
+        dry_run: DryRunArgs,
+        #[command(flatten)]
         output: OutputArgs,
     },
 
     /// Relink PR stack to match local commit stack and halt early on case-colliding synthetic branch names
     RelinkPrs {
-        // dry-run is provided via global --dry-run
+        #[command(flatten)]
+        dry_run: DryRunArgs,
+
         #[command(flatten)]
         output: OutputArgs,
     },
@@ -230,7 +268,9 @@ pub enum Cmd {
     /// Delete remote branches with the configured prefix whose PRs are all closed
     #[command(alias = "clean")]
     Cleanup {
-        // dry-run is provided via global --dry-run
+        #[command(flatten)]
+        dry_run: DryRunArgs,
+
         #[command(flatten)]
         output: OutputArgs,
     },
@@ -247,6 +287,8 @@ pub enum Cmd {
         #[arg(long)]
         safe: bool,
         #[command(flatten)]
+        dry_run: DryRunArgs,
+        #[command(flatten)]
         output: OutputArgs,
     },
 
@@ -261,6 +303,8 @@ pub enum Cmd {
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
         safe: bool,
+        #[command(flatten)]
+        dry_run: DryRunArgs,
         #[command(flatten)]
         output: OutputArgs,
     },
@@ -277,9 +321,9 @@ impl Cmd {
             | Self::Land { output, .. }
             | Self::FixPr { output, .. }
             | Self::Status { output, .. }
-            | Self::Prep { output }
-            | Self::RelinkPrs { output }
-            | Self::Cleanup { output }
+            | Self::Prep { output, .. }
+            | Self::RelinkPrs { output, .. }
+            | Self::Cleanup { output, .. }
             | Self::Move { output, .. } => output.format(),
             Self::List { output, .. } => output.format(),
             Self::Update { output, .. } => output.format(),
@@ -314,9 +358,6 @@ pub struct Cli {
     /// Global branch prefix for per-PR branches
     #[arg(long, global = true)]
     pub prefix: Option<String>,
-    /// Global dry-run flag (applies to all subcommands)
-    #[arg(long, global = true, visible_alias = "dr")]
-    pub dry_run: bool,
     /// Global until (used by prep/land). Accepts 0, a local PR number, or a stable handle
     #[arg(long, global = true, value_name = "N|0|label|pr:<label>")]
     pub until: Option<crate::selectors::InclusiveSelector>,
@@ -330,6 +371,7 @@ pub struct Cli {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Cmd, OutputFormat};
+    use crate::execution::ExecutionMode;
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
 
@@ -340,7 +382,7 @@ mod tests {
         match cli.cmd {
             Cmd::Absorb {
                 allow_replayed_duplicates,
-                output: _,
+                ..
             } => assert!(allow_replayed_duplicates),
             other => panic!("unexpected command: {:?}", other),
         }
@@ -440,15 +482,55 @@ mod tests {
                 after,
                 safe,
                 preview,
+                dry_run,
                 output,
             } => {
                 assert_eq!(after.to_string(), "pr:alpha");
                 assert!(safe);
                 assert!(preview);
+                assert_eq!(ExecutionMode::from(dry_run), ExecutionMode::Apply);
                 assert_eq!(output.format(), OutputFormat::Json);
             }
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn update_dry_run_flag_parses_after_command() {
+        let cli = Cli::try_parse_from(["spr", "update", "--dry-run"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Update { dry_run, .. } => {
+                assert_eq!(ExecutionMode::from(dry_run), ExecutionMode::DryRun);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_dry_run_alias_parses_after_command() {
+        let cli = Cli::try_parse_from(["spr", "update", "--dr"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Update { dry_run, .. } => {
+                assert_eq!(ExecutionMode::from(dry_run), ExecutionMode::DryRun);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn status_dry_run_flag_is_rejected() {
+        let err = Cli::try_parse_from(["spr", "status", "--dry-run"]).unwrap_err();
+
+        assert!(err.to_string().contains("--dry-run"));
+    }
+
+    #[test]
+    fn global_dry_run_flag_before_command_is_rejected() {
+        let err = Cli::try_parse_from(["spr", "--dry-run", "update"]).unwrap_err();
+
+        assert!(err.to_string().contains("--dry-run"));
     }
 
     #[test]
@@ -532,6 +614,26 @@ mod tests {
         assert!(update
             .get_arguments()
             .any(|argument| argument.get_long() == Some("json")));
+    }
+
+    #[test]
+    fn update_help_includes_dry_run_flag() {
+        let mut cli = Cli::command();
+        let update = cli.find_subcommand_mut("update").unwrap();
+
+        assert!(update
+            .get_arguments()
+            .any(|argument| argument.get_long() == Some("dry-run")));
+    }
+
+    #[test]
+    fn status_help_does_not_include_dry_run_flag() {
+        let mut cli = Cli::command();
+        let status = cli.find_subcommand_mut("status").unwrap();
+
+        assert!(!status
+            .get_arguments()
+            .any(|argument| argument.get_long() == Some("dry-run")));
     }
 
     #[test]

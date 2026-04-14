@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use crate::commands::common::{
     self, CherryPickEmptyPolicy, CherryPickOp, DeferredDirtyWorktreeRestore, DirtyWorktreeOutcome,
 };
+use crate::execution::ExecutionMode;
 use crate::git::{git_common_dir, git_rev_list_range, git_ro, git_rw, repo_root};
 
 const REWRITE_RESUME_SCHEMA_VERSION: u32 = 1;
@@ -131,7 +132,7 @@ pub fn current_repo_root() -> Result<String> {
 }
 
 pub fn prepare_resume_path_for_new_session(
-    dry: bool,
+    execution_mode: ExecutionMode,
     command_kind: RewriteCommandKind,
     original_branch: &str,
     original_head: &str,
@@ -163,7 +164,7 @@ pub fn prepare_resume_path_for_new_session(
         );
     }
 
-    if dry {
+    if execution_mode == ExecutionMode::DryRun {
         bail!(
             "stale resume file {} exists for {}, but `--dry-run` will not remove it; delete the file or rerun without `--dry-run`",
             resume_path.display(),
@@ -176,11 +177,14 @@ pub fn prepare_resume_path_for_new_session(
         resume_path.display(),
         existing_state.temp_worktree_path
     );
-    remove_resume_file_if_exists(false, &resume_path)?;
+    remove_resume_file_if_exists(ExecutionMode::Apply, &resume_path)?;
     Ok(resume_path)
 }
 
-pub fn run_rewrite_session(dry: bool, session: RewriteSession) -> Result<RewriteCommandOutcome> {
+pub fn run_rewrite_session(
+    execution_mode: ExecutionMode,
+    session: RewriteSession,
+) -> Result<RewriteCommandOutcome> {
     let git_common_dir = git_common_dir()?;
     let state = RewriteResumeState {
         schema_version: REWRITE_RESUME_SCHEMA_VERSION,
@@ -203,7 +207,7 @@ pub fn run_rewrite_session(dry: bool, session: RewriteSession) -> Result<Rewrite
         metadata_refresh_context: session.metadata_refresh_context,
     };
     continue_rewrite_operations(
-        dry,
+        execution_mode,
         state,
         session.conflict_policy,
         &session.resume_path,
@@ -212,11 +216,7 @@ pub fn run_rewrite_session(dry: bool, session: RewriteSession) -> Result<Rewrite
     )
 }
 
-pub fn resume_rewrite(dry: bool, path: &Path) -> Result<RewriteCommandOutcome> {
-    if dry {
-        bail!("`spr resume` does not support `--dry-run`");
-    }
-
+pub fn resume_rewrite(path: &Path) -> Result<RewriteCommandOutcome> {
     let resume_path = absolute_path(path)?;
     let state = read_resume_state(&resume_path)?;
     validate_resume_state_against_current_repo(&resume_path, &state)?;
@@ -232,7 +232,7 @@ pub fn resume_rewrite(dry: bool, path: &Path) -> Result<RewriteCommandOutcome> {
         }
         ensure_no_unmerged_paths(&state.temp_worktree_path)?;
         let continue_result = git_rw(
-            false,
+            ExecutionMode::Apply,
             [
                 "-C",
                 state.temp_worktree_path.as_str(),
@@ -257,7 +257,7 @@ pub fn resume_rewrite(dry: bool, path: &Path) -> Result<RewriteCommandOutcome> {
                     state.temp_worktree_path
                 );
                 let skip_result = git_rw(
-                    false,
+                    ExecutionMode::Apply,
                     [
                         "-C",
                         state.temp_worktree_path.as_str(),
@@ -299,7 +299,7 @@ pub fn resume_rewrite(dry: bool, path: &Path) -> Result<RewriteCommandOutcome> {
 
     let remaining_operations = state.remaining_operations.clone();
     continue_rewrite_operations(
-        false,
+        ExecutionMode::Apply,
         state,
         RewriteConflictPolicy::Suspend,
         &resume_path,
@@ -309,7 +309,7 @@ pub fn resume_rewrite(dry: bool, path: &Path) -> Result<RewriteCommandOutcome> {
 }
 
 fn continue_rewrite_operations(
-    dry: bool,
+    execution_mode: ExecutionMode,
     mut state: RewriteResumeState,
     conflict_policy: RewriteConflictPolicy,
     resume_path: &Path,
@@ -317,7 +317,7 @@ fn continue_rewrite_operations(
     restore_dirty_worktree_on_success: bool,
 ) -> Result<RewriteCommandOutcome> {
     for (op_index, op) in operations.iter().enumerate() {
-        if let Err(err) = run_cherry_pick_op(dry, &state.temp_worktree_path, op) {
+        if let Err(err) = run_cherry_pick_op(execution_mode, &state.temp_worktree_path, op) {
             let conflict = cherry_pick_head_exists(&state.temp_worktree_path);
             if conflict && conflict_policy == RewriteConflictPolicy::Suspend {
                 state.paused_head = head_at(&state.temp_worktree_path)?;
@@ -336,9 +336,13 @@ fn continue_rewrite_operations(
             }
 
             if conflict {
-                abort_cherry_pick_best_effort(dry, &state.temp_worktree_path);
+                abort_cherry_pick_best_effort(execution_mode, &state.temp_worktree_path);
             }
-            cleanup_temp_state_best_effort(dry, &state.temp_worktree_path, &state.temp_branch);
+            cleanup_temp_state_best_effort(
+                execution_mode,
+                &state.temp_worktree_path,
+                &state.temp_branch,
+            );
             return Err(err).with_context(|| {
                 format!(
                     "{} failed; temp rewrite state was cleaned up",
@@ -348,11 +352,16 @@ fn continue_rewrite_operations(
         }
     }
 
-    finish_rewrite(dry, state, resume_path, restore_dirty_worktree_on_success)
+    finish_rewrite(
+        execution_mode,
+        state,
+        resume_path,
+        restore_dirty_worktree_on_success,
+    )
 }
 
 fn finish_rewrite(
-    dry: bool,
+    execution_mode: ExecutionMode,
     state: RewriteResumeState,
     resume_path: &Path,
     restore_dirty_worktree_on_success: bool,
@@ -364,7 +373,7 @@ fn finish_rewrite(
         state.original_branch, state.original_worktree_root, new_tip
     );
     let _ = git_rw(
-        dry,
+        execution_mode,
         [
             "-C",
             state.original_worktree_root.as_str(),
@@ -374,7 +383,7 @@ fn finish_rewrite(
         ]
         .as_slice(),
     )?;
-    let metadata_refresh_result = if dry {
+    let metadata_refresh_result = if execution_mode == ExecutionMode::DryRun {
         Ok(())
     } else if let Some(metadata_refresh_context) = &state.metadata_refresh_context {
         crate::stack_metadata::refresh_metadata_for_branch(
@@ -391,15 +400,19 @@ fn finish_rewrite(
             .deferred_dirty_worktree_restore
             .clone()
             .restore_after_success(
-                dry,
+                execution_mode,
                 state.command_kind.command_name(),
                 &state.original_worktree_root,
             )
     } else {
         Ok(())
     };
-    cleanup_temp_state_best_effort(dry, &state.temp_worktree_path, &state.temp_branch);
-    remove_resume_file_if_exists(dry, resume_path)?;
+    cleanup_temp_state_best_effort(
+        execution_mode,
+        &state.temp_worktree_path,
+        &state.temp_branch,
+    );
+    remove_resume_file_if_exists(execution_mode, resume_path)?;
     if let Some(post_success_hint) = &state.post_success_hint {
         info!("{post_success_hint}");
     }
@@ -479,16 +492,20 @@ struct CommitIdentity {
     author_date: String,
 }
 
-fn run_cherry_pick_op(dry: bool, tmp_path: &str, op: &CherryPickOp) -> Result<()> {
+fn run_cherry_pick_op(
+    execution_mode: ExecutionMode,
+    tmp_path: &str,
+    op: &CherryPickOp,
+) -> Result<()> {
     match op {
         CherryPickOp::Commit { sha, empty_policy } => {
-            common::cherry_pick_commit(dry, tmp_path, sha, *empty_policy)
+            common::cherry_pick_commit(execution_mode, tmp_path, sha, *empty_policy)
         }
         CherryPickOp::Range {
             first,
             last,
             empty_policy,
-        } => common::cherry_pick_range(dry, tmp_path, first, last, *empty_policy),
+        } => common::cherry_pick_range(execution_mode, tmp_path, first, last, *empty_policy),
     }
 }
 
@@ -712,14 +729,17 @@ fn git_dir_at(tmp_path: &str) -> Result<PathBuf> {
     }
 }
 
-fn abort_cherry_pick_best_effort(dry: bool, tmp_path: &str) {
-    if let Err(err) = git_rw(dry, ["-C", tmp_path, "cherry-pick", "--abort"].as_slice()) {
+fn abort_cherry_pick_best_effort(execution_mode: ExecutionMode, tmp_path: &str) {
+    if let Err(err) = git_rw(
+        execution_mode,
+        ["-C", tmp_path, "cherry-pick", "--abort"].as_slice(),
+    ) {
         warn!("Failed to abort cherry-pick in {}: {}", tmp_path, err);
     }
 }
 
-fn cleanup_temp_state_best_effort(dry: bool, tmp_path: &str, tmp_branch: &str) {
-    if let Err(err) = common::cleanup_temp_worktree(dry, tmp_path, tmp_branch) {
+fn cleanup_temp_state_best_effort(execution_mode: ExecutionMode, tmp_path: &str, tmp_branch: &str) {
+    if let Err(err) = common::cleanup_temp_worktree(execution_mode, tmp_path, tmp_branch) {
         warn!(
             "Failed to clean up temp rewrite state ({} / {}): {}",
             tmp_path, tmp_branch, err
@@ -872,8 +892,8 @@ fn short_head(head: &str) -> &str {
     &head[..limit]
 }
 
-fn remove_resume_file_if_exists(dry: bool, path: &Path) -> Result<()> {
-    if dry {
+fn remove_resume_file_if_exists(execution_mode: ExecutionMode, path: &Path) -> Result<()> {
+    if execution_mode == ExecutionMode::DryRun {
         Ok(())
     } else if path.exists() {
         fs::remove_file(path)
@@ -1044,6 +1064,7 @@ mod tests {
     use crate::commands::common::{
         CherryPickEmptyPolicy, CherryPickOp, DeferredDirtyWorktreeRestore,
     };
+    use crate::execution::ExecutionMode;
     use crate::test_support::{lock_cwd, DirGuard};
 
     fn git(repo: &Path, args: &[&str]) -> String {
@@ -1126,11 +1147,15 @@ mod tests {
         let short = git(&repo, ["rev-parse", "--short", "HEAD"].as_slice())
             .trim()
             .to_string();
-        let (tmp_path, tmp_branch) =
-            crate::commands::common::create_temp_worktree(false, "restack", &base_head, &short)
-                .expect("create temp worktree");
+        let (tmp_path, tmp_branch) = crate::commands::common::create_temp_worktree(
+            ExecutionMode::Apply,
+            "restack",
+            &base_head,
+            &short,
+        )
+        .expect("create temp worktree");
         let resume_path = prepare_resume_path_for_new_session(
-            false,
+            ExecutionMode::Apply,
             RewriteCommandKind::Restack,
             "stack",
             &original_head,
@@ -1156,7 +1181,8 @@ mod tests {
             metadata_refresh_context: None,
         };
 
-        let outcome = run_rewrite_session(false, session).expect("run rewrite session");
+        let outcome =
+            run_rewrite_session(ExecutionMode::Apply, session).expect("run rewrite session");
         let resume_path = match outcome {
             RewriteCommandOutcome::Completed => panic!("expected suspended rewrite"),
             RewriteCommandOutcome::Suspended(state) => state.resume_path.clone(),
@@ -1182,11 +1208,15 @@ mod tests {
         let short = git(&repo, ["rev-parse", "--short", "HEAD"].as_slice())
             .trim()
             .to_string();
-        let (tmp_path, tmp_branch) =
-            crate::commands::common::create_temp_worktree(false, "restack", &base_head, &short)
-                .expect("create temp worktree");
+        let (tmp_path, tmp_branch) = crate::commands::common::create_temp_worktree(
+            ExecutionMode::Apply,
+            "restack",
+            &base_head,
+            &short,
+        )
+        .expect("create temp worktree");
         let resume_path = prepare_resume_path_for_new_session(
-            false,
+            ExecutionMode::Apply,
             RewriteCommandKind::Restack,
             "stack",
             &original_head,
@@ -1194,7 +1224,7 @@ mod tests {
         .expect("prepare resume path");
 
         let outcome = run_rewrite_session(
-            false,
+            ExecutionMode::Apply,
             RewriteSession {
                 command_kind: RewriteCommandKind::Restack,
                 conflict_policy: RewriteConflictPolicy::Suspend,
@@ -1259,11 +1289,15 @@ mod tests {
         let short = git(&repo, ["rev-parse", "--short", "HEAD"].as_slice())
             .trim()
             .to_string();
-        let (tmp_path, tmp_branch) =
-            crate::commands::common::create_temp_worktree(false, "restack", &base_head, &short)
-                .expect("create temp worktree");
+        let (tmp_path, tmp_branch) = crate::commands::common::create_temp_worktree(
+            ExecutionMode::Apply,
+            "restack",
+            &base_head,
+            &short,
+        )
+        .expect("create temp worktree");
         let resume_path = prepare_resume_path_for_new_session(
-            false,
+            ExecutionMode::Apply,
             RewriteCommandKind::Restack,
             "stack",
             &original_head,
@@ -1271,7 +1305,7 @@ mod tests {
         .expect("prepare resume path");
 
         let outcome = run_rewrite_session(
-            false,
+            ExecutionMode::Apply,
             RewriteSession {
                 command_kind: RewriteCommandKind::Restack,
                 conflict_policy: RewriteConflictPolicy::Suspend,
@@ -1358,7 +1392,7 @@ mod tests {
             "base-updated\nstack-change\n",
         );
 
-        let outcome = resume_rewrite(false, &resume_path).expect("resume rewrite");
+        let outcome = resume_rewrite(&resume_path).expect("resume rewrite");
         assert_eq!(outcome, RewriteCommandOutcome::Completed);
         assert!(
             !resume_path.exists(),
@@ -1388,7 +1422,7 @@ mod tests {
             "manual continue should finish only the paused commit before spr resume relaunches the suffix"
         );
 
-        let outcome = resume_rewrite(false, &resume_path).expect("resume after manual continue");
+        let outcome = resume_rewrite(&resume_path).expect("resume after manual continue");
         assert_eq!(outcome, RewriteCommandOutcome::Completed);
         assert!(
             !resume_path.exists(),
@@ -1427,7 +1461,7 @@ mod tests {
             "manual unrelated commit",
         );
 
-        let err = resume_rewrite(false, &resume_path)
+        let err = resume_rewrite(&resume_path)
             .expect_err("unrelated one-commit manual history should fail");
         let err_text = format!("{err:#}");
         assert!(
@@ -1444,7 +1478,7 @@ mod tests {
         let _keep_dir_alive = dir.path();
         let wrong_repo = init_conflict_repo();
         let _guard = DirGuard::change_to(wrong_repo.path());
-        let err = resume_rewrite(false, &resume_path).expect_err("wrong repo should fail");
+        let err = resume_rewrite(&resume_path).expect_err("wrong repo should fail");
         let err_text = format!("{err:#}");
         assert!(
             err_text.contains("belongs to git-common-dir"),
@@ -1460,7 +1494,7 @@ mod tests {
         let _keep_dir_alive = dir.path();
         let _guard = DirGuard::change_to(&repo);
 
-        let err = resume_rewrite(false, &resume_path).expect_err("unresolved conflict should fail");
+        let err = resume_rewrite(&resume_path).expect_err("unresolved conflict should fail");
         let err_text = format!("{err:#}");
         assert!(
             err_text.contains("still has unresolved conflicts"),
@@ -1485,7 +1519,7 @@ mod tests {
         )
         .expect("overwrite resume state");
 
-        let err = resume_rewrite(false, &resume_path).expect_err("unknown schema should fail");
+        let err = resume_rewrite(&resume_path).expect_err("unknown schema should fail");
         let err_text = format!("{err:#}");
         assert!(
             err_text.contains("schema version"),
@@ -1513,7 +1547,7 @@ mod tests {
             "feat: unsupported manual edit",
         );
 
-        let err = resume_rewrite(false, &resume_path).expect_err("extra manual commit should fail");
+        let err = resume_rewrite(&resume_path).expect_err("extra manual commit should fail");
         let err_text = format!("{err:#}");
         assert!(
             err_text.contains("only one accidental manual continue is supported"),
@@ -1537,7 +1571,7 @@ mod tests {
             "base-updated\nstack-1\n",
         );
 
-        let resumed = resume_rewrite(false, &resume_path).expect("resume into second conflict");
+        let resumed = resume_rewrite(&resume_path).expect("resume into second conflict");
         let second_resume_path = match resumed {
             RewriteCommandOutcome::Completed => panic!("expected second suspension"),
             RewriteCommandOutcome::Suspended(state) => state.resume_path.clone(),
@@ -1576,7 +1610,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&resume_path).expect("read resume state"))
                 .expect("parse resume state");
         let err = prepare_resume_path_for_new_session(
-            false,
+            ExecutionMode::Apply,
             RewriteCommandKind::Restack,
             &resume_state.original_branch,
             &resume_state.original_head,

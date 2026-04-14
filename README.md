@@ -141,7 +141,6 @@ Global flags
 - `--cd <PATH>`: change to `PATH` before loading repo config or running git/gh commands
 - `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
-- `--dry-run` (alias: `--dr`): print state-changing commands instead of executing
 - `--until <N|0|label|pr:<label>>`: target range used by `prep` and `land` (`0` means all)
 - `--exact <I|label|pr:<label>>`: used by `prep` to select exactly one PR group
 - `--verbose`: enable verbose logging of underlying git/gh commands
@@ -672,6 +671,8 @@ Behavior:
 Dry run behavior
 ----------------
 
+- `--dry-run` (alias: `--dr`) is a command-local option accepted only by commands that can change
+  local or remote state. Read-only commands such as `status`, `list`, and `resolve-stack` reject it.
 - `--dry-run` prints most state-changing `git`/`gh` commands instead of executing
 - For safety, some local operations may still execute in temporary worktrees to better mirror behavior
 - In dry-run, set `--assume-existing-prs` with `spr update` to show `gh pr edit` instead of `gh pr create`

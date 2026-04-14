@@ -14,6 +14,7 @@ use crate::commands::common::{self, DirtyWorktreeOutcome, NativeRebaseOutcome};
 use crate::commands::restack_after_count;
 use crate::commands::rewrite_resume::RewriteCommandOutcome;
 use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
+use crate::execution::ExecutionMode;
 use crate::git::{git_is_ancestor, git_rw};
 use crate::github::{
     fetch_merged_pr_merge_commit_oids, list_open_or_merged_prs_for_heads, PrInfoWithState, PrState,
@@ -157,14 +158,14 @@ fn verify_merge_commits_are_in_base(plan: &DropMergedPrefixPlan, base: &str) -> 
     Ok(())
 }
 
-fn log_drop_plan(plan: &DropMergedPrefixPlan, dry: bool, base: &str) {
+fn log_drop_plan(plan: &DropMergedPrefixPlan, execution_mode: ExecutionMode, base: &str) {
     let handles = plan
         .dropped
         .iter()
         .map(|candidate| format!("pr:{} (#{})", candidate.tag, candidate.pr_number))
         .collect::<Vec<_>>()
         .join(", ");
-    let mode = if dry {
+    let mode = if execution_mode == ExecutionMode::DryRun {
         "DRY-RUN: would drop"
     } else {
         "Dropping"
@@ -176,13 +177,17 @@ fn log_drop_plan(plan: &DropMergedPrefixPlan, dry: bool, base: &str) {
 }
 
 fn run_native_rebase(
-    dry: bool,
+    execution_mode: ExecutionMode,
     base: &str,
     boundary_commit: &str,
     cur_branch: &str,
 ) -> Result<FastLocalRewriteOutcome> {
     let args = ["rebase", "--onto", base, boundary_commit, cur_branch];
-    match common::run_native_rebase_with_abort(dry, args.as_slice(), "native drop-merged-prefix")? {
+    match common::run_native_rebase_with_abort(
+        execution_mode,
+        args.as_slice(),
+        "native drop-merged-prefix",
+    )? {
         NativeRebaseOutcome::Completed => Ok(FastLocalRewriteOutcome::Completed),
         NativeRebaseOutcome::Aborted => {
             warn!(
@@ -197,25 +202,30 @@ fn execute_fast_local_rewrite(
     metadata_context: &RefreshMetadataContext,
     plan: &DropMergedPrefixPlan,
     safe: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     dirty_worktree_policy: DirtyWorktreePolicy,
 ) -> Result<FastLocalRewriteOutcome> {
     common::with_dirty_worktree_policy(
-        dry,
+        execution_mode,
         "spr drop-merged-prefix",
         dirty_worktree_policy,
         |_deferred_dirty_worktree_restore| {
             let (cur_branch, short) = common::get_current_branch_and_short()?;
             if safe {
-                let _ = common::create_backup_tag(dry, "drop-merged-prefix", &cur_branch, &short)?;
+                let _ = common::create_backup_tag(
+                    execution_mode,
+                    "drop-merged-prefix",
+                    &cur_branch,
+                    &short,
+                )?;
             }
             let outcome = match plan.strategy {
                 DropMergedRewriteStrategy::FastResetAll => {
-                    common::reset_current_branch_to(dry, &metadata_context.base)?;
+                    common::reset_current_branch_to(execution_mode, &metadata_context.base)?;
                     FastLocalRewriteOutcome::Completed
                 }
                 DropMergedRewriteStrategy::FastRebase => run_native_rebase(
-                    dry,
+                    execution_mode,
                     &metadata_context.base,
                     &plan.boundary_commit,
                     &cur_branch,
@@ -224,7 +234,9 @@ fn execute_fast_local_rewrite(
                     unreachable!("restack fallback is executed outside the fast-rewrite path")
                 }
             };
-            if outcome == FastLocalRewriteOutcome::Completed && !dry {
+            if outcome == FastLocalRewriteOutcome::Completed
+                && execution_mode == ExecutionMode::Apply
+            {
                 crate::stack_metadata::refresh_metadata_for_current_checkout(
                     &metadata_context.base,
                     &metadata_context.prefix,
@@ -239,11 +251,11 @@ fn execute_fast_local_rewrite(
 pub fn drop_merged_prefix(
     metadata_context: &RefreshMetadataContext,
     safe: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     restack_conflict_policy: RestackConflictPolicy,
     dirty_worktree_policy: DirtyWorktreePolicy,
 ) -> Result<RewriteCommandOutcome> {
-    git_rw(dry, ["fetch", "origin"].as_slice())?;
+    git_rw(execution_mode, ["fetch", "origin"].as_slice())?;
 
     let (_merge_base, leading_ignored, groups) =
         derive_local_groups_with_ignored(&metadata_context.base, &metadata_context.ignore_tag)?;
@@ -271,19 +283,25 @@ pub fn drop_merged_prefix(
         &merge_commit_oids_by_pr_number,
     )?;
     verify_merge_commits_are_in_base(&plan, &metadata_context.base)?;
-    log_drop_plan(&plan, dry, &metadata_context.base);
+    log_drop_plan(&plan, execution_mode, &metadata_context.base);
 
     let fast_outcome = if plan.strategy == DropMergedRewriteStrategy::RestackFallback {
         FastLocalRewriteOutcome::FallbackRequired
     } else {
-        execute_fast_local_rewrite(metadata_context, &plan, safe, dry, dirty_worktree_policy)?
+        execute_fast_local_rewrite(
+            metadata_context,
+            &plan,
+            safe,
+            execution_mode,
+            dirty_worktree_policy,
+        )?
     };
     if fast_outcome == FastLocalRewriteOutcome::FallbackRequired {
         restack_after_count(
             metadata_context,
             plan.dropped.len(),
             safe,
-            dry,
+            execution_mode,
             restack_conflict_policy,
             dirty_worktree_policy,
         )
@@ -304,6 +322,7 @@ mod tests {
     };
     use crate::commands::RewriteCommandOutcome;
     use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
+    use crate::execution::ExecutionMode;
     use crate::github::{PrInfoWithState, PrState};
     use crate::parsing::Group;
     use crate::stack_metadata::RefreshMetadataContext;
@@ -601,7 +620,7 @@ mod tests {
                 ignore_tag: "ignore".to_string(),
             },
             true,
-            false,
+            ExecutionMode::Apply,
             RestackConflictPolicy::Halt,
             DirtyWorktreePolicy::Halt,
         )

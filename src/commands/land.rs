@@ -4,6 +4,7 @@ use tracing::warn;
 
 use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
 use crate::cli::LandCmd;
+use crate::execution::ExecutionMode;
 use crate::git::{gh_rw, git_ro, git_rw, sanitize_gh_base_ref, to_remote_ref};
 use crate::github::{
     fetch_pr_bodies_graphql, fetch_pr_ci_review_status, graphql_escape, list_open_prs_for_heads,
@@ -50,7 +51,7 @@ pub fn land_until(
     prefix: &str,
     ignore_tag: &str,
     until: &InclusiveSelector,
-    dry: bool,
+    execution_mode: ExecutionMode,
     mode: LandCmd,
     bypass_safety: bool,
 ) -> Result<usize> {
@@ -132,7 +133,7 @@ pub fn land_until(
 
     if let LandCmd::PerPr = mode {
         // Verify each has exactly one unique commit over its parent
-        git_rw(dry, ["fetch", "origin"].as_slice())?; // ensure remotes up to date
+        git_rw(execution_mode, ["fetch", "origin"].as_slice())?; // ensure remotes up to date
         let mut offenders: Vec<u64> = vec![];
         for (i, pr) in segment.iter().enumerate() {
             let parent = if i == 0 {
@@ -232,7 +233,7 @@ pub fn land_until(
         take_n - 1
     );
     gh_rw(
-        dry,
+        execution_mode,
         ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
     )?;
 
@@ -246,7 +247,7 @@ pub fn land_per_pr_until(
     prefix: &str,
     ignore_tag: &str,
     until: &InclusiveSelector,
-    dry: bool,
+    execution_mode: ExecutionMode,
     bypass_safety: bool,
 ) -> Result<usize> {
     land_until(
@@ -254,7 +255,7 @@ pub fn land_per_pr_until(
         prefix,
         ignore_tag,
         until,
-        dry,
+        execution_mode,
         LandCmd::PerPr,
         bypass_safety,
     )
@@ -266,7 +267,7 @@ pub fn land_flatten_until(
     prefix: &str,
     ignore_tag: &str,
     until: &InclusiveSelector,
-    dry: bool,
+    execution_mode: ExecutionMode,
     bypass_safety: bool,
 ) -> Result<usize> {
     land_until(
@@ -274,7 +275,7 @@ pub fn land_flatten_until(
         prefix,
         ignore_tag,
         until,
-        dry,
+        execution_mode,
         LandCmd::Flatten,
         bypass_safety,
     )
@@ -284,6 +285,7 @@ pub fn land_flatten_until(
 mod tests {
     use super::{land_until, resolve_land_take_count, resolve_landed_pr_segment};
     use crate::cli::LandCmd;
+    use crate::execution::ExecutionMode;
     use crate::github::PrInfo;
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
@@ -384,7 +386,7 @@ mod tests {
             "dank-spr/",
             "ignore",
             &InclusiveSelector::All,
-            true,
+            ExecutionMode::DryRun,
             LandCmd::Flatten,
             false,
         )

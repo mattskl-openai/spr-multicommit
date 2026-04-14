@@ -20,6 +20,7 @@ use crate::commands::rewrite_resume::{
     self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
 };
 use crate::config::DirtyWorktreePolicy;
+use crate::execution::ExecutionMode;
 use crate::git::{
     git_commit_message, git_commit_parent_count, git_commit_tree, git_is_ancestor,
     git_local_branch_tip, git_merge_base, git_patch_ids_for_commits, git_rev_list_range,
@@ -46,7 +47,7 @@ pub fn absorb_branch_tails(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
-    dry: bool,
+    execution_mode: ExecutionMode,
     dirty_worktree_policy: DirtyWorktreePolicy,
     options: AbsorbOptions,
 ) -> Result<RewriteCommandOutcome> {
@@ -68,9 +69,14 @@ pub fn absorb_branch_tails(
             info!("No absorbable branch tails found; nothing to rewrite.");
             Ok(RewriteCommandOutcome::Completed)
         }
-        AbsorbPlanValidation::ReadyToRewrite => {
-            execute_absorb_plan(base, prefix, ignore_tag, &plan, dry, dirty_worktree_policy)
-        }
+        AbsorbPlanValidation::ReadyToRewrite => execute_absorb_plan(
+            base,
+            prefix,
+            ignore_tag,
+            &plan,
+            execution_mode,
+            dirty_worktree_policy,
+        ),
     }
 }
 
@@ -941,16 +947,16 @@ fn execute_absorb_plan(
     prefix: &str,
     ignore_tag: &str,
     plan: &RewritePlan,
-    dry: bool,
+    execution_mode: ExecutionMode,
     dirty_worktree_policy: DirtyWorktreePolicy,
 ) -> Result<RewriteCommandOutcome> {
     emit_rewrite_plan(plan);
     common::with_dirty_worktree_policy(
-        dry,
+        execution_mode,
         "spr absorb",
         dirty_worktree_policy,
         |deferred_dirty_worktree_restore| {
-            if dry {
+            if execution_mode == ExecutionMode::DryRun {
                 info!("Dry run complete. No local git state or GitHub state was changed.");
                 info!("Run `spr absorb` without `--dry-run` to apply the rewrite.");
                 info!("After inspecting the rewritten stack, run `spr update`.");
@@ -960,41 +966,44 @@ fn execute_absorb_plan(
                 let original_head = git_rev_parse("HEAD")?;
                 let original_worktree_root = rewrite_resume::current_repo_root()?;
                 let resume_path = rewrite_resume::prepare_resume_path_for_new_session(
-                    dry,
+                    execution_mode,
                     RewriteCommandKind::Absorb,
                     &cur_branch,
                     &original_head,
                 )?;
-                let backup_tag = common::create_backup_tag(dry, "absorb", &cur_branch, &short)?;
-                let (tmp_path, tmp_branch) =
-                    common::create_temp_worktree(dry, "absorb", &plan.merge_base, &short)?;
+                let backup_tag =
+                    common::create_backup_tag(execution_mode, "absorb", &cur_branch, &short)?;
+                let (tmp_path, tmp_branch) = common::create_temp_worktree(
+                    execution_mode,
+                    "absorb",
+                    &plan.merge_base,
+                    &short,
+                )?;
                 rewrite_resume::run_rewrite_session(
-                dry,
-                RewriteSession {
-                    command_kind: RewriteCommandKind::Absorb,
-                    conflict_policy: RewriteConflictPolicy::Suspend,
-                    original_worktree_root,
-                    original_branch: cur_branch,
-                    original_head,
-                    resume_path,
-                    temp_branch: tmp_branch,
-                    temp_worktree_path: tmp_path,
-                    backup_tag: Some(backup_tag),
-                    operations: plan.operations.clone(),
-                    deferred_dirty_worktree_restore,
-                    post_success_hint: Some(
-                        "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
-                            .to_string(),
-                    ),
-                    metadata_refresh_context: Some(
-                        crate::stack_metadata::RefreshMetadataContext {
+                    execution_mode,
+                    RewriteSession {
+                        command_kind: RewriteCommandKind::Absorb,
+                        conflict_policy: RewriteConflictPolicy::Suspend,
+                        original_worktree_root,
+                        original_branch: cur_branch,
+                        original_head,
+                        resume_path,
+                        temp_branch: tmp_branch,
+                        temp_worktree_path: tmp_path,
+                        backup_tag: Some(backup_tag),
+                        operations: plan.operations.clone(),
+                        deferred_dirty_worktree_restore,
+                        post_success_hint: Some(
+                            "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
+                                .to_string(),
+                        ),
+                        metadata_refresh_context: Some(crate::stack_metadata::RefreshMetadataContext {
                             base: base.to_string(),
                             prefix: prefix.to_string(),
                             ignore_tag: ignore_tag.to_string(),
-                        },
-                    ),
-                },
-            )
+                        }),
+                    },
+                )
             }
         },
     )
@@ -1079,6 +1088,7 @@ mod tests {
     use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
     use crate::commands::RewriteCommandOutcome;
     use crate::config::DirtyWorktreePolicy;
+    use crate::execution::ExecutionMode;
     use crate::parsing::{derive_local_groups_with_ignored, Group};
     use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
     use std::env;
@@ -1185,7 +1195,7 @@ mod tests {
             "main",
             "dank-spr/",
             "ignore",
-            true,
+            ExecutionMode::DryRun,
             DirtyWorktreePolicy::Halt,
             AbsorbOptions::default(),
         )
@@ -1964,7 +1974,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
-                false,
+                ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
@@ -1996,7 +2006,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
-                false,
+                ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
@@ -2034,7 +2044,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
-                false,
+                ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
@@ -2074,7 +2084,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
-                false,
+                ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 absorb_override_options(),
             )
@@ -2170,7 +2180,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
-                false,
+                ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
@@ -2272,7 +2282,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
-                false,
+                ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
@@ -2309,7 +2319,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
-                false,
+                ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
@@ -2344,7 +2354,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
-                true,
+                ExecutionMode::DryRun,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
             )
@@ -2386,7 +2396,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
-                false,
+                ExecutionMode::Apply,
                 DirtyWorktreePolicy::Halt,
                 default_absorb_options(),
             )
@@ -2411,7 +2421,7 @@ mod tests {
 
         {
             let _guard = DirGuard::change_to(&repo.repo);
-            let resumed = resume_rewrite(false, &resume_path).expect("resume absorb");
+            let resumed = resume_rewrite(&resume_path).expect("resume absorb");
             assert_eq!(resumed, RewriteCommandOutcome::Completed);
         }
 

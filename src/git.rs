@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{error, info};
 
+use crate::execution::ExecutionMode;
+
 pub fn ensure_tool(name: &str) -> Result<()> {
     let status = Command::new(name)
         .arg("--version")
@@ -43,31 +45,36 @@ pub fn git_ro_in(path: &str, args: &[&str]) -> Result<String> {
     git_ro(argv.as_slice())
 }
 
-pub fn git_rw(dry: bool, args: &[&str]) -> Result<String> {
-    if dry {
-        // Allow executing safe local ops in dry-run to mimic real flow closely
-        let mut idx = 0;
-        let mut in_tmp = false;
-        if let Some(first) = args.first() {
-            if *first == "-C" && args.len() >= 2 {
-                idx = 2;
-                in_tmp = args[1].starts_with("/tmp/spr-");
+pub fn git_rw(execution_mode: ExecutionMode, args: &[&str]) -> Result<String> {
+    match execution_mode {
+        ExecutionMode::Apply => {
+            verbose_log_cmd("git", args);
+            run("git", args)
+        }
+        ExecutionMode::DryRun => {
+            // Allow executing safe local ops in dry-run to mimic real flow closely
+            let mut idx = 0;
+            let mut in_tmp = false;
+            if let Some(first) = args.first() {
+                if *first == "-C" && args.len() >= 2 {
+                    idx = 2;
+                    in_tmp = args[1].starts_with("/tmp/spr-");
+                }
+            }
+            let sub = args.get(idx).copied().unwrap_or("");
+            let is_push = sub == "push";
+            let is_worktree = sub == "worktree";
+            let is_commit_tree = sub == "commit-tree";
+            let allow = (in_tmp && !is_push) || is_worktree || is_commit_tree;
+            if allow {
+                info!("DRY-RUN (exec): git {}", shellish(args));
+                run("git", args)
+            } else {
+                info!("DRY-RUN: git {}", shellish(args));
+                Ok(String::new())
             }
         }
-        let sub = args.get(idx).copied().unwrap_or("");
-        let is_push = sub == "push";
-        let is_worktree = sub == "worktree";
-        let is_commit_tree = sub == "commit-tree";
-        let allow = (in_tmp && !is_push) || is_worktree || is_commit_tree;
-        if allow {
-            info!("DRY-RUN (exec): git {}", shellish(args));
-            return run("git", args);
-        }
-        info!("DRY-RUN: git {}", shellish(args));
-        return Ok(String::new());
     }
-    verbose_log_cmd("git", args);
-    run("git", args)
 }
 
 pub fn gh_ro(args: &[&str]) -> Result<String> {
@@ -78,24 +85,27 @@ pub fn gh_ro(args: &[&str]) -> Result<String> {
     run("gh", args)
 }
 
-pub fn gh_rw(dry: bool, args: &[&str]) -> Result<String> {
-    if dry {
-        let printable = if args.contains(&"--body") {
-            let mut v = args.to_vec();
-            if let Some(i) = v.iter().position(|a| *a == "--body") {
-                if i + 1 < v.len() {
-                    v[i + 1] = "<elided-body>";
+pub fn gh_rw(execution_mode: ExecutionMode, args: &[&str]) -> Result<String> {
+    match execution_mode {
+        ExecutionMode::Apply => {
+            verbose_log_cmd("gh", args);
+            run("gh", args)
+        }
+        ExecutionMode::DryRun => {
+            let printable = if args.contains(&"--body") {
+                let mut v = args.to_vec();
+                if let Some(i) = v.iter().position(|a| *a == "--body") {
+                    if i + 1 < v.len() {
+                        v[i + 1] = "<elided-body>";
+                    }
                 }
-            }
-            v
-        } else {
-            args.to_vec()
-        };
-        info!("DRY-RUN: gh {}", shellish(&printable));
-        Ok(String::new())
-    } else {
-        verbose_log_cmd("gh", args);
-        run("gh", args)
+                v
+            } else {
+                args.to_vec()
+            };
+            info!("DRY-RUN: gh {}", shellish(&printable));
+            Ok(String::new())
+        }
     }
 }
 

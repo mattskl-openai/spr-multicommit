@@ -4,6 +4,7 @@ use tracing::info;
 
 use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
 use crate::commands::common;
+use crate::execution::ExecutionMode;
 use crate::git::{gh_rw, normalize_branch_name, sanitize_gh_base_ref};
 use crate::github::list_open_prs_for_heads;
 use crate::maintenance_output::{
@@ -40,8 +41,9 @@ pub fn relink_prs(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
-    dry: bool,
+    execution_mode: ExecutionMode,
 ) -> Result<RelinkPrsSummaryData> {
+    let dry_run = execution_mode == ExecutionMode::DryRun;
     let normalized_base = normalize_branch_name(base);
     let (_merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
@@ -50,7 +52,7 @@ pub fn relink_prs(
                 base: normalized_base,
                 prefix: prefix.to_string(),
             },
-            options: MaintenanceOptions { dry_run: dry },
+            options: MaintenanceOptions { dry_run },
             expected_chain: Vec::new(),
             decisions: Vec::new(),
         });
@@ -90,7 +92,7 @@ pub fn relink_prs(
                 RelinkPrAction::AlreadyCorrect
             } else {
                 gh_rw(
-                    dry,
+                    execution_mode,
                     [
                         "pr",
                         "edit",
@@ -100,7 +102,7 @@ pub fn relink_prs(
                     ]
                     .as_slice(),
                 )?;
-                if dry {
+                if dry_run {
                     RelinkPrAction::DryRunEdit
                 } else {
                     RelinkPrAction::Edited
@@ -133,7 +135,7 @@ pub fn relink_prs(
             base: normalized_base,
             prefix: prefix.to_string(),
         },
-        options: MaintenanceOptions { dry_run: dry },
+        options: MaintenanceOptions { dry_run },
         expected_chain,
         decisions,
     })
@@ -142,6 +144,7 @@ pub fn relink_prs(
 #[cfg(test)]
 mod tests {
     use super::relink_prs;
+    use crate::execution::ExecutionMode;
     use crate::maintenance_output::RelinkPrAction;
     use crate::test_support::{commit_file, git, lock_cwd, write_file, DirGuard};
     use std::env;
@@ -240,7 +243,7 @@ mod tests {
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
 
-        let summary = relink_prs("main", "skilltest/", "ignore", false).unwrap();
+        let summary = relink_prs("main", "skilltest/", "ignore", ExecutionMode::Apply).unwrap();
 
         assert_eq!(summary.decisions[0].action, RelinkPrAction::AlreadyCorrect);
         assert_eq!(summary.decisions[1].action, RelinkPrAction::Edited);
@@ -262,7 +265,7 @@ mod tests {
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
 
-        let err = relink_prs("main", "skilltest/", "ignore", false).unwrap_err();
+        let err = relink_prs("main", "skilltest/", "ignore", ExecutionMode::Apply).unwrap_err();
 
         assert!(err
             .to_string()
@@ -285,7 +288,7 @@ mod tests {
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
 
-        let summary = relink_prs("main", "skilltest/", "ignore", false).unwrap();
+        let summary = relink_prs("main", "skilltest/", "ignore", ExecutionMode::Apply).unwrap();
 
         assert_eq!(summary.expected_chain.len(), 2);
         assert_eq!(summary.decisions.len(), 2);

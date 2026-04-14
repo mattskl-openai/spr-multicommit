@@ -3,10 +3,13 @@ use clap::{error::ErrorKind, Parser};
 use std::ffi::OsString;
 use std::path::Path;
 
+use crate::execution::ExecutionMode;
+
 mod branch_names;
 mod cli;
 mod commands;
 mod config;
+mod execution;
 mod format;
 mod git;
 mod github;
@@ -103,8 +106,8 @@ fn init_tools(needs_gh: bool) -> Result<()> {
     Ok(())
 }
 
-fn set_dry_run_env(dry_run: bool, assume_existing_prs: bool) {
-    if dry_run {
+fn set_dry_run_env(execution_mode: ExecutionMode, assume_existing_prs: bool) {
+    if execution_mode == ExecutionMode::DryRun {
         std::env::set_var("SPR_DRY_RUN", "1");
         if assume_existing_prs {
             std::env::set_var("SPR_DRY_ASSUME_EXISTING", "1");
@@ -249,7 +252,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
     if let crate::cli::Cmd::Resume { path, .. } = &cli.cmd {
         return Ok(CommandOutput::Machine(ensure_resume_completed(
             output_format,
-            crate::commands::resume_rewrite(cli.dry_run, path)?,
+            crate::commands::resume_rewrite(path)?,
         )?));
     }
 
@@ -274,10 +277,12 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             assume_existing_prs,
             pr_description_mode: pr_description_mode_override,
             allow_branch_reuse,
+            dry_run,
             output: _,
             extent,
         } => {
-            set_dry_run_env(cli.dry_run, assume_existing_prs);
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, assume_existing_prs);
             let pr_description_mode = pr_description_mode_override.unwrap_or(pr_description_mode);
             if restack {
                 Err(anyhow::anyhow!(
@@ -323,7 +328,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         &prefix,
                         &skipped_handles,
                         no_pr,
-                        cli.dry_run,
+                        execution_mode,
                         pr_description_mode,
                         limit,
                         groups,
@@ -339,14 +344,14 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                             ignore_tag: ignore_tag.clone(),
                         },
                         crate::update_output::UpdateOptions {
-                            dry_run: cli.dry_run,
+                            dry_run: execution_mode == ExecutionMode::DryRun,
                             no_pr,
                             pr_description_mode,
                         },
                         resolved_extent,
                         execution,
                     );
-                    if !cli.dry_run {
+                    if execution_mode == ExecutionMode::Apply {
                         crate::stack_metadata::refresh_metadata_for_current_checkout(
                             &metadata_refresh_context.base,
                             &metadata_refresh_context.prefix,
@@ -362,7 +367,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         &prefix,
                         &skipped_handles,
                         no_pr,
-                        cli.dry_run,
+                        execution_mode,
                         pr_description_mode,
                         limit,
                         groups,
@@ -370,7 +375,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         allow_branch_reuse,
                         branch_reuse_guard_days,
                     )?;
-                    if !cli.dry_run {
+                    if execution_mode == ExecutionMode::Apply {
                         crate::stack_metadata::refresh_metadata_for_current_checkout(
                             &metadata_refresh_context.base,
                             &metadata_refresh_context.prefix,
@@ -385,9 +390,11 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             after,
             safe,
             preview,
+            dry_run,
             output: _,
         } => {
-            set_dry_run_env(cli.dry_run, false);
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
             if preview {
                 Ok(CommandOutput::RestackPreview(
                     crate::restack_output::preview(crate::commands::preview_restack_after(
@@ -405,15 +412,20 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         &metadata_refresh_context,
                         &after,
                         safe,
-                        cli.dry_run,
+                        execution_mode,
                         restack_conflict_policy,
                         dirty_worktree_policy,
                     )?,
                 )?))
             }
         }
-        crate::cli::Cmd::DropMergedPrefix { safe, output: _ } => {
-            set_dry_run_env(cli.dry_run, false);
+        crate::cli::Cmd::DropMergedPrefix {
+            safe,
+            dry_run,
+            output: _,
+        } => {
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
             Ok(CommandOutput::Machine(ensure_rewrite_completed(
                 output_format,
                 "spr drop-merged-prefix",
@@ -421,7 +433,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 crate::commands::drop_merged_prefix(
                     &metadata_refresh_context,
                     safe,
-                    cli.dry_run,
+                    execution_mode,
                     restack_conflict_policy,
                     dirty_worktree_policy,
                 )?,
@@ -429,9 +441,11 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
         }
         crate::cli::Cmd::Absorb {
             allow_replayed_duplicates,
+            dry_run,
             output: _,
         } => {
-            set_dry_run_env(cli.dry_run, false);
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
             let options = crate::commands::AbsorbOptions {
                 copied_later_stack_commit_policy: if allow_replayed_duplicates {
                     crate::commands::CopiedLaterStackCommitPolicy::AllowKeepNonSeedDuplicates
@@ -447,14 +461,15 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     &base,
                     &prefix,
                     &ignore_tag,
-                    cli.dry_run,
+                    execution_mode,
                     dirty_worktree_policy,
                     options,
                 )?,
             )?))
         }
-        crate::cli::Cmd::Prep { output: _ } => {
-            set_dry_run_env(cli.dry_run, false);
+        crate::cli::Cmd::Prep { dry_run, output: _ } => {
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
             if cli.until.is_some() && cli.exact.is_some() {
                 return Err(anyhow::anyhow!("--until conflicts with --exact"));
             }
@@ -476,7 +491,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 pr_description_mode,
                 list_order,
                 selection,
-                cli.dry_run,
+                execution_mode,
             )?;
             if output_format == crate::cli::OutputFormat::Json {
                 Ok(CommandOutput::Maintenance(Box::new(
@@ -548,9 +563,11 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             which,
             r#unsafe,
             no_restack,
+            dry_run,
             output: _,
         } => {
-            set_dry_run_env(cli.dry_run, false);
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
             let mode = which.unwrap_or(match cfg.land.as_str() {
                 "per-pr" | "perpr" | "per_pr" => crate::cli::LandCmd::PerPr,
                 _ => crate::cli::LandCmd::Flatten,
@@ -564,7 +581,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     &prefix,
                     &ignore_tag,
                     &until,
-                    cli.dry_run,
+                    execution_mode,
                     r#unsafe,
                 )?,
                 crate::cli::LandCmd::PerPr => crate::commands::land_per_pr_until(
@@ -572,7 +589,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     &prefix,
                     &ignore_tag,
                     &until,
-                    cli.dry_run,
+                    execution_mode,
                     r#unsafe,
                 )?,
             };
@@ -582,7 +599,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     &metadata_refresh_context,
                     landed_count,
                     false,
-                    cli.dry_run,
+                    execution_mode,
                     restack_conflict_policy,
                     dirty_worktree_policy,
                 )?;
@@ -613,9 +630,10 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 ),
             ))
         }
-        crate::cli::Cmd::RelinkPrs { output: _ } => {
-            set_dry_run_env(cli.dry_run, false);
-            let summary = crate::commands::relink_prs(&base, &prefix, &ignore_tag, cli.dry_run)?;
+        crate::cli::Cmd::RelinkPrs { dry_run, output: _ } => {
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
+            let summary = crate::commands::relink_prs(&base, &prefix, &ignore_tag, execution_mode)?;
             if output_format == crate::cli::OutputFormat::Json {
                 Ok(CommandOutput::Maintenance(Box::new(
                     crate::maintenance_output::relink_prs_summary(summary),
@@ -625,9 +643,10 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 Ok(CommandOutput::None)
             }
         }
-        crate::cli::Cmd::Cleanup { output: _ } => {
-            set_dry_run_env(cli.dry_run, false);
-            let summary = crate::commands::cleanup_remote_branches(&prefix, cli.dry_run)?;
+        crate::cli::Cmd::Cleanup { dry_run, output: _ } => {
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
+            let summary = crate::commands::cleanup_remote_branches(&prefix, execution_mode)?;
             if output_format == crate::cli::OutputFormat::Json {
                 Ok(CommandOutput::Maintenance(Box::new(
                     crate::maintenance_output::cleanup_summary(summary),
@@ -641,9 +660,11 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             target,
             tail,
             safe,
+            dry_run,
             output: _,
         } => {
-            set_dry_run_env(cli.dry_run, false);
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
             Ok(CommandOutput::Machine(ensure_rewrite_completed(
                 output_format,
                 "spr fix-pr",
@@ -653,7 +674,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     &target,
                     tail,
                     safe,
-                    cli.dry_run,
+                    execution_mode,
                     dirty_worktree_policy,
                 )?,
             )?))
@@ -662,9 +683,11 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             range,
             after,
             safe,
+            dry_run,
             output: _,
         } => {
-            set_dry_run_env(cli.dry_run, false);
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
             Ok(CommandOutput::Machine(ensure_rewrite_completed(
                 output_format,
                 "spr move",
@@ -677,7 +700,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     &after,
                     crate::commands::MoveExecutionOptions {
                         safe,
-                        dry: cli.dry_run,
+                        execution_mode,
                         dirty_worktree_policy,
                     },
                 )?,
@@ -846,7 +869,7 @@ mod tests {
         apply_working_directory_override, command_requires_gh, json_command_for_raw_args,
         parse_failure_as_json_output, resolve_update_pr_limit, run_cli, CommandOutput,
     };
-    use crate::cli::{OutputArgs, OutputFormat};
+    use crate::cli::{DryRunArgs, OutputArgs, OutputFormat};
     use crate::json_output::{ErrorPayload, JsonCommand, JsonError, EXIT_FAILURE};
     use crate::maintenance_output::{
         MaintenancePayload, PrepNextChildAction, ResolvedPrepSelection,
@@ -983,6 +1006,7 @@ mod tests {
     fn absorb_is_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::Absorb {
             allow_replayed_duplicates: false,
+            dry_run: DryRunArgs::default(),
             output: OutputArgs::human(),
         }));
     }
@@ -991,6 +1015,7 @@ mod tests {
     fn drop_merged_prefix_requires_github_cli() {
         assert!(command_requires_gh(&crate::cli::Cmd::DropMergedPrefix {
             safe: true,
+            dry_run: DryRunArgs::default(),
             output: OutputArgs::human(),
         }));
     }
@@ -1019,6 +1044,7 @@ mod tests {
             assume_existing_prs: false,
             pr_description_mode: None,
             allow_branch_reuse: false,
+            dry_run: DryRunArgs::default(),
             output: OutputArgs::human(),
             extent: None,
         }));
@@ -1033,6 +1059,7 @@ mod tests {
             assume_existing_prs: false,
             pr_description_mode: None,
             allow_branch_reuse: false,
+            dry_run: DryRunArgs::default(),
             output: OutputArgs::json(),
             extent: None,
         }));
@@ -1396,10 +1423,10 @@ mod tests {
             "main",
             "--prefix",
             "dank-spr/",
-            "--dry-run",
             "--until",
             "1",
             "prep",
+            "--dry-run",
             "--json",
         ])
         .unwrap();
@@ -1909,8 +1936,8 @@ mod tests {
             "main",
             "--prefix",
             "dank-spr/",
-            "--dry-run",
             "update",
+            "--dry-run",
             "--json",
             "--no-pr",
         ])
@@ -1967,8 +1994,8 @@ mod tests {
             "main",
             "--prefix",
             "dank-spr/",
-            "--dry-run",
             "update",
+            "--dry-run",
             "--json",
             "--no-pr",
             "pr",
@@ -2004,8 +2031,8 @@ mod tests {
             "main",
             "--prefix",
             "dank-spr/",
-            "--dry-run",
             "update",
+            "--dry-run",
             "--json",
             "--no-pr",
             "pr",
@@ -2041,8 +2068,8 @@ mod tests {
             "main",
             "--prefix",
             "dank-spr/",
-            "--dry-run",
             "update",
+            "--dry-run",
             "--json",
             "--no-pr",
             "commits",
