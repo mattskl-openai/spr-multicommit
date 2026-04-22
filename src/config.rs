@@ -19,6 +19,19 @@ pub enum PrDescriptionMode {
     StackOnly,
 }
 
+/// Opt-in policy for keeping local per-PR branches aligned with stack group tips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+pub enum LocalPrBranchSyncPolicy {
+    /// Preserve existing behavior: do not create or move local per-PR branches.
+    Off,
+    /// Move local per-PR branches that already exist, but do not create missing branches.
+    UpdateExisting,
+    /// Create missing local per-PR branches and move existing ones.
+    CreateOrUpdate,
+}
+
 /// Behavior when `spr restack` encounters a cherry-pick conflict.
 ///
 /// This is YAML-deserializable and avoids stringly-typed policy handling.
@@ -109,6 +122,8 @@ pub struct FileConfig {
     pub pr_description_mode: Option<PrDescriptionMode>,
     /// Order for printing PR/commit lists and update progress output.
     pub list_order: Option<ListOrder>,
+    /// Whether to synchronize local per-PR branches named like synthetic PR branches.
+    pub local_pr_branches: Option<LocalPrBranchSyncPolicy>,
     /// Behavior when `spr restack` encounters a cherry-pick conflict.
     ///
     /// Supported values:
@@ -140,6 +155,8 @@ pub struct Config {
     pub pr_description_mode: PrDescriptionMode,
     /// Order for printing PR/commit lists and update progress output.
     pub list_order: ListOrder,
+    /// Whether to synchronize local per-PR branches named like synthetic PR branches.
+    pub local_pr_branches: LocalPrBranchSyncPolicy,
     /// Behavior when `spr restack` encounters a cherry-pick conflict.
     pub restack_conflict: RestackConflictPolicy,
     /// Behavior when a branch-rewriting command sees local changes.
@@ -184,6 +201,7 @@ fn default_config() -> Config {
         ignore_tag: "ignore".to_string(),
         pr_description_mode: PrDescriptionMode::Overwrite,
         list_order: ListOrder::RecentOnTop,
+        local_pr_branches: LocalPrBranchSyncPolicy::Off,
         restack_conflict: RestackConflictPolicy::Halt,
         dirty_worktree: DirtyWorktreePolicy::Halt,
         branch_reuse_guard_days: 180,
@@ -209,6 +227,9 @@ fn apply_overrides(config: &Config, overrides: FileConfig) -> Config {
     }
     if let Some(list_order) = overrides.list_order {
         merged.list_order = list_order;
+    }
+    if let Some(local_pr_branches) = overrides.local_pr_branches {
+        merged.local_pr_branches = local_pr_branches;
     }
     if let Some(restack_conflict) = overrides.restack_conflict {
         merged.restack_conflict = restack_conflict;
@@ -258,7 +279,8 @@ pub fn load_config() -> Result<Config> {
 mod tests {
     use super::{
         apply_overrides, default_config, normalize_config, normalize_prefix, read_config_file,
-        DirtyWorktreePolicy, FileConfig, PrDescriptionMode, RestackConflictPolicy,
+        DirtyWorktreePolicy, FileConfig, LocalPrBranchSyncPolicy, PrDescriptionMode,
+        RestackConflictPolicy,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -363,6 +385,27 @@ restack_conflict: rollback
     }
 
     #[test]
+    fn default_config_leaves_local_pr_branch_sync_off() {
+        let cfg = default_config();
+
+        assert_eq!(cfg.local_pr_branches, LocalPrBranchSyncPolicy::Off);
+    }
+
+    #[test]
+    fn read_config_file_parses_local_pr_branch_sync_policy() {
+        let dir = tempdir().unwrap();
+        let mut path = dir.path().to_path_buf();
+        path.push(".spr_multicommit_cfg.yml");
+        fs::write(&path, "local_pr_branches: create-or-update\n").unwrap();
+
+        let cfg = read_config_file(&path).unwrap().unwrap();
+        assert_eq!(
+            cfg.local_pr_branches,
+            Some(LocalPrBranchSyncPolicy::CreateOrUpdate)
+        );
+    }
+
+    #[test]
     // Verifies: YAML config parsing accepts an integer value for branch_reuse_guard_days.
     // Catches: regressions where the new config key is rejected or parsed with the wrong type.
     fn read_config_file_parses_branch_reuse_guard_days_integer() {
@@ -389,6 +432,7 @@ restack_conflict: rollback
                 ignore_tag: None,
                 pr_description_mode: None,
                 list_order: None,
+                local_pr_branches: None,
                 restack_conflict: None,
                 dirty_worktree: None,
                 branch_reuse_guard_days: Some(30),
@@ -396,6 +440,30 @@ restack_conflict: rollback
         );
 
         assert_eq!(merged.branch_reuse_guard_days, 30);
+    }
+
+    #[test]
+    fn apply_overrides_updates_local_pr_branch_sync_policy() {
+        let merged = apply_overrides(
+            &default_config(),
+            FileConfig {
+                base: None,
+                prefix: None,
+                land: None,
+                ignore_tag: None,
+                pr_description_mode: None,
+                list_order: None,
+                local_pr_branches: Some(LocalPrBranchSyncPolicy::UpdateExisting),
+                restack_conflict: None,
+                dirty_worktree: None,
+                branch_reuse_guard_days: None,
+            },
+        );
+
+        assert_eq!(
+            merged.local_pr_branches,
+            LocalPrBranchSyncPolicy::UpdateExisting
+        );
     }
 
     #[test]

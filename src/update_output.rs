@@ -1,7 +1,8 @@
 use serde::Serialize;
 
-use crate::config::PrDescriptionMode;
+use crate::config::{LocalPrBranchSyncPolicy, PrDescriptionMode};
 use crate::json_output::JsonCommand;
+use crate::local_pr_branches::LocalPrBranchAction;
 use crate::summary_output::SummaryOutput;
 
 pub type UpdateOutput = SummaryOutput<UpdateSummaryData>;
@@ -14,6 +15,7 @@ pub struct UpdateSummaryData {
     pub warnings: Vec<String>,
     pub skipped_groups: Vec<SkippedUpdateGroupData>,
     pub groups: Vec<UpdateGroupData>,
+    pub local_pr_branch_actions: Vec<LocalPrBranchAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -29,6 +31,7 @@ pub struct UpdateOptions {
     pub dry_run: bool,
     pub no_pr: bool,
     pub pr_description_mode: PrDescriptionMode,
+    pub local_pr_branches: LocalPrBranchSyncPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -44,6 +47,7 @@ pub struct UpdateExecutionData {
     pub warnings: Vec<String>,
     pub skipped_groups: Vec<SkippedUpdateGroupData>,
     pub groups: Vec<UpdateGroupData>,
+    pub local_pr_branch_actions: Vec<LocalPrBranchAction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -113,6 +117,7 @@ impl UpdateSummaryData {
             warnings: execution.warnings,
             skipped_groups: execution.skipped_groups,
             groups: execution.groups,
+            local_pr_branch_actions: execution.local_pr_branch_actions,
         }
     }
 }

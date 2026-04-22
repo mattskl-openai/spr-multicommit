@@ -16,6 +16,7 @@ mod git;
 mod github;
 mod json_output;
 mod limit;
+mod local_pr_branches;
 mod machine_output;
 mod maintenance_output;
 mod parsing;
@@ -159,11 +160,15 @@ fn ensure_rewrite_completed(
     command_name: &str,
     machine_command: crate::machine_output::MachineCommand,
     outcome: crate::commands::RewriteCommandOutcome,
+    local_pr_branch_actions: Vec<crate::local_pr_branches::LocalPrBranchAction>,
 ) -> Result<crate::machine_output::MachineOutput> {
     if outcome == crate::commands::RewriteCommandOutcome::Completed {
-        Ok(crate::machine_output::MachineOutput::completed(
-            machine_command,
-        ))
+        Ok(
+            crate::machine_output::MachineOutput::completed_with_local_pr_branch_actions(
+                machine_command,
+                local_pr_branch_actions,
+            ),
+        )
     } else if let crate::commands::RewriteCommandOutcome::Suspended(state) = outcome {
         if output_format == crate::cli::OutputFormat::Json {
             Ok(crate::machine_output::MachineOutput::suspended(
@@ -179,20 +184,27 @@ fn ensure_rewrite_completed(
             ))
         }
     } else {
-        Ok(crate::machine_output::MachineOutput::completed(
-            machine_command,
-        ))
+        Ok(
+            crate::machine_output::MachineOutput::completed_with_local_pr_branch_actions(
+                machine_command,
+                local_pr_branch_actions,
+            ),
+        )
     }
 }
 
 fn ensure_resume_completed(
     output_format: crate::cli::OutputFormat,
     outcome: crate::commands::RewriteCommandOutcome,
+    local_pr_branch_actions: Vec<crate::local_pr_branches::LocalPrBranchAction>,
 ) -> Result<crate::machine_output::MachineOutput> {
     if outcome == crate::commands::RewriteCommandOutcome::Completed {
-        Ok(crate::machine_output::MachineOutput::completed(
-            crate::machine_output::MachineCommand::Resume,
-        ))
+        Ok(
+            crate::machine_output::MachineOutput::completed_with_local_pr_branch_actions(
+                crate::machine_output::MachineCommand::Resume,
+                local_pr_branch_actions,
+            ),
+        )
     } else if let crate::commands::RewriteCommandOutcome::Suspended(state) = outcome {
         if output_format == crate::cli::OutputFormat::Json {
             Ok(crate::machine_output::MachineOutput::suspended(
@@ -207,9 +219,48 @@ fn ensure_resume_completed(
             ))
         }
     } else {
-        Ok(crate::machine_output::MachineOutput::completed(
-            crate::machine_output::MachineCommand::Resume,
-        ))
+        Ok(
+            crate::machine_output::MachineOutput::completed_with_local_pr_branch_actions(
+                crate::machine_output::MachineCommand::Resume,
+                local_pr_branch_actions,
+            ),
+        )
+    }
+}
+
+fn sync_local_pr_branches_for_current_stack(
+    policy: crate::config::LocalPrBranchSyncPolicy,
+    execution_mode: ExecutionMode,
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+) -> Result<Vec<crate::local_pr_branches::LocalPrBranchAction>> {
+    if policy == crate::config::LocalPrBranchSyncPolicy::Off {
+        return Ok(Vec::new());
+    }
+
+    let (_merge_base, _leading_ignored, groups) =
+        crate::parsing::derive_local_groups_with_ignored(base, ignore_tag)?;
+    crate::branch_names::group_branch_identities(&groups, prefix)?;
+    let targets = crate::local_pr_branches::targets_from_groups(prefix, &groups)?;
+    crate::local_pr_branches::sync_local_pr_branches(policy, execution_mode, &targets)
+}
+
+fn sync_actions_after_completed_rewrite(
+    outcome: &crate::commands::RewriteCommandOutcome,
+    policy: crate::config::LocalPrBranchSyncPolicy,
+    execution_mode: ExecutionMode,
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+) -> Result<Vec<crate::local_pr_branches::LocalPrBranchAction>> {
+    if execution_mode == ExecutionMode::DryRun {
+        return Ok(Vec::new());
+    }
+    if *outcome == crate::commands::RewriteCommandOutcome::Completed {
+        sync_local_pr_branches_for_current_stack(policy, execution_mode, base, prefix, ignore_tag)
+    } else {
+        Ok(Vec::new())
     }
 }
 
@@ -251,9 +302,71 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
     apply_working_directory_override(cli.cd.as_deref())?;
     init_tools(command_requires_gh(&cli.cmd))?;
     if let crate::cli::Cmd::Resume { path, .. } = &cli.cmd {
+        let resume_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let resume_context = crate::commands::resume_context(&resume_path)?;
+        std::env::set_current_dir(&resume_context.original_worktree_root).with_context(|| {
+            format!(
+                "failed to change to original rewrite worktree {}",
+                resume_context.original_worktree_root
+            )
+        })?;
+        let explicit_local_pr_branch_policy = cli.local_pr_branches;
+        let sync_context = if explicit_local_pr_branch_policy
+            == Some(crate::config::LocalPrBranchSyncPolicy::Off)
+        {
+            None
+        } else {
+            match crate::config::load_config() {
+                Ok(cfg) => {
+                    let policy = explicit_local_pr_branch_policy.unwrap_or(cfg.local_pr_branches);
+                    if policy == crate::config::LocalPrBranchSyncPolicy::Off {
+                        None
+                    } else {
+                        match resolve_base_prefix(&cfg, cli.base.clone(), cli.prefix.clone()) {
+                            Ok(context) => Some((policy, context)),
+                            Err(err) if explicit_local_pr_branch_policy.is_none() => {
+                                tracing::warn!(
+                                    "Skipping local PR branch sync after resume because base and prefix could not be resolved: {err:#}"
+                                );
+                                None
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }
+                Err(err) if explicit_local_pr_branch_policy.is_none() => {
+                    tracing::warn!(
+                        "Skipping local PR branch sync after resume because config could not be loaded: {err:#}"
+                    );
+                    None
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        let outcome = crate::commands::resume_rewrite(&resume_path)?;
+        let local_pr_branch_actions = if let (
+            crate::commands::RewriteCommandOutcome::Completed,
+            Some((policy, (base, prefix, ignore_tag))),
+        ) = (&outcome, sync_context)
+        {
+            sync_local_pr_branches_for_current_stack(
+                policy,
+                ExecutionMode::Apply,
+                &base,
+                &prefix,
+                &ignore_tag,
+            )?
+        } else {
+            Vec::new()
+        };
         return Ok(CommandOutput::Machine(ensure_resume_completed(
             output_format,
-            crate::commands::resume_rewrite(path)?,
+            outcome,
+            local_pr_branch_actions,
         )?));
     }
 
@@ -270,6 +383,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
     let dirty_worktree_policy = cfg.dirty_worktree;
     let list_order = cfg.list_order;
     let branch_reuse_guard_days = cfg.branch_reuse_guard_days;
+    let local_pr_branch_policy = cli.local_pr_branches.unwrap_or(cfg.local_pr_branches);
     match cli.cmd {
         crate::cli::Cmd::Update {
             from,
@@ -335,6 +449,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         list_order,
                         allow_branch_reuse,
                         branch_reuse_guard_days,
+                        local_pr_branch_policy,
                     )?;
                     let summary = crate::update_output::UpdateSummaryData::from_execution(
                         crate::update_output::UpdateRepoContext {
@@ -347,6 +462,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                             dry_run: execution_mode == ExecutionMode::DryRun,
                             no_pr,
                             pr_description_mode,
+                            local_pr_branches: local_pr_branch_policy,
                         },
                         resolved_extent,
                         execution,
@@ -374,6 +490,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         list_order,
                         allow_branch_reuse,
                         branch_reuse_guard_days,
+                        local_pr_branch_policy,
                     )?;
                     if execution_mode == ExecutionMode::Apply {
                         crate::stack_metadata::refresh_metadata_for_current_checkout(
@@ -403,35 +520,55 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     )?),
                 ))
             } else {
+                let outcome = crate::commands::restack_after(
+                    &metadata_refresh_context,
+                    &after,
+                    safe,
+                    execution_mode,
+                    restack_conflict_policy,
+                    dirty_worktree_policy,
+                )?;
+                let local_pr_branch_actions = sync_actions_after_completed_rewrite(
+                    &outcome,
+                    local_pr_branch_policy,
+                    execution_mode,
+                    &base,
+                    &prefix,
+                    &ignore_tag,
+                )?;
                 Ok(CommandOutput::Machine(ensure_rewrite_completed(
                     output_format,
                     "spr restack",
                     crate::machine_output::MachineCommand::Restack,
-                    crate::commands::restack_after(
-                        &metadata_refresh_context,
-                        &after,
-                        safe,
-                        execution_mode,
-                        restack_conflict_policy,
-                        dirty_worktree_policy,
-                    )?,
+                    outcome,
+                    local_pr_branch_actions,
                 )?))
             }
         }
         crate::cli::Cmd::DropMergedPrefix { safe, dry_run } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
+            let outcome = crate::commands::drop_merged_prefix(
+                &metadata_refresh_context,
+                safe,
+                execution_mode,
+                restack_conflict_policy,
+                dirty_worktree_policy,
+            )?;
+            let local_pr_branch_actions = sync_actions_after_completed_rewrite(
+                &outcome,
+                local_pr_branch_policy,
+                execution_mode,
+                &base,
+                &prefix,
+                &ignore_tag,
+            )?;
             Ok(CommandOutput::Machine(ensure_rewrite_completed(
                 output_format,
                 "spr drop-merged-prefix",
                 crate::machine_output::MachineCommand::DropMergedPrefix,
-                crate::commands::drop_merged_prefix(
-                    &metadata_refresh_context,
-                    safe,
-                    execution_mode,
-                    restack_conflict_policy,
-                    dirty_worktree_policy,
-                )?,
+                outcome,
+                local_pr_branch_actions,
             )?))
         }
         crate::cli::Cmd::Absorb {
@@ -447,18 +584,28 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     crate::commands::CopiedLaterStackCommitPolicy::Block
                 },
             };
+            let outcome = crate::commands::absorb_branch_tails(
+                &base,
+                &prefix,
+                &ignore_tag,
+                execution_mode,
+                dirty_worktree_policy,
+                options,
+            )?;
+            let local_pr_branch_actions = sync_actions_after_completed_rewrite(
+                &outcome,
+                local_pr_branch_policy,
+                execution_mode,
+                &base,
+                &prefix,
+                &ignore_tag,
+            )?;
             Ok(CommandOutput::Machine(ensure_rewrite_completed(
                 output_format,
                 "spr absorb",
                 crate::machine_output::MachineCommand::Absorb,
-                crate::commands::absorb_branch_tails(
-                    &base,
-                    &prefix,
-                    &ignore_tag,
-                    execution_mode,
-                    dirty_worktree_policy,
-                    options,
-                )?,
+                outcome,
+                local_pr_branch_actions,
             )?))
         }
         crate::cli::Cmd::Prep { dry_run } => {
@@ -586,7 +733,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     r#unsafe,
                 )?,
             };
-            if !no_restack {
+            let local_pr_branch_actions = if !no_restack {
                 // After landing the first N PRs, restack the remaining commits onto the latest base
                 let outcome = crate::commands::restack_after_count(
                     &metadata_refresh_context,
@@ -596,7 +743,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     restack_conflict_policy,
                     dirty_worktree_policy,
                 )?;
-                if let crate::commands::RewriteCommandOutcome::Suspended(state) = outcome {
+                if let crate::commands::RewriteCommandOutcome::Suspended(state) = &outcome {
                     let post_success_hint = Some(
                         "GitHub landing already succeeded; resolve the local restack conflict and run the printed `spr resume <path>` command instead of rerunning `spr land`."
                             .to_string(),
@@ -605,7 +752,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         return Ok(CommandOutput::Machine(
                             crate::machine_output::MachineOutput::suspended(
                                 crate::machine_output::MachineCommand::Land,
-                                *state,
+                                (**state).clone(),
                                 post_success_hint,
                             ),
                         ));
@@ -616,10 +763,21 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         ));
                     }
                 }
-            }
+                sync_actions_after_completed_rewrite(
+                    &outcome,
+                    local_pr_branch_policy,
+                    execution_mode,
+                    &base,
+                    &prefix,
+                    &ignore_tag,
+                )?
+            } else {
+                Vec::new()
+            };
             Ok(CommandOutput::Machine(
-                crate::machine_output::MachineOutput::completed(
+                crate::machine_output::MachineOutput::completed_with_local_pr_branch_actions(
                     crate::machine_output::MachineCommand::Land,
+                    local_pr_branch_actions,
                 ),
             ))
         }
@@ -657,18 +815,28 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
+            let outcome = crate::commands::fix_pr_tail(
+                &metadata_refresh_context,
+                &target,
+                tail,
+                safe,
+                execution_mode,
+                dirty_worktree_policy,
+            )?;
+            let local_pr_branch_actions = sync_actions_after_completed_rewrite(
+                &outcome,
+                local_pr_branch_policy,
+                execution_mode,
+                &base,
+                &prefix,
+                &ignore_tag,
+            )?;
             Ok(CommandOutput::Machine(ensure_rewrite_completed(
                 output_format,
                 "spr fix-pr",
                 crate::machine_output::MachineCommand::FixPr,
-                crate::commands::fix_pr_tail(
-                    &metadata_refresh_context,
-                    &target,
-                    tail,
-                    safe,
-                    execution_mode,
-                    dirty_worktree_policy,
-                )?,
+                outcome,
+                local_pr_branch_actions,
             )?))
         }
         crate::cli::Cmd::Move {
@@ -679,22 +847,32 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
+            let outcome = crate::commands::move_groups_after(
+                &base,
+                &prefix,
+                &ignore_tag,
+                &range,
+                &after,
+                crate::commands::MoveExecutionOptions {
+                    safe,
+                    execution_mode,
+                    dirty_worktree_policy,
+                },
+            )?;
+            let local_pr_branch_actions = sync_actions_after_completed_rewrite(
+                &outcome,
+                local_pr_branch_policy,
+                execution_mode,
+                &base,
+                &prefix,
+                &ignore_tag,
+            )?;
             Ok(CommandOutput::Machine(ensure_rewrite_completed(
                 output_format,
                 "spr move",
                 crate::machine_output::MachineCommand::Move,
-                crate::commands::move_groups_after(
-                    &base,
-                    &prefix,
-                    &ignore_tag,
-                    &range,
-                    &after,
-                    crate::commands::MoveExecutionOptions {
-                        safe,
-                        execution_mode,
-                        dirty_worktree_policy,
-                    },
-                )?,
+                outcome,
+                local_pr_branch_actions,
             )?))
         }
     }
@@ -879,7 +1057,7 @@ mod tests {
     use crate::maintenance_output::{
         MaintenancePayload, PrepNextChildAction, ResolvedPrepSelection,
     };
-    use crate::parsing::Group;
+    use crate::parsing::{derive_local_groups_with_ignored, Group};
     use crate::read_only_output::ReadOnlyPayload;
     use crate::selectors::{GroupSelector, StableHandle};
     use crate::test_support::{
@@ -892,7 +1070,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -1133,6 +1311,26 @@ mod tests {
 
     fn install_failing_gh_wrapper() -> (TempDir, EnvVarGuard) {
         install_gh_wrapper("#!/bin/sh\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n")
+    }
+
+    fn local_branch_exists(repo: &Path, branch: &str) -> bool {
+        Command::new("git")
+            .current_dir(repo)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}^{{commit}}"),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn rev_parse(repo: &Path, revision: &str) -> String {
+        git(repo, ["rev-parse", revision].as_slice())
+            .trim()
+            .to_string()
     }
 
     fn prep_json_gh_script(log_path: &std::path::Path) -> String {
@@ -1950,9 +2148,14 @@ mod tests {
                 assert_eq!(data.repo.ignore_tag, "ignore");
                 assert!(data.options.dry_run);
                 assert!(data.options.no_pr);
+                assert_eq!(
+                    data.options.local_pr_branches,
+                    crate::config::LocalPrBranchSyncPolicy::Off
+                );
                 assert_eq!(data.extent, ResolvedUpdateLimit::All);
                 assert!(data.warnings.is_empty());
                 assert!(data.skipped_groups.is_empty());
+                assert!(data.local_pr_branch_actions.is_empty());
                 assert_eq!(data.groups.len(), 2);
                 assert_eq!(data.groups[0].stable_handle, "pr:alpha");
                 assert_eq!(
@@ -1972,6 +2175,146 @@ mod tests {
             }
             other => panic!("unexpected command output: {:?}", other),
         }
+    }
+
+    #[test]
+    fn update_json_no_pr_reports_opted_in_local_branch_sync_actions() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let (_wrapper_dir, _path_guard) = install_failing_gh_wrapper();
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--local-pr-branches",
+            "create-or-update",
+            "update",
+            "--dry-run",
+            "--json",
+            "--no-pr",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::Update(output) => {
+                let data = output.data;
+                assert_eq!(
+                    data.options.local_pr_branches,
+                    crate::config::LocalPrBranchSyncPolicy::CreateOrUpdate
+                );
+                assert_eq!(data.local_pr_branch_actions.len(), 2);
+                assert_eq!(data.local_pr_branch_actions[0].stable_handle, "pr:alpha");
+                assert_eq!(data.local_pr_branch_actions[0].branch, "dank-spr/alpha");
+                assert_eq!(
+                    data.local_pr_branch_actions[0].action,
+                    crate::local_pr_branches::LocalPrBranchActionKind::Created
+                );
+                assert_eq!(data.local_pr_branch_actions[0].old_tip, None);
+                assert_eq!(
+                    data.local_pr_branch_actions[0].new_tip,
+                    data.groups[0].target_sha
+                );
+                assert_eq!(data.local_pr_branch_actions[1].stable_handle, "pr:beta");
+                assert_eq!(data.local_pr_branch_actions[1].branch, "dank-spr/beta");
+                assert_eq!(
+                    data.local_pr_branch_actions[1].action,
+                    crate::local_pr_branches::LocalPrBranchActionKind::Created
+                );
+                assert!(!local_branch_exists(&repo, "dank-spr/alpha"));
+                assert!(!local_branch_exists(&repo, "dank-spr/beta"));
+            }
+            other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn absorb_with_local_pr_branch_sync_updates_rewritten_local_branch_tip() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let alpha_tip = rev_parse(&repo, "HEAD~1");
+        let beta_tip = rev_parse(&repo, "HEAD");
+        git(&repo, ["branch", "dank-spr/alpha", &alpha_tip].as_slice());
+        git(&repo, ["branch", "dank-spr/beta", &beta_tip].as_slice());
+        git(&repo, ["checkout", "dank-spr/alpha"].as_slice());
+        commit_file(
+            &repo,
+            "alpha.txt",
+            "alpha-1\nalpha-2\nalpha-branch\n",
+            "feat: alpha branch tail",
+        );
+        git(&repo, ["checkout", "stack"].as_slice());
+        let stale_beta_branch_tip = rev_parse(&repo, "dank-spr/beta");
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--local-pr-branches",
+            "create-or-update",
+            "absorb",
+            "--json",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::Machine(output) => match output.payload {
+                crate::machine_output::MachinePayload::Completed {
+                    local_pr_branch_actions,
+                } => {
+                    assert_eq!(local_pr_branch_actions.len(), 2);
+                    assert_eq!(local_pr_branch_actions[0].stable_handle, "pr:alpha");
+                    assert!(matches!(
+                        local_pr_branch_actions[0].action,
+                        crate::local_pr_branches::LocalPrBranchActionKind::Updated
+                            | crate::local_pr_branches::LocalPrBranchActionKind::Skipped
+                    ));
+                    assert_eq!(local_pr_branch_actions[1].stable_handle, "pr:beta");
+                    assert_eq!(
+                        local_pr_branch_actions[1].action,
+                        crate::local_pr_branches::LocalPrBranchActionKind::Updated
+                    );
+                }
+                other => panic!("unexpected machine payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+
+        let _guard = DirGuard::change_to(&repo);
+        let (_merge_base, leading_ignored, groups) =
+            derive_local_groups_with_ignored("main", "ignore").unwrap();
+        assert!(leading_ignored.is_empty());
+        let rewritten_alpha_tip = groups[0].commits.last().unwrap();
+        let rewritten_beta_tip = groups[1].commits.last().unwrap();
+        assert_ne!(
+            rewritten_beta_tip, &stale_beta_branch_tip,
+            "absorb should replay beta above the absorbed alpha tail"
+        );
+        assert_eq!(
+            rev_parse(&repo, "dank-spr/alpha"),
+            *rewritten_alpha_tip,
+            "local alpha branch should move to the rewritten alpha group tip"
+        );
+        assert_eq!(
+            rev_parse(&repo, "dank-spr/beta"),
+            *rewritten_beta_tip,
+            "local beta branch should move to the rewritten beta group tip"
+        );
     }
 
     #[test]

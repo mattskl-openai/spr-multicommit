@@ -57,7 +57,9 @@ pub struct MachineSuspendedPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum MachinePayload {
-    Completed,
+    Completed {
+        local_pr_branch_actions: Vec<crate::local_pr_branches::LocalPrBranchAction>,
+    },
     Suspended {
         #[serde(flatten)]
         details: Box<MachineSuspendedPayload>,
@@ -65,11 +67,16 @@ pub enum MachinePayload {
 }
 
 impl MachineOutput {
-    pub fn completed(command: MachineCommand) -> Self {
+    pub fn completed_with_local_pr_branch_actions(
+        command: MachineCommand,
+        local_pr_branch_actions: Vec<crate::local_pr_branches::LocalPrBranchAction>,
+    ) -> Self {
         Self {
             schema_version: JSON_OUTPUT_SCHEMA_VERSION,
             command,
-            payload: MachinePayload::Completed,
+            payload: MachinePayload::Completed {
+                local_pr_branch_actions,
+            },
         }
     }
 

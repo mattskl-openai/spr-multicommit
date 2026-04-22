@@ -289,6 +289,9 @@ pub struct Cli {
     /// Global branch prefix for per-PR branches
     #[arg(long, global = true)]
     pub prefix: Option<String>,
+    /// Sync local per-PR branches named like synthetic PR branches
+    #[arg(long, global = true, value_enum)]
+    pub local_pr_branches: Option<crate::config::LocalPrBranchSyncPolicy>,
     /// Global until (used by prep/land). Accepts 0, a local PR number, or a stable handle
     #[arg(long, global = true, value_name = "N|0|label|pr:<label>")]
     pub until: Option<crate::selectors::InclusiveSelector>,
@@ -304,6 +307,7 @@ pub struct Cli {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Cmd, OutputFormat};
+    use crate::config::LocalPrBranchSyncPolicy;
     use crate::execution::ExecutionMode;
     use clap::{CommandFactory, Parser};
     use std::ffi::OsString;
@@ -477,6 +481,29 @@ mod tests {
             }
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn global_local_pr_branch_sync_override_parses_before_command() {
+        let cli = Cli::try_parse_from(["spr", "--local-pr-branches", "update-existing", "absorb"])
+            .unwrap();
+
+        assert_eq!(
+            cli.local_pr_branches,
+            Some(LocalPrBranchSyncPolicy::UpdateExisting)
+        );
+        assert!(matches!(cli.cmd, Cmd::Absorb { .. }));
+    }
+
+    #[test]
+    fn global_local_pr_branch_sync_override_parses_after_command() {
+        let cli = Cli::try_parse_from(["spr", "update", "--local-pr-branches", "create-or-update"])
+            .unwrap();
+
+        assert_eq!(
+            cli.local_pr_branches,
+            Some(LocalPrBranchSyncPolicy::CreateOrUpdate)
+        );
     }
 
     #[test]

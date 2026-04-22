@@ -383,6 +383,7 @@ pub fn prep_squash(
         list_order,
         true,
         0,
+        crate::config::LocalPrBranchSyncPolicy::Off,
     )?;
     let update_summary = UpdateSummaryData::from_execution(
         UpdateRepoContext {
@@ -395,6 +396,7 @@ pub fn prep_squash(
             dry_run,
             no_pr: false,
             pr_description_mode,
+            local_pr_branches: crate::config::LocalPrBranchSyncPolicy::Off,
         },
         resolved_extent,
         update_execution,

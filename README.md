@@ -108,6 +108,12 @@ pr_description_mode: overwrite | stack_only
 # one of: "recent_on_bottom" (default) or "recent_on_top"
 list_order: recent_on_bottom
 
+# Optional local synchronization for branches named like `prefix + <tag>`.
+# - `off` (default): do not create or move local per-PR branches
+# - `update-existing`: move matching local branches that already exist
+# - `create-or-update`: create missing matching local branches and move existing ones
+local_pr_branches: off
+
 # How `spr restack` behaves on cherry-pick conflicts
 # - `halt` (default): suspend, leave the temp worktree in place, and resume
 #   with `spr resume <path>`
@@ -133,7 +139,7 @@ Precedence for defaults:
 
 - CLI flag > repo YAML > home YAML > git discovery (`origin/HEAD`)
 - Base has no built-in fallback; if discovery fails, set `base` explicitly
-- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `list_order = recent_on_bottom`, `restack_conflict = halt`, `dirty_worktree = halt`
+- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `list_order = recent_on_bottom`, `local_pr_branches = off`, `restack_conflict = halt`, `dirty_worktree = halt`
 
 Global flags
 ------------
@@ -141,6 +147,7 @@ Global flags
 - `--cd <PATH>`: change to `PATH` before loading repo config or running git/gh commands
 - `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
+- `--local-pr-branches <off|update-existing|create-or-update>`: override local per-PR branch synchronization for this run
 - `--until <N|0|label|pr:<label>>`: target range used by `prep` and `land` (`0` means all)
 - `--exact <I|label|pr:<label>>`: used by `prep` to select exactly one PR group
 - `--verbose`: enable verbose logging of underlying git/gh commands
@@ -191,6 +198,7 @@ Behavior:
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
   - When `pr_description_mode` is `stack_only`, only the stack block (between markers) is updated; the rest of the body is preserved
   - May temporarily set existing PR bases to the repo base while pushing, then re-chain them to match the local stack
+- When `local_pr_branches` is enabled, synchronizes local branches named exactly like the synthetic PR branches after the update succeeds. `update-existing` only moves existing local branches; `create-or-update` also creates missing ones.
 
 ### spr restack
 
@@ -221,6 +229,7 @@ Behavior:
 - Uses the existing temp-worktree cherry-pick executor when the plan is not one contiguous suffix,
   or when the fast rebase conflicts and can be aborted cleanly.
 - Updates the current branch to the rebuilt tip
+- When `local_pr_branches` is enabled, synchronizes local synthetic PR branches to the final rewritten group tips after a successful rewrite.
 - With `--safe`, a backup tag named like `backup/restack/<current-branch>-<short-sha>` is created first
 - Conflict handling is controlled by `restack_conflict` in config.
 - Before rewriting the checked-out branch, `spr restack` follows the `dirty_worktree` config.
@@ -256,6 +265,7 @@ Behavior:
 - With `--safe`, creates a local backup tag named like `backup/drop-merged-prefix/<current-branch>-<short-sha>` before moving the branch
 - Does not merge, close, retarget, comment on, push, or otherwise mutate GitHub PRs
 - Does not run `spr update`; run it afterwards to publish the remaining open PR branch updates
+- When `local_pr_branches` is enabled, synchronizes local synthetic PR branches for the remaining stack after the local rewrite succeeds.
 
 ### spr absorb
 
@@ -276,6 +286,7 @@ Behavior:
 - Before rewriting the checked-out branch, `spr absorb` follows the `dirty_worktree` config.
 - On cherry-pick conflict, `spr absorb` suspends the rewrite, leaves the temp worktree in place, and prints `spr resume <path>`
 - Does not update GitHub; inspect the rewritten stack first, then run `spr update`
+- When `local_pr_branches` is enabled, synchronizes local synthetic PR branches to the absorbed stack's final group tips after the local rewrite succeeds. A branch checked out in any worktree is reported as blocked and is not moved.
 
 Typical workflow:
 
@@ -369,8 +380,8 @@ Machine-readable `--json` mode:
   bottom-up stack order, even when `list_order: recent_on_top` changes the human display order.
   Each group's `remote.kind` encodes whether there is no matching PR, a PR without CI/review
   data, or a PR with typed CI/review status.
-- `spr update --json` writes repo context, resolved extent metadata, warnings, skipped groups, and
-  per-group branch or PR actions
+- `spr update --json` writes repo context, resolved extent metadata, warnings, skipped groups,
+  per-group branch or PR actions, and `local_pr_branch_actions`
 - `spr prep --json` writes the resolved selection, selected-group rewrite actions, replay counts,
   next-child warning action, and the nested update summary for the rewritten tip
 - `spr relink-prs --json` writes the expected local head/base chain plus one decision per PR head
@@ -381,7 +392,8 @@ Machine-readable `--json` mode:
   remaining groups, ignored-segment count, planned cherry-pick operation count, operations that a
   real run would perform, and the checks not validated by preview
 - `spr restack --json` without `--preview` keeps the rewrite lifecycle contract:
-  it writes one completed or suspended object, not a preview object
+  it writes one completed or suspended object, not a preview object. Completed rewrite JSON includes
+  `local_pr_branch_actions`, which is empty unless local per-PR branch sync is enabled.
 - JSON errors across commands use one typed error envelope with `result: "error"` plus
   `error_kind` values such as `synthetic_branch_name_collision`, `invalid_arguments`, and
   `internal`

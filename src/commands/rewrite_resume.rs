@@ -37,6 +37,11 @@ pub enum RewriteCommandOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteResumeContext {
+    pub original_worktree_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteSuspendedState {
     pub command_kind: RewriteCommandKind,
     pub original_worktree_root: String,
@@ -306,6 +311,15 @@ pub fn resume_rewrite(path: &Path) -> Result<RewriteCommandOutcome> {
         &remaining_operations,
         true,
     )
+}
+
+pub fn resume_context(path: &Path) -> Result<RewriteResumeContext> {
+    let resume_path = absolute_path(path)?;
+    let state = read_resume_state(&resume_path)?;
+    validate_resume_state_against_current_repo(&resume_path, &state)?;
+    Ok(RewriteResumeContext {
+        original_worktree_root: state.original_worktree_root,
+    })
 }
 
 fn continue_rewrite_operations(
