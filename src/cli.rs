@@ -25,6 +25,7 @@ pub enum Extent {
 pub enum PrepSelection {
     Until(crate::selectors::InclusiveSelector),
     Exact(crate::selectors::GroupSelector),
+    From(crate::selectors::GroupSelector),
     All,
 }
 
@@ -176,7 +177,11 @@ pub enum Cmd {
 
     /// Prepare PRs for landing (e.g., squash) and halt early on case-colliding synthetic branch names
     Prep {
-        // selection is provided via global --until/--exact flags
+        /// Prepare this PR group and every group above it
+        #[arg(long, value_name = "N|label|pr:<label>")]
+        from: Option<crate::selectors::GroupSelector>,
+
+        // Additional selection is provided via global --until/--exact flags.
         #[command(flatten)]
         dry_run: DryRunArgs,
     },
@@ -356,6 +361,19 @@ mod tests {
 
         match cli.cmd {
             Cmd::Absorb {
+                from: Some(crate::selectors::GroupSelector::Stable(handle)),
+                ..
+            } => assert_eq!(handle.tag, "beta"),
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prep_from_selector_parses() {
+        let cli = Cli::try_parse_from(["spr", "prep", "--from", "pr:beta"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Prep {
                 from: Some(crate::selectors::GroupSelector::Stable(handle)),
                 ..
             } => assert_eq!(handle.tag, "beta"),

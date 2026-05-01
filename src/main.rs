@@ -638,22 +638,25 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 local_pr_branch_actions,
             )?))
         }
-        crate::cli::Cmd::Prep { dry_run } => {
+        crate::cli::Cmd::Prep { from, dry_run } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
-            if cli.until.is_some() && cli.exact.is_some() {
-                return Err(anyhow::anyhow!("--until conflicts with --exact"));
-            }
-            let selection = if let Some(n) = cli.until {
-                if n == crate::selectors::InclusiveSelector::All {
-                    crate::cli::PrepSelection::All
-                } else {
-                    crate::cli::PrepSelection::Until(n)
+            let selection = match (cli.until, cli.exact, from) {
+                (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+                    return Err(anyhow::anyhow!(
+                        "--until, --exact, and --from are mutually exclusive"
+                    ));
                 }
-            } else if let Some(i) = cli.exact {
-                crate::cli::PrepSelection::Exact(i)
-            } else {
-                crate::cli::PrepSelection::All
+                (Some(n), None, None) => {
+                    if n == crate::selectors::InclusiveSelector::All {
+                        crate::cli::PrepSelection::All
+                    } else {
+                        crate::cli::PrepSelection::Until(n)
+                    }
+                }
+                (None, Some(i), None) => crate::cli::PrepSelection::Exact(i),
+                (None, None, Some(selector)) => crate::cli::PrepSelection::From(selector),
+                (None, None, None) => crate::cli::PrepSelection::All,
             };
             let summary = crate::commands::prep_squash(
                 &base,
@@ -1760,6 +1763,95 @@ mod tests {
                 }
             }
             other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_cli_prep_from_json_returns_suffix_summary() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let origin_url = format!("file://{}", dir.path().join("origin.git").display());
+        git(
+            &repo,
+            ["remote", "set-url", "origin", origin_url.as_str()].as_slice(),
+        );
+        let log_path = repo.join("gh.log");
+        let script = prep_json_gh_script(&log_path);
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "prep",
+            "--from",
+            "pr:beta",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::Maintenance(output) => match output.data {
+                MaintenancePayload::Prep { data } => {
+                    assert_eq!(
+                        data.selection,
+                        ResolvedPrepSelection::From {
+                            selector: "pr:beta".to_string(),
+                            first_local_pr_number: 2,
+                        }
+                    );
+                    assert_eq!(data.selected_groups.len(), 1);
+                    assert_eq!(data.selected_groups[0].stable_handle, "pr:beta");
+                    assert!(data.next_child.is_none());
+                    let update = data
+                        .update
+                        .expect("prep should include nested update summary");
+                    assert_eq!(update.extent, ResolvedUpdateLimit::All);
+                    assert_eq!(update.groups.len(), 2);
+                    assert_eq!(update.groups[0].stable_handle, "pr:alpha");
+                    assert_eq!(update.groups[1].stable_handle, "pr:beta");
+                }
+                other => panic!("unexpected maintenance payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_cli_prep_rejects_mixed_selectors() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let cases = [
+            vec![
+                "spr", "--base", "main", "--until", "1", "--exact", "1", "prep",
+            ],
+            vec![
+                "spr", "--base", "main", "--until", "1", "prep", "--from", "pr:beta",
+            ],
+            vec![
+                "spr", "--base", "main", "--exact", "1", "prep", "--from", "pr:beta",
+            ],
+        ];
+
+        for case in cases {
+            let cli = crate::cli::Cli::try_parse_from(case).unwrap();
+            let err = run_cli(cli, OutputFormat::Human).unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "--until, --exact, and --from are mutually exclusive"
+            );
         }
     }
 

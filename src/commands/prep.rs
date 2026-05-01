@@ -42,6 +42,10 @@ fn resolve_prep_window(
             let ordinal = resolve_group_ordinal(groups, selector)?;
             Ok((ordinal - 1, ordinal))
         }
+        crate::cli::PrepSelection::From(selector) => {
+            let ordinal = resolve_group_ordinal(groups, selector)?;
+            Ok((ordinal - 1, groups.len()))
+        }
     }
 }
 
@@ -51,6 +55,7 @@ fn selector_text(selector: &GroupSelector) -> String {
 
 fn resolved_selection(
     selection: &crate::cli::PrepSelection,
+    start_idx: usize,
     end_idx_exclusive: usize,
 ) -> ResolvedPrepSelection {
     match selection {
@@ -65,6 +70,10 @@ fn resolved_selection(
         crate::cli::PrepSelection::Exact(selector) => ResolvedPrepSelection::Exact {
             selector: selector_text(selector),
             local_pr_number: end_idx_exclusive,
+        },
+        crate::cli::PrepSelection::From(selector) => ResolvedPrepSelection::From {
+            selector: selector_text(selector),
+            first_local_pr_number: start_idx + 1,
         },
     }
 }
@@ -95,6 +104,7 @@ fn limit_and_next_idx(
                 ResolvedUpdateLimit::ByPr { count },
             ))
         }
+        crate::cli::PrepSelection::From(_) => Ok((None, None, ResolvedUpdateLimit::All)),
     }
 }
 
@@ -218,7 +228,7 @@ pub fn prep_squash(
     }
     let branch_identities = group_branch_identities(&groups, prefix)?;
     let (start_idx, end_idx_exclusive) = resolve_prep_window(&groups, &selection)?;
-    let resolved_selection = resolved_selection(&selection, end_idx_exclusive);
+    let resolved_selection = resolved_selection(&selection, start_idx, end_idx_exclusive);
 
     let mut parent_sha = if start_idx == 0 {
         merge_base.clone()
@@ -537,6 +547,16 @@ mod tests {
         }));
 
         assert_eq!(resolve_prep_window(&groups, &selection).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn prep_from_stable_handle_resolves_suffix_window() {
+        let groups = groups(&["alpha", "beta", "gamma"]);
+        let selection = PrepSelection::From(GroupSelector::Stable(StableHandle {
+            tag: "beta".to_string(),
+        }));
+
+        assert_eq!(resolve_prep_window(&groups, &selection).unwrap(), (1, 3));
     }
 
     #[test]
