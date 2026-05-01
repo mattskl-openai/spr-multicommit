@@ -155,12 +155,20 @@ pub enum Cmd {
 
     /// Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch
     #[command(
-        long_about = "Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.\n\nIf you append commits to the end of a local PR branch such as `user-spr/alpha`, run `spr absorb` while the stack branch is checked out. `spr` rebuilds the local stack so the new commits become part of the matching PR group. The PR-group order stays the same.\n\nThis command is local-only: it rewrites the current stack branch, creates a backup tag, and does not update GitHub. After checking the result, run `spr update`.\n\nOnly exact local branches named `prefix + tag` are considered. If one of those branches still points at rewritten-equivalent stack commits, `spr absorb` accepts that prefix only when the branch still descends from the same stack merge-base and the matched pre-tail commit ends at the same tree as the canonical stack prefix. A no-op rewritten match is reported as `skip (rewritten-equivalent prefix)`, and only commits appended above that proven prefix are absorbed. `spr absorb` also refuses to operate when two live PR groups would derive synthetic branch names that differ only by case.\n\nExample:\n- The current stack has three PR groups: `pr:alpha`, `pr:beta`, and `pr:gamma`.\n- Check out `user-spr/alpha` and append 2 commits.\n- Check out the stack branch.\n- Run `spr absorb`.\n- Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same.\n- Then run `spr update`.\n\nOn cherry-pick conflict, `spr absorb` leaves the temp rewrite worktree in place, writes a resume file under the repository common Git directory, and prints `spr resume <path>`. Resolve conflicts in that temp worktree, stage the resolution, and run the printed resume command.\n\nAdvanced:\n- By default, absorb blocks copied later commits when replaying the stack would become empty or ambiguous.\n- `--allow-replayed-duplicates` allows an earlier copied non-seed follow-up commit to coexist with its later replayed copy by keeping both commits in the rewritten stack."
+        long_about = "Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.\n\nIf you append commits to the end of a local PR branch such as `user-spr/alpha`, run `spr absorb` while the stack branch is checked out. `spr` rebuilds the local stack so the new commits become part of the matching PR group. The PR-group order stays the same.\n\nThis command is local-only: it rewrites the current stack branch, creates a backup tag, and does not update GitHub. After checking the result, run `spr update`.\n\nOnly exact local branches named `prefix + tag` are considered. If one of those branches still points at rewritten-equivalent stack commits, `spr absorb` accepts that prefix only when the branch still descends from the same stack merge-base and the matched pre-tail commit ends at the same tree as the canonical stack prefix. A no-op rewritten match is reported as `skip (rewritten-equivalent prefix)`, and only commits appended above that proven prefix are absorbed. `spr absorb` also refuses to operate when two live PR groups would derive synthetic branch names that differ only by case.\n\nUse `--from <N|label|pr:<label>>` to constrain absorb to one PR group and every group above it. For example, `spr absorb --from pr:beta` considers only the `pr:beta..top` suffix and leaves unrelated lower-group branch tails out of scope.\n\nExample:\n- The current stack has three PR groups: `pr:alpha`, `pr:beta`, and `pr:gamma`.\n- Check out `user-spr/alpha` and append 2 commits.\n- Check out the stack branch.\n- Run `spr absorb`.\n- Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same.\n- Then run `spr update`.\n\nOn cherry-pick conflict, `spr absorb` leaves the temp rewrite worktree in place, writes a resume file under the repository common Git directory, and prints `spr resume <path>`. Resolve conflicts in that temp worktree, stage the resolution, and run the printed resume command.\n\nAdvanced:\n- By default, absorb blocks copied later commits when replaying the stack would become empty or ambiguous.\n- `--allow-replayed-duplicates` allows an earlier copied non-seed follow-up commit to coexist with its later replayed copy by keeping both commits in the rewritten stack."
     )]
     Absorb {
+        /// Absorb only this PR group and every group above it
+        #[arg(long, value_name = "N|label|pr:<label>")]
+        from: Option<crate::selectors::GroupSelector>,
+
         /// Allow replayed duplicates and keep both copies when the later replay is non-seed
         #[arg(long)]
         allow_replayed_duplicates: bool,
+
+        /// Print the branch names that an absorb rewrite would change without rewriting
+        #[arg(long, conflicts_with = "dry_run")]
+        query_changed_branches: bool,
 
         #[command(flatten)]
         dry_run: DryRunArgs,
@@ -322,6 +330,32 @@ mod tests {
                 allow_replayed_duplicates,
                 ..
             } => assert!(allow_replayed_duplicates),
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn absorb_changed_branch_query_flag_parses() {
+        let cli = Cli::try_parse_from(["spr", "absorb", "--query-changed-branches"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Absorb {
+                query_changed_branches,
+                ..
+            } => assert!(query_changed_branches),
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn absorb_from_selector_parses() {
+        let cli = Cli::try_parse_from(["spr", "absorb", "--from", "pr:beta"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Absorb {
+                from: Some(crate::selectors::GroupSelector::Stable(handle)),
+                ..
+            } => assert_eq!(handle.tag, "beta"),
             other => panic!("unexpected command: {:?}", other),
         }
     }
