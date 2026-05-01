@@ -26,6 +26,7 @@ pub enum JsonCommand {
     ListPr,
     ListCommit,
     Status,
+    SyncLocalBranches,
     Update,
     Prep,
     RelinkPrs,
@@ -320,6 +321,8 @@ pub fn command_for_raw_args(args: &[OsString]) -> JsonCommand {
                 saw_list = true;
             } else if arg == "status" || arg == "stat" {
                 return JsonCommand::Status;
+            } else if arg == "sync-local-branches" {
+                return JsonCommand::SyncLocalBranches;
             } else if arg == "update" || arg == "u" {
                 return JsonCommand::Update;
             } else if arg == "prep" {

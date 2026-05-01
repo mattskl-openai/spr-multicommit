@@ -64,6 +64,7 @@ mod tests {
                         },
                     },
                 }],
+                local_pr_branch_drift: Vec::new(),
             },
         );
 
@@ -93,6 +94,7 @@ mod tests {
                         subject: "feat: alpha".to_string(),
                     }],
                 }],
+                local_pr_branch_drift: Vec::new(),
             },
         );
 
@@ -116,6 +118,7 @@ mod tests {
                                 subject: "feat: alpha".to_string(),
                             }],
                         }],
+                        local_pr_branch_drift: Vec::new(),
                     },
                 },
             )

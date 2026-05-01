@@ -20,6 +20,14 @@ use crate::update_output::{
     ResolvedUpdateLimit, UpdateOptions, UpdateRepoContext, UpdateSummaryData,
 };
 
+pub struct PrepExecutionOptions {
+    pub pr_description_mode: crate::config::PrDescriptionMode,
+    pub list_order: crate::config::ListOrder,
+    pub local_pr_branch_policy: crate::config::LocalPrBranchSyncPolicy,
+    pub selection: crate::cli::PrepSelection,
+    pub execution_mode: ExecutionMode,
+}
+
 fn resolve_prep_window(
     groups: &[crate::parsing::Group],
     selection: &crate::cli::PrepSelection,
@@ -177,11 +185,15 @@ pub fn prep_squash(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
-    pr_description_mode: crate::config::PrDescriptionMode,
-    list_order: crate::config::ListOrder,
-    selection: crate::cli::PrepSelection,
-    execution_mode: ExecutionMode,
+    options: PrepExecutionOptions,
 ) -> Result<PrepSummaryData> {
+    let PrepExecutionOptions {
+        pr_description_mode,
+        list_order,
+        local_pr_branch_policy,
+        selection,
+        execution_mode,
+    } = options;
     let dry_run = execution_mode == ExecutionMode::DryRun;
     let (merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
@@ -383,7 +395,7 @@ pub fn prep_squash(
         list_order,
         true,
         0,
-        crate::config::LocalPrBranchSyncPolicy::Off,
+        local_pr_branch_policy,
     )?;
     let update_summary = UpdateSummaryData::from_execution(
         UpdateRepoContext {
@@ -396,7 +408,7 @@ pub fn prep_squash(
             dry_run,
             no_pr: false,
             pr_description_mode,
-            local_pr_branches: crate::config::LocalPrBranchSyncPolicy::Off,
+            local_pr_branches: local_pr_branch_policy,
         },
         resolved_extent,
         update_execution,
@@ -484,7 +496,7 @@ pub fn print_prep_summary(summary: &PrepSummaryData) {
 
 #[cfg(test)]
 mod tests {
-    use super::{prep_squash, render_prep_summary, resolve_prep_window};
+    use super::{prep_squash, render_prep_summary, resolve_prep_window, PrepExecutionOptions};
     use crate::cli::PrepSelection;
     use crate::config::{ListOrder, PrDescriptionMode};
     use crate::execution::ExecutionMode;
@@ -572,10 +584,13 @@ mod tests {
             "main",
             "dank-spr/",
             "ignore",
-            PrDescriptionMode::Overwrite,
-            ListOrder::RecentOnBottom,
-            PrepSelection::All,
-            ExecutionMode::DryRun,
+            PrepExecutionOptions {
+                pr_description_mode: PrDescriptionMode::Overwrite,
+                list_order: ListOrder::RecentOnBottom,
+                local_pr_branch_policy: crate::config::LocalPrBranchSyncPolicy::Off,
+                selection: PrepSelection::All,
+                execution_mode: ExecutionMode::DryRun,
+            },
         )
         .unwrap_err();
 

@@ -89,6 +89,35 @@ pub fn sync_local_pr_branches(
     Ok(actions)
 }
 
+pub fn plan_local_pr_branch_drift(
+    policy: LocalPrBranchSyncPolicy,
+    targets: &[LocalPrBranchTarget],
+) -> Result<Vec<LocalPrBranchAction>> {
+    if policy == LocalPrBranchSyncPolicy::Off || targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let checked_out_branches = checked_out_local_branches()?;
+    targets
+        .iter()
+        .map(|target| plan_action(policy, target, &checked_out_branches))
+        .filter_map(|planned| match planned {
+            Ok(planned)
+                if matches!(
+                    planned.action,
+                    LocalPrBranchActionKind::Created
+                        | LocalPrBranchActionKind::Updated
+                        | LocalPrBranchActionKind::Blocked
+                ) =>
+            {
+                Some(Ok(planned.into_action_without_backup_tag()))
+            }
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect()
+}
+
 fn plan_action(
     policy: LocalPrBranchSyncPolicy,
     target: &LocalPrBranchTarget,
@@ -130,6 +159,20 @@ fn plan_action(
         action,
         reason,
     })
+}
+
+impl PlannedLocalPrBranchAction {
+    fn into_action_without_backup_tag(self) -> LocalPrBranchAction {
+        LocalPrBranchAction {
+            stable_handle: self.target.stable_handle,
+            branch: self.target.branch_name,
+            old_tip: self.old_tip,
+            new_tip: self.target.tip,
+            action: self.action,
+            reason: self.reason,
+            backup_tag: None,
+        }
+    }
 }
 
 fn apply_action(
@@ -266,7 +309,10 @@ fn short_sha(sha: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{sync_local_pr_branches, LocalPrBranchActionKind, LocalPrBranchTarget};
+    use super::{
+        plan_local_pr_branch_drift, sync_local_pr_branches, LocalPrBranchActionKind,
+        LocalPrBranchTarget,
+    };
     use crate::config::LocalPrBranchSyncPolicy;
     use crate::execution::ExecutionMode;
     use crate::test_support::{commit_file, git, init_repo, lock_cwd, DirGuard};
@@ -400,6 +446,37 @@ mod tests {
 
         assert_eq!(actions[0].action, LocalPrBranchActionKind::Created);
         assert!(branch_tip(&repo, "dank-spr/alpha").is_none());
+    }
+
+    #[test]
+    fn drift_planning_reports_only_reconcilable_or_blocked_branches() {
+        let _lock = lock_cwd();
+        let dir = init_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+        let current_tip = rev_parse(&repo, "HEAD");
+        git(
+            &repo,
+            ["branch", "dank-spr/current", &current_tip].as_slice(),
+        );
+        git(&repo, ["branch", "dank-spr/stale", &current_tip].as_slice());
+        let target_tip = commit_file(&repo, "alpha.txt", "alpha\n", "feat: alpha");
+
+        let actions = plan_local_pr_branch_drift(
+            LocalPrBranchSyncPolicy::CreateOrUpdate,
+            &[
+                target("dank-spr/missing", &target_tip),
+                target("dank-spr/current", &current_tip),
+                target("dank-spr/stale", &target_tip),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].branch, "dank-spr/missing");
+        assert_eq!(actions[0].action, LocalPrBranchActionKind::Created);
+        assert_eq!(actions[1].branch, "dank-spr/stale");
+        assert_eq!(actions[1].action, LocalPrBranchActionKind::Updated);
     }
 
     #[test]
