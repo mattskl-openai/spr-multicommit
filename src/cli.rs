@@ -128,6 +128,19 @@ pub enum Cmd {
         output: OutputArgs,
     },
 
+    /// Drop bottom PR groups whose GitHub PRs already merged, without landing or mutating PRs
+    #[command(
+        long_about = "Drop bottom PR groups whose GitHub PRs already merged, without landing or mutating PRs.\n\n`spr drop-merged-prefix` is local post-merge maintenance. It reads GitHub PR state, verifies each dropped PR's GitHub merge commit is contained in the configured SPR base, and then rewrites only the checked-out local stack.\n\nIt does not merge, close, retarget, comment on, or push GitHub PRs. After inspecting the rewritten stack, run `spr update` to publish remaining PR branch updates."
+    )]
+    DropMergedPrefix {
+        /// Create a local backup tag at current HEAD before rewriting
+        #[arg(long)]
+        safe: bool,
+
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+
     /// Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch
     #[command(
         long_about = "Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.\n\nIf you append commits to the end of a local PR branch such as `user-spr/alpha`, run `spr absorb` while the stack branch is checked out. `spr` rebuilds the local stack so the new commits become part of the matching PR group. The PR-group order stays the same.\n\nThis command is local-only: it rewrites the current stack branch, creates a backup tag, and does not update GitHub. After checking the result, run `spr update`.\n\nOnly exact local branches named `prefix + tag` are considered. If one of those branches still points at rewritten-equivalent stack commits, `spr absorb` accepts that prefix only when the branch still descends from the same stack merge-base and the matched pre-tail commit ends at the same tree as the canonical stack prefix. A no-op rewritten match is reported as `skip (rewritten-equivalent prefix)`, and only commits appended above that proven prefix are absorbed. `spr absorb` also refuses to operate when two live PR groups would derive synthetic branch names that differ only by case.\n\nExample:\n- The current stack has three PR groups: `pr:alpha`, `pr:beta`, and `pr:gamma`.\n- Check out `user-spr/alpha` and append 2 commits.\n- Check out the stack branch.\n- Run `spr absorb`.\n- Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same.\n- Then run `spr update`.\n\nOn cherry-pick conflict, `spr absorb` leaves the temp rewrite worktree in place, writes a resume file under the repository common Git directory, and prints `spr resume <path>`. Resolve conflicts in that temp worktree, stage the resolution, and run the printed resume command.\n\nAdvanced:\n- By default, absorb blocks copied later commits when replaying the stack would become empty or ambiguous.\n- `--allow-replayed-duplicates` allows an earlier copied non-seed follow-up commit to coexist with its later replayed copy by keeping both commits in the rewritten stack."
@@ -253,6 +266,7 @@ impl Cmd {
     pub fn output_format(&self) -> OutputFormat {
         match self {
             Self::Restack { output, .. }
+            | Self::DropMergedPrefix { output, .. }
             | Self::Absorb { output, .. }
             | Self::ResolveStack { output, .. }
             | Self::Resume { output, .. }
@@ -348,6 +362,18 @@ mod tests {
     }
 
     #[test]
+    fn drop_merged_prefix_help_text_says_local_post_merge_maintenance() {
+        let mut cli = Cli::command();
+        let command = cli.find_subcommand_mut("drop-merged-prefix").unwrap();
+        let long_about = command.get_long_about().unwrap().to_string();
+
+        assert!(long_about.contains("local post-merge maintenance"));
+        assert!(long_about.contains("without landing or mutating PRs"));
+        assert!(long_about.contains("does not merge, close, retarget, comment on, or push"));
+        assert!(long_about.contains("run `spr update`"));
+    }
+
+    #[test]
     fn resume_command_parses_explicit_path() {
         let cli = Cli::try_parse_from([
             "spr",
@@ -381,6 +407,9 @@ mod tests {
     fn rewrite_commands_report_json_mode() {
         let restack = Cli::try_parse_from(["spr", "restack", "--after", "1", "--json"]).unwrap();
         assert_eq!(restack.cmd.output_format(), OutputFormat::Json);
+
+        let drop_merged = Cli::try_parse_from(["spr", "drop-merged-prefix", "--json"]).unwrap();
+        assert_eq!(drop_merged.cmd.output_format(), OutputFormat::Json);
 
         let land = Cli::try_parse_from(["spr", "land", "--json"]).unwrap();
         assert_eq!(land.cmd.output_format(), OutputFormat::Json);

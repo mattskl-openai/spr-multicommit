@@ -11,6 +11,7 @@ pub const EXIT_SUSPENDED: i32 = 2;
 pub enum JsonCommand {
     Cli,
     Restack,
+    DropMergedPrefix,
     Absorb,
     Move,
     FixPr,
@@ -128,6 +129,8 @@ pub fn command_for_raw_args(args: &[OsString]) -> JsonCommand {
                 return JsonCommand::ListCommit;
             } else if arg == "restack" {
                 return JsonCommand::Restack;
+            } else if arg == "drop-merged-prefix" {
+                return JsonCommand::DropMergedPrefix;
             } else if arg == "absorb" {
                 return JsonCommand::Absorb;
             } else if arg == "move" || arg == "mv" {
@@ -195,6 +198,17 @@ mod tests {
 
         assert_eq!(command_for_raw_args(&pr_args), JsonCommand::ListPr);
         assert_eq!(command_for_raw_args(&commit_args), JsonCommand::ListCommit);
+    }
+
+    #[test]
+    fn raw_args_detect_drop_merged_prefix_command() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("drop-merged-prefix"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(command_for_raw_args(&args), JsonCommand::DropMergedPrefix);
     }
 
     #[test]

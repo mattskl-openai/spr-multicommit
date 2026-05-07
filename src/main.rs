@@ -74,6 +74,7 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
         crate::cli::Cmd::List { .. }
         | crate::cli::Cmd::Status { .. }
         | crate::cli::Cmd::Prep { .. }
+        | crate::cli::Cmd::DropMergedPrefix { .. }
         | crate::cli::Cmd::Land { .. }
         | crate::cli::Cmd::RelinkPrs { .. }
         | crate::cli::Cmd::Cleanup { .. }
@@ -391,6 +392,21 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 crate::commands::restack_after(
                     &metadata_refresh_context,
                     &after,
+                    safe,
+                    cli.dry_run,
+                    restack_conflict_policy,
+                    dirty_worktree_policy,
+                )?,
+            )?))
+        }
+        crate::cli::Cmd::DropMergedPrefix { safe, output: _ } => {
+            set_dry_run_env(cli.dry_run, false);
+            Ok(CommandOutput::Machine(ensure_rewrite_completed(
+                output_format,
+                "spr drop-merged-prefix",
+                crate::machine_output::MachineCommand::DropMergedPrefix,
+                crate::commands::drop_merged_prefix(
+                    &metadata_refresh_context,
                     safe,
                     cli.dry_run,
                     restack_conflict_policy,
@@ -782,6 +798,9 @@ fn main() {
 fn json_command_for_cli(cmd: &crate::cli::Cmd) -> crate::json_output::JsonCommand {
     match cmd {
         crate::cli::Cmd::Restack { .. } => crate::machine_output::MachineCommand::Restack,
+        crate::cli::Cmd::DropMergedPrefix { .. } => {
+            crate::machine_output::MachineCommand::DropMergedPrefix
+        }
         crate::cli::Cmd::Absorb { .. } => crate::machine_output::MachineCommand::Absorb,
         crate::cli::Cmd::ResolveStack { .. } => crate::machine_output::MachineCommand::ResolveStack,
         crate::cli::Cmd::Resume { .. } => crate::machine_output::MachineCommand::Resume,
@@ -943,6 +962,14 @@ mod tests {
     fn absorb_is_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::Absorb {
             allow_replayed_duplicates: false,
+            output: OutputArgs::human(),
+        }));
+    }
+
+    #[test]
+    fn drop_merged_prefix_requires_github_cli() {
+        assert!(command_requires_gh(&crate::cli::Cmd::DropMergedPrefix {
+            safe: true,
             output: OutputArgs::human(),
         }));
     }
@@ -1142,6 +1169,20 @@ mod tests {
         ];
 
         assert_eq!(json_command_for_raw_args(&args), JsonCommand::Update);
+    }
+
+    #[test]
+    fn json_command_for_raw_args_detects_drop_merged_prefix() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("drop-merged-prefix"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(
+            json_command_for_raw_args(&args),
+            JsonCommand::DropMergedPrefix
+        );
     }
 
     #[test]

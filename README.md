@@ -196,6 +196,9 @@ Behavior:
 ### spr restack
 
 Restack the local stack by rebuilding commits after the bottom N PR groups onto the latest base.
+Use this for local open-stack reshaping, such as reordering PR groups or rebuilding the remaining
+open groups onto base. If bottom PRs already merged on GitHub and you want the local stack to catch
+up, prefer `spr drop-merged-prefix`.
 
 Options:
 
@@ -218,6 +221,35 @@ Behavior:
 - `halt` (default) suspends on conflict, leaves the temp restack worktree and branch in place, writes a resume file under the repository common Git directory, and prints `spr resume <path>`.
 - `rollback` preserves the historical cleanup-on-conflict behavior and attempts to remove the temp restack worktree and branch (cleanup failures may require manual cleanup).
 - When restack suspends, resolve conflicts inside the printed temp worktree path, stage the resolution, and run the printed `spr resume <path>` command. Resolving in your original worktree does not advance the suspended cherry-pick.
+
+### spr drop-merged-prefix
+
+Drop the bottom local PR groups whose GitHub PRs already merged, without landing or updating any
+GitHub PR.
+Prefer this when one or more bottom PRs already merged on GitHub and your local stack still
+contains them. This is post-merge local cleanup; `spr restack` remains the general local rewrite
+tool for reshaping the remaining open stack.
+
+Typical workflow:
+
+```bash
+# After GitHub auto-merges the bottom PR:
+git fetch origin
+spr drop-merged-prefix --safe
+spr status
+spr update
+```
+
+Behavior:
+
+- Reads open/merged GitHub PR state for the local stack's synthetic PR branches
+- Selects only the contiguous bottom prefix whose PRs are `MERGED`; if the bottom PR is still open, nothing is rewritten
+- Fetches each dropped PR's GitHub merge commit OID and verifies that commit is already an ancestor of the configured SPR base, such as `origin/main`
+- Uses a fast native Git rewrite for the common case, so the checked-out stack branch starts at the first still-open PR group on top of the updated base
+- Falls back to the existing `spr restack` replay when it must preserve ignored local commits from the dropped prefix, or when native rebase cannot complete cleanly
+- With `--safe`, creates a local backup tag named like `backup/drop-merged-prefix/<current-branch>-<short-sha>` before moving the branch
+- Does not merge, close, retarget, comment on, push, or otherwise mutate GitHub PRs
+- Does not run `spr update`; run it afterwards to publish the remaining open PR branch updates
 
 ### spr absorb
 

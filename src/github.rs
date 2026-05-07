@@ -8,7 +8,7 @@
 //! latest terminal PR event for a canonical head ref so branch-name reuse can be blocked after
 //! recent merges or closes.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -736,6 +736,60 @@ pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiRev
     Ok(out)
 }
 
+pub fn fetch_merged_pr_merge_commit_oids(numbers: &[u64]) -> Result<HashMap<u64, String>> {
+    let mut out = HashMap::new();
+    if numbers.is_empty() {
+        return Ok(out);
+    }
+    let (owner, name) = get_repo_owner_name()?;
+    let mut query =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (i, number) in numbers.iter().enumerate() {
+        query.push_str(&format!(
+            "pr{}: pullRequest(number: {}) {{ number state mergeCommit {{ oid }} }} ",
+            i, number
+        ));
+    }
+    query.push_str("} }");
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={}", query),
+            "-F",
+            &format!("owner={}", owner),
+            "-F",
+            &format!("name={}", name),
+        ]
+        .as_slice(),
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &v["data"]["repository"];
+    for (i, number) in numbers.iter().enumerate() {
+        let key = format!("pr{}", i);
+        let node = &repo[&key];
+        if node.is_null() {
+            bail!("GitHub PR #{} was not found", number);
+        }
+        let state = node["state"]
+            .as_str()
+            .ok_or_else(|| anyhow!("GitHub PR #{} result missing state", number))?;
+        if state != "MERGED" {
+            bail!(
+                "GitHub PR #{} is {}, but drop-merged-prefix expected MERGED",
+                number,
+                state
+            );
+        }
+        let oid = node["mergeCommit"]["oid"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Merged GitHub PR #{} has no merge commit OID", number))?;
+        out.insert(*number, oid.to_string());
+    }
+    Ok(out)
+}
+
 pub fn get_repo_owner_name() -> Result<(String, String)> {
     let url = git_ro(["config", "--get", "remote.origin.url"].as_slice())?
         .trim()
@@ -1134,9 +1188,9 @@ pub fn append_warning_to_pr(number: u64, warning: &str, dry: bool) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_case_variant_head_search_matches, filter_head_search_matches,
-        list_conflicting_prs_for_heads_search_exhaustive, list_exact_prs_for_heads,
-        list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
+        fetch_merged_pr_merge_commit_oids, filter_case_variant_head_search_matches,
+        filter_head_search_matches, list_conflicting_prs_for_heads_search_exhaustive,
+        list_exact_prs_for_heads, list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
         list_recent_terminal_prs_for_heads, parse_open_pr_automerge_node, resolve_pr_url_head_ref,
         select_latest_merged_pr_match, select_single_open_pr_match, HeadSearchPr, PrState,
         TerminalPrState, EXACT_HEAD_QUERY_LIMIT,
@@ -1267,6 +1321,28 @@ mod tests {
         )
     }
 
+    fn install_gh_number_query_wrapper(
+        response_json: &str,
+    ) -> (TempDir, TempDir, EnvVarGuard, String) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let log_path = data_dir.path().join("gh.log");
+        let response_path = data_dir.path().join("response.json");
+        fs::write(&response_path, response_json).unwrap();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  cat \"{}\"\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            log_path.display(),
+            response_path.display()
+        );
+        let (wrapper_dir, path_guard) = install_gh_wrapper(&script);
+
+        (
+            wrapper_dir,
+            data_dir,
+            path_guard,
+            log_path.display().to_string(),
+        )
+    }
+
     #[test]
     fn resolve_pr_url_head_ref_reads_only_head_ref_name() {
         let _lock = lock_cwd();
@@ -1284,6 +1360,64 @@ mod tests {
         assert_eq!(head_ref_name, "dank-spr/example");
         let log = fs::read_to_string(log_path).expect("read gh log");
         assert!(log.contains("pr view https://github.com/o/r/pull/17 --json headRefName"));
+    }
+
+    #[test]
+    fn fetch_merged_pr_merge_commit_oids_queries_numbers_and_returns_oids() {
+        let _lock = lock_cwd();
+        let (_wrapper_dir, _data_dir, _path_guard, log_path) = install_gh_number_query_wrapper(
+            &json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "number": 10,
+                            "state": "MERGED",
+                            "mergeCommit": { "oid": "merge-alpha" }
+                        },
+                        "pr1": {
+                            "number": 11,
+                            "state": "MERGED",
+                            "mergeCommit": { "oid": "merge-beta" }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        let oids = fetch_merged_pr_merge_commit_oids(&[10, 11]).unwrap();
+
+        assert_eq!(oids[&10], "merge-alpha");
+        assert_eq!(oids[&11], "merge-beta");
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("pullRequest(number: 10)"));
+        assert!(log.contains("pullRequest(number: 11)"));
+        assert!(log.contains("mergeCommit { oid }"));
+    }
+
+    #[test]
+    fn fetch_merged_pr_merge_commit_oids_rejects_missing_merge_commit() {
+        let _lock = lock_cwd();
+        let (_wrapper_dir, _data_dir, _path_guard, _log_path) = install_gh_number_query_wrapper(
+            &json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "number": 10,
+                            "state": "MERGED",
+                            "mergeCommit": null
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        let err = fetch_merged_pr_merge_commit_oids(&[10]).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Merged GitHub PR #10 has no merge commit OID"));
     }
 
     #[test]
