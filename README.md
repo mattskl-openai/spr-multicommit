@@ -346,13 +346,25 @@ Behavior:
 
 Machine-readable `--json` mode:
 
-- Supported on `spr list pr`, `spr list commit`, `spr status`, `spr update`, `spr prep`,
-  `spr relink-prs`, `spr cleanup`, `spr restack`, `spr absorb`, `spr move`, `spr fix-pr`,
-  `spr land`, `spr resume`, and `spr resolve-stack`
+- `--json` is a global output mode. It can appear before the command, after the command, or
+  between a parent command and leaf subcommand, as long as it appears before a literal `--`
+  passthrough marker. For example, `spr --json status`, `spr status --json`,
+  `spr --json list commit`, `spr list --json commit`, and `spr list commit --json` are
+  equivalent. A `--json` token after `--` is preserved as payload and does not change `spr`
+  output mode.
+- Supported on operational commands including `spr list pr`, `spr list commit`, `spr status`,
+  `spr update`, `spr prep`, `spr relink-prs`, `spr cleanup`, `spr restack`, `spr absorb`,
+  `spr move`, `spr fix-pr`, `spr land`, `spr resume`, and `spr resolve-stack`
+- Also supported for display output: `spr --json --help`, `spr --help --json`,
+  `spr --json help list commit`, `spr list commit --help --json`, `spr --json --version`, and
+  `spr --version --json` each emit one structured JSON object
 - In `--json` mode, stdout is exactly one JSON object and stderr is normally empty
 - Summary-style commands (`list pr`, `list commit`, `status`, `update`, `prep`, `relink-prs`,
   and `cleanup`) share the same top-level shape: `schema_version`, `command`,
   `result: "summary"`, and `data`
+- JSON help uses `result: "help"` and includes the resolved command path, usage, options,
+  positionals, subcommands, aliases, and `rendered_text` containing Clap's normal human help
+- JSON version uses `result: "version"` and includes the binary name and Cargo package version
 - `spr list --json pr`, `spr list --json commit`, and `spr status --json` always emit canonical
   bottom-up stack order, even when `list_order: recent_on_top` changes the human display order.
   Each group's `remote.kind` encodes whether there is no matching PR, a PR without CI/review

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{error::ErrorKind, Parser};
+use serde::Serialize;
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -70,13 +71,13 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
         | crate::cli::Cmd::Absorb { .. }
         | crate::cli::Cmd::Resume { .. }
         | crate::cli::Cmd::FixPr { .. } => false,
-        crate::cli::Cmd::ResolveStack { target, .. } => target
+        crate::cli::Cmd::ResolveStack { target } => target
             .as_deref()
             .map(crate::commands::looks_like_pr_url)
             .unwrap_or(false),
         crate::cli::Cmd::Update { no_pr, .. } => !*no_pr,
         crate::cli::Cmd::List { .. }
-        | crate::cli::Cmd::Status { .. }
+        | crate::cli::Cmd::Status
         | crate::cli::Cmd::Prep { .. }
         | crate::cli::Cmd::DropMergedPrefix { .. }
         | crate::cli::Cmd::Land { .. }
@@ -278,7 +279,6 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             pr_description_mode: pr_description_mode_override,
             allow_branch_reuse,
             dry_run,
-            output: _,
             extent,
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
@@ -391,7 +391,6 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             safe,
             preview,
             dry_run,
-            output: _,
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
@@ -419,11 +418,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 )?))
             }
         }
-        crate::cli::Cmd::DropMergedPrefix {
-            safe,
-            dry_run,
-            output: _,
-        } => {
+        crate::cli::Cmd::DropMergedPrefix { safe, dry_run } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
             Ok(CommandOutput::Machine(ensure_rewrite_completed(
@@ -442,7 +437,6 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
         crate::cli::Cmd::Absorb {
             allow_replayed_duplicates,
             dry_run,
-            output: _,
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
@@ -467,7 +461,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 )?,
             )?))
         }
-        crate::cli::Cmd::Prep { dry_run, output: _ } => {
+        crate::cli::Cmd::Prep { dry_run } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
             if cli.until.is_some() && cli.exact.is_some() {
@@ -539,7 +533,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 Ok(CommandOutput::None)
             }
         }
-        crate::cli::Cmd::Status { output: _ } => {
+        crate::cli::Cmd::Status => {
             if output_format == crate::cli::OutputFormat::Json {
                 match read_only_pr_list_output(
                     crate::json_output::JsonCommand::Status,
@@ -555,7 +549,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 Ok(CommandOutput::None)
             }
         }
-        crate::cli::Cmd::ResolveStack { target, output: _ } => Ok(CommandOutput::ResolveStack(
+        crate::cli::Cmd::ResolveStack { target } => Ok(CommandOutput::ResolveStack(
             crate::commands::resolve_stack(target, &ignore_tag)?,
         )),
         crate::cli::Cmd::Resume { .. } => unreachable!("handled before config loading"),
@@ -564,7 +558,6 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             r#unsafe,
             no_restack,
             dry_run,
-            output: _,
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
@@ -630,7 +623,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 ),
             ))
         }
-        crate::cli::Cmd::RelinkPrs { dry_run, output: _ } => {
+        crate::cli::Cmd::RelinkPrs { dry_run } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
             let summary = crate::commands::relink_prs(&base, &prefix, &ignore_tag, execution_mode)?;
@@ -643,7 +636,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 Ok(CommandOutput::None)
             }
         }
-        crate::cli::Cmd::Cleanup { dry_run, output: _ } => {
+        crate::cli::Cmd::Cleanup { dry_run } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
             let summary = crate::commands::cleanup_remote_branches(&prefix, execution_mode)?;
@@ -661,7 +654,6 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             tail,
             safe,
             dry_run,
-            output: _,
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
@@ -684,7 +676,6 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             after,
             safe,
             dry_run,
-            output: _,
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
@@ -734,23 +725,20 @@ fn init_logging(verbose: bool, output_format: crate::cli::OutputFormat) {
     }
 }
 
-fn raw_args_request_json(args: &[OsString]) -> bool {
-    crate::json_output::raw_args_request_json(args)
-}
-
 fn json_command_for_raw_args(args: &[OsString]) -> crate::json_output::JsonCommand {
     crate::json_output::command_for_raw_args(args)
 }
 
 fn parse_failure_as_json_output(
     args: &[OsString],
+    json_requested: bool,
     err: &clap::Error,
 ) -> Option<crate::json_output::ErrorOutput> {
     let is_display_only = matches!(
         err.kind(),
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     );
-    if raw_args_request_json(args) && !is_display_only {
+    if json_requested && !is_display_only {
         Some(crate::json_output::ErrorOutput::invalid_arguments(
             json_command_for_raw_args(args),
             err.to_string(),
@@ -760,20 +748,45 @@ fn parse_failure_as_json_output(
     }
 }
 
+fn exit_with_json<T: Serialize>(output: &T, exit_code: i32) -> ! {
+    println!("{}", serde_json::to_string(output).unwrap());
+    std::process::exit(exit_code);
+}
+
 fn main() {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
-    let cli = match crate::cli::Cli::try_parse_from(raw_args.clone()) {
+    let json_scan = crate::json_output::scan_json_output_request(raw_args.clone());
+    let cli = match crate::cli::Cli::try_parse_from(json_scan.clap_args.clone()) {
         Ok(cli) => cli,
         Err(err) => {
-            if let Some(output) = parse_failure_as_json_output(&raw_args, &err) {
-                println!("{}", serde_json::to_string(&output).unwrap());
-                std::process::exit(output.exit_code());
+            if json_scan.requested && err.kind() == ErrorKind::DisplayHelp {
+                match crate::json_output::help_output_for_args(&raw_args) {
+                    Ok(output) => exit_with_json(&output, output.exit_code()),
+                    Err(err) => {
+                        let output = crate::json_output::ErrorOutput::internal(
+                            crate::json_output::JsonCommand::Help,
+                            format!("{err:#}"),
+                        );
+                        exit_with_json(&output, output.exit_code());
+                    }
+                }
+            } else if json_scan.requested && err.kind() == ErrorKind::DisplayVersion {
+                let output = crate::json_output::version_output();
+                exit_with_json(&output, output.exit_code());
+            } else if let Some(output) =
+                parse_failure_as_json_output(&raw_args, json_scan.requested, &err)
+            {
+                exit_with_json(&output, output.exit_code());
             } else {
                 err.exit();
             }
         }
     };
-    let output_format = cli.cmd.output_format();
+    let output_format = if json_scan.requested {
+        crate::cli::OutputFormat::Json
+    } else {
+        crate::cli::OutputFormat::Human
+    };
     init_logging(cli.verbose, output_format);
     let command = json_command_for_cli(&cli.cmd);
     match run_cli(cli, output_format) {
@@ -781,46 +794,39 @@ fn main() {
             CommandOutput::None => {}
             CommandOutput::Machine(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
-                    println!("{}", serde_json::to_string(&output).unwrap());
-                    std::process::exit(output.exit_code());
+                    exit_with_json(&output, output.exit_code());
                 }
             }
             CommandOutput::ReadOnly(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
-                    println!("{}", serde_json::to_string(&output).unwrap());
-                    std::process::exit(output.exit_code());
+                    exit_with_json(&output, output.exit_code());
                 }
             }
             CommandOutput::RestackPreview(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
-                    println!("{}", serde_json::to_string(&output).unwrap());
-                    std::process::exit(output.exit_code());
+                    exit_with_json(&output, output.exit_code());
                 } else {
                     println!("{}", output.render_human());
                 }
             }
             CommandOutput::Update(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
-                    println!("{}", serde_json::to_string(&output).unwrap());
-                    std::process::exit(output.exit_code());
+                    exit_with_json(&output, output.exit_code());
                 }
             }
             CommandOutput::Maintenance(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
-                    println!("{}", serde_json::to_string(&output).unwrap());
-                    std::process::exit(output.exit_code());
+                    exit_with_json(&output, output.exit_code());
                 }
             }
             CommandOutput::Error(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
-                    println!("{}", serde_json::to_string(&output).unwrap());
-                    std::process::exit(output.exit_code());
+                    exit_with_json(&output, output.exit_code());
                 }
             }
             CommandOutput::ResolveStack(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
-                    println!("{}", serde_json::to_string(&output).unwrap());
-                    std::process::exit(crate::json_output::EXIT_SUCCESS);
+                    exit_with_json(&output, crate::json_output::EXIT_SUCCESS);
                 } else {
                     println!("{}", output.render_human());
                 }
@@ -829,8 +835,7 @@ fn main() {
         Err(err) => {
             if output_format == crate::cli::OutputFormat::Json {
                 let output = crate::json_output::ErrorOutput::internal(command, format!("{err:#}"));
-                println!("{}", serde_json::to_string(&output).unwrap());
-                std::process::exit(output.exit_code());
+                exit_with_json(&output, output.exit_code());
             } else {
                 eprintln!("Error: {err:#}");
                 std::process::exit(crate::json_output::EXIT_FAILURE);
@@ -857,7 +862,7 @@ fn json_command_for_cli(cmd: &crate::cli::Cmd) -> crate::json_output::JsonComman
             crate::cli::ListWhat::Pr => crate::machine_output::MachineCommand::ListPr,
             crate::cli::ListWhat::Commit => crate::machine_output::MachineCommand::ListCommit,
         },
-        crate::cli::Cmd::Status { .. } => crate::machine_output::MachineCommand::Status,
+        crate::cli::Cmd::Status => crate::machine_output::MachineCommand::Status,
         crate::cli::Cmd::RelinkPrs { .. } => crate::machine_output::MachineCommand::RelinkPrs,
         crate::cli::Cmd::Cleanup { .. } => crate::machine_output::MachineCommand::Cleanup,
     }
@@ -869,7 +874,7 @@ mod tests {
         apply_working_directory_override, command_requires_gh, json_command_for_raw_args,
         parse_failure_as_json_output, resolve_update_pr_limit, run_cli, CommandOutput,
     };
-    use crate::cli::{DryRunArgs, OutputArgs, OutputFormat};
+    use crate::cli::{DryRunArgs, OutputFormat};
     use crate::json_output::{ErrorPayload, JsonCommand, JsonError, EXIT_FAILURE};
     use crate::maintenance_output::{
         MaintenancePayload, PrepNextChildAction, ResolvedPrepSelection,
@@ -1007,7 +1012,6 @@ mod tests {
         assert!(!command_requires_gh(&crate::cli::Cmd::Absorb {
             allow_replayed_duplicates: false,
             dry_run: DryRunArgs::default(),
-            output: OutputArgs::human(),
         }));
     }
 
@@ -1016,7 +1020,6 @@ mod tests {
         assert!(command_requires_gh(&crate::cli::Cmd::DropMergedPrefix {
             safe: true,
             dry_run: DryRunArgs::default(),
-            output: OutputArgs::human(),
         }));
     }
 
@@ -1024,15 +1027,12 @@ mod tests {
     fn resume_is_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::Resume {
             path: std::path::PathBuf::from(".git/spr/resume/example.json"),
-            output: OutputArgs::human(),
         }));
     }
 
     #[test]
     fn status_requires_github_cli() {
-        assert!(command_requires_gh(&crate::cli::Cmd::Status {
-            output: OutputArgs::human()
-        }));
+        assert!(command_requires_gh(&crate::cli::Cmd::Status));
     }
 
     #[test]
@@ -1045,7 +1045,6 @@ mod tests {
             pr_description_mode: None,
             allow_branch_reuse: false,
             dry_run: DryRunArgs::default(),
-            output: OutputArgs::human(),
             extent: None,
         }));
     }
@@ -1060,7 +1059,6 @@ mod tests {
             pr_description_mode: None,
             allow_branch_reuse: false,
             dry_run: DryRunArgs::default(),
-            output: OutputArgs::json(),
             extent: None,
         }));
     }
@@ -1069,7 +1067,6 @@ mod tests {
     fn resolve_stack_without_pr_url_stays_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::ResolveStack {
             target: Some("dank-spr/alpha".to_string()),
-            output: OutputArgs::human(),
         }));
     }
 
@@ -1077,7 +1074,6 @@ mod tests {
     fn resolve_stack_pr_url_requires_github_cli() {
         assert!(command_requires_gh(&crate::cli::Cmd::ResolveStack {
             target: Some("https://github.com/o/r/pull/17".to_string()),
-            output: OutputArgs::json(),
         }));
     }
 
@@ -1241,8 +1237,8 @@ mod tests {
             OsString::from("--json"),
         ];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
-        let output =
-            parse_failure_as_json_output(&args, &err).expect("json parse failure should serialize");
+        let output = parse_failure_as_json_output(&args, true, &err)
+            .expect("json parse failure should serialize");
 
         assert_eq!(output.command, JsonCommand::Restack);
         match output.payload {
@@ -1266,8 +1262,8 @@ mod tests {
             OsString::from("--bogus"),
         ];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
-        let output =
-            parse_failure_as_json_output(&args, &err).expect("json parse failure should serialize");
+        let output = parse_failure_as_json_output(&args, true, &err)
+            .expect("json parse failure should serialize");
 
         assert_eq!(output.command, JsonCommand::ListPr);
         assert_eq!(output.schema_version, 1);
@@ -1291,8 +1287,8 @@ mod tests {
             OsString::from("--bogus"),
         ];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
-        let output =
-            parse_failure_as_json_output(&args, &err).expect("json parse failure should serialize");
+        let output = parse_failure_as_json_output(&args, true, &err)
+            .expect("json parse failure should serialize");
 
         assert_eq!(output.command, JsonCommand::Update);
     }
@@ -1306,8 +1302,8 @@ mod tests {
             OsString::from("--bogus"),
         ];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
-        let output =
-            parse_failure_as_json_output(&args, &err).expect("json parse failure should serialize");
+        let output = parse_failure_as_json_output(&args, true, &err)
+            .expect("json parse failure should serialize");
 
         assert_eq!(output.command, JsonCommand::Prep);
     }
@@ -1321,8 +1317,8 @@ mod tests {
             OsString::from("--bogus"),
         ];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
-        let output =
-            parse_failure_as_json_output(&args, &err).expect("json parse failure should serialize");
+        let output = parse_failure_as_json_output(&args, true, &err)
+            .expect("json parse failure should serialize");
 
         assert_eq!(output.command, JsonCommand::RelinkPrs);
     }
@@ -1336,8 +1332,8 @@ mod tests {
             OsString::from("--bogus"),
         ];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
-        let output =
-            parse_failure_as_json_output(&args, &err).expect("json parse failure should serialize");
+        let output = parse_failure_as_json_output(&args, true, &err)
+            .expect("json parse failure should serialize");
 
         assert_eq!(output.command, JsonCommand::Cleanup);
     }
@@ -1347,11 +1343,11 @@ mod tests {
         let args = vec![OsString::from("spr"), OsString::from("restack")];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
 
-        assert!(parse_failure_as_json_output(&args, &err).is_none());
+        assert!(parse_failure_as_json_output(&args, false, &err).is_none());
     }
 
     #[test]
-    fn help_request_with_json_stays_human() {
+    fn help_request_with_json_is_not_parse_failure() {
         let args = vec![
             OsString::from("spr"),
             OsString::from("restack"),
@@ -1360,7 +1356,7 @@ mod tests {
         ];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected help output");
 
-        assert!(parse_failure_as_json_output(&args, &err).is_none());
+        assert!(parse_failure_as_json_output(&args, true, &err).is_none());
     }
 
     fn init_local_stack_repo() -> TempDir {
