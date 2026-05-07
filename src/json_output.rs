@@ -290,6 +290,7 @@ pub fn command_for_raw_args(args: &[OsString]) -> JsonCommand {
             } else if arg == "--cd"
                 || arg == "--base"
                 || arg == "--prefix"
+                || arg == "--local-pr-branches"
                 || arg == "--until"
                 || arg == "--exact"
                 || arg == "-b"

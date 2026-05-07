@@ -9,7 +9,7 @@ use crate::branch_names::{
     canonical_branch_conflict_key, group_branch_identities, CanonicalBranchConflictKey,
 };
 use crate::commands::common;
-use crate::config::{ListOrder, PrDescriptionMode};
+use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
 use crate::execution::ExecutionMode;
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
@@ -393,6 +393,7 @@ fn empty_update_execution(skipped_handles: &[String]) -> UpdateExecutionData {
         warnings: update_warnings(skipped_handles),
         skipped_groups: skipped_group_data(skipped_handles),
         groups: Vec::new(),
+        local_pr_branch_actions: Vec::new(),
     }
 }
 
@@ -409,6 +410,7 @@ fn build_from_groups_internal(
     list_order: ListOrder,
     allow_branch_reuse: bool,
     branch_reuse_guard_days: u32,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
     render_progress: bool,
 ) -> Result<UpdateExecutionData> {
     let dry_run = execution_mode == ExecutionMode::DryRun;
@@ -876,6 +878,23 @@ fn build_from_groups_internal(
     let remote_url_prefix = get_repo_owner_name()
         .ok()
         .map(|(owner, name)| format!("https://github.com/{owner}/{name}/pull/"));
+    let local_pr_targets = planned
+        .iter()
+        .enumerate()
+        .map(
+            |(group_idx, planned_push)| crate::local_pr_branches::LocalPrBranchTarget {
+                stable_handle: common::stable_handle_text(&groups[group_idx].tag),
+                branch_name: planned_push.branch.clone(),
+                tip: planned_push.target_sha.clone(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let local_pr_branch_actions = crate::local_pr_branches::sync_local_pr_branches(
+        local_pr_branch_policy,
+        execution_mode,
+        &local_pr_targets,
+    )?;
+
     let groups = groups
         .iter()
         .zip(branch_identities.iter())
@@ -908,6 +927,7 @@ fn build_from_groups_internal(
         warnings: update_warnings(skipped_handles),
         skipped_groups: skipped_group_data(skipped_handles),
         groups,
+        local_pr_branch_actions,
     })
 }
 
@@ -924,6 +944,7 @@ pub fn build_from_groups_with_summary(
     list_order: ListOrder,
     allow_branch_reuse: bool,
     branch_reuse_guard_days: u32,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
 ) -> Result<UpdateExecutionData> {
     build_from_groups_internal(
         base,
@@ -937,6 +958,7 @@ pub fn build_from_groups_with_summary(
         list_order,
         allow_branch_reuse,
         branch_reuse_guard_days,
+        local_pr_branch_policy,
         false,
     )
 }
@@ -954,6 +976,7 @@ pub fn build_from_groups(
     list_order: ListOrder,
     allow_branch_reuse: bool,
     branch_reuse_guard_days: u32,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
 ) -> Result<()> {
     build_from_groups_internal(
         base,
@@ -967,6 +990,7 @@ pub fn build_from_groups(
         list_order,
         allow_branch_reuse,
         branch_reuse_guard_days,
+        local_pr_branch_policy,
         true,
     )?;
     Ok(())
@@ -1001,6 +1025,7 @@ pub fn build_from_tags(
         list_order,
         true,
         0,
+        LocalPrBranchSyncPolicy::Off,
     )
 }
 
@@ -1012,7 +1037,7 @@ mod tests {
         pr_number_for_head, recent_pr_age, recent_pr_age_blocks_recreation, terminal_pr_action,
     };
     use crate::branch_names::group_branch_identities;
-    use crate::config::{ListOrder, PrDescriptionMode};
+    use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
     use crate::execution::ExecutionMode;
     use crate::github::TerminalPrState;
     use crate::parsing::{split_groups_for_update, Group};
@@ -1138,6 +1163,7 @@ mod tests {
             ListOrder::RecentOnTop,
             false,
             180,
+            LocalPrBranchSyncPolicy::Off,
         )
         .unwrap();
     }

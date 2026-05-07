@@ -31,6 +31,7 @@ pub use relink_prs::{print_relink_prs_summary, relink_prs};
 pub use resolve_stack::{looks_like_pr_url, resolve_stack, ResolveStackOutput};
 pub use restack::{preview_restack_after, restack_after, restack_after_count};
 pub use rewrite_resume::{
-    resume_rewrite, RewriteCommandKind, RewriteCommandOutcome, RewriteSuspendedState,
+    resume_context, resume_rewrite, RewriteCommandKind, RewriteCommandOutcome,
+    RewriteSuspendedState,
 };
 pub use update::{build_from_groups, build_from_groups_with_summary};
