@@ -35,13 +35,12 @@ pub enum LocalPrBranchSyncPolicy {
 /// Behavior when `spr restack` encounters a cherry-pick conflict.
 ///
 /// This is YAML-deserializable and avoids stringly-typed policy handling.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RestackConflictPolicy {
     /// Abort and clean up temp restack state.
     Rollback,
     /// Suspend, leave the temp worktree in place, and resume with `spr resume`.
-    #[default]
     Halt,
 }
 
@@ -50,7 +49,7 @@ pub enum RestackConflictPolicy {
 /// This applies to commands that rebuild the checked-out branch and then move
 /// it to a rewritten tip, such as `spr restack`, `spr move`, `spr fix-pr`, and
 /// `spr absorb`.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DirtyWorktreePolicy {
     /// Preserve the historical behavior: proceed and let the rewrite replace
@@ -60,7 +59,6 @@ pub enum DirtyWorktreePolicy {
     /// reapply them with `git stash apply --index`.
     Stash,
     /// Refuse to rewrite until the worktree is clean.
-    #[default]
     Halt,
 }
 
