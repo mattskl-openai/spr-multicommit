@@ -26,6 +26,20 @@ pub struct RestackPreviewGroup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RestackExecutorPlan {
+    Noop,
+    ResetToBase,
+    NativeRebase {
+        upstream_exclusive: String,
+        commit_count: usize,
+    },
+    TempWorktreeCherryPick {
+        operation_count: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RestackPreviewData {
     pub base_ref: String,
     pub base_sha: Option<String>,
@@ -38,6 +52,7 @@ pub struct RestackPreviewData {
     pub remaining_groups: Vec<RestackPreviewGroup>,
     pub kept_ignored_segment_count: usize,
     pub planned_cherry_pick_operation_count: usize,
+    pub planned_executor: RestackExecutorPlan,
     pub would_fetch_origin_when_executed: bool,
     pub would_create_backup_tag: bool,
     pub would_create_temp_worktree: bool,
@@ -90,6 +105,22 @@ fn render_bool_list(items: &[&str]) -> String {
     items.join("; ")
 }
 
+fn render_planned_executor(executor: &RestackExecutorPlan) -> String {
+    match executor {
+        RestackExecutorPlan::Noop => "no-op".to_string(),
+        RestackExecutorPlan::ResetToBase => "reset current branch to target base".to_string(),
+        RestackExecutorPlan::NativeRebase {
+            upstream_exclusive,
+            commit_count,
+        } => format!(
+            "native git rebase of {commit_count} commit(s) after {upstream_exclusive}; temp-worktree replay if native rebase conflicts"
+        ),
+        RestackExecutorPlan::TempWorktreeCherryPick { operation_count } => {
+            format!("temp-worktree cherry-pick replay ({operation_count} operation(s))")
+        }
+    }
+}
+
 pub fn render_human_preview(title: &str, data: &RestackPreviewData) -> String {
     let is_preview = title.to_ascii_lowercase().contains("preview");
     let base_sha = data.base_sha.as_deref().unwrap_or("<unresolved>");
@@ -122,15 +153,10 @@ pub fn render_human_preview(title: &str, data: &RestackPreviewData) -> String {
         if data.would_create_temp_worktree {
             "create temp restack worktree"
         } else {
-            "skip temp restack worktree"
-        },
-        if data.planned_cherry_pick_operation_count == 0 {
-            "skip cherry-pick replay"
-        } else {
-            "cherry-pick replay plan"
+            "skip temp restack worktree on the planned executor"
         },
         if data.would_reset_current_branch {
-            "reset current branch"
+            "move current branch"
         } else {
             "leave current branch tip unchanged"
         },
@@ -142,7 +168,7 @@ pub fn render_human_preview(title: &str, data: &RestackPreviewData) -> String {
     ]);
 
     format!(
-        "{title}:\n  current branch: {} @ {}\n  target base: {} @ {} ({})\n  selector: --after {} -> keeps first {} PR group(s)\n  drop from local stack: {}\n  replay onto target base: {}\n  preserve ignored blocks before replay: {}\n  planned cherry-pick operations: {}\n  {execution_label}: {}\n  {not_validated_label}: {}",
+        "{title}:\n  current branch: {} @ {}\n  target base: {} @ {} ({})\n  selector: --after {} -> keeps first {} PR group(s)\n  drop from local stack: {}\n  replay onto target base: {}\n  preserve ignored blocks before replay: {}\n  planned cherry-pick operations: {}\n  planned executor: {}\n  {execution_label}: {}\n  {not_validated_label}: {}",
         data.current_branch,
         data.original_head,
         data.base_ref,
@@ -154,6 +180,7 @@ pub fn render_human_preview(title: &str, data: &RestackPreviewData) -> String {
         render_groups(&data.remaining_groups),
         data.kept_ignored_segment_count,
         data.planned_cherry_pick_operation_count,
+        render_planned_executor(&data.planned_executor),
         would_do,
         data.not_validated.join("; ")
     )
@@ -162,8 +189,8 @@ pub fn render_human_preview(title: &str, data: &RestackPreviewData) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        preview, render_human_preview, RestackPreviewData, RestackPreviewGroup,
-        RestackPreviewResult,
+        preview, render_human_preview, RestackExecutorPlan, RestackPreviewData,
+        RestackPreviewGroup, RestackPreviewResult,
     };
 
     fn sample_preview_data() -> RestackPreviewData {
@@ -187,6 +214,7 @@ mod tests {
             }],
             kept_ignored_segment_count: 0,
             planned_cherry_pick_operation_count: 2,
+            planned_executor: RestackExecutorPlan::TempWorktreeCherryPick { operation_count: 2 },
             would_fetch_origin_when_executed: true,
             would_create_backup_tag: true,
             would_create_temp_worktree: true,
@@ -215,6 +243,11 @@ mod tests {
             json["data"]["remaining_groups"][0]["stable_handle"],
             "pr:beta"
         );
+        assert_eq!(
+            json["data"]["planned_executor"]["kind"],
+            "temp_worktree_cherry_pick"
+        );
+        assert_eq!(json["data"]["planned_executor"]["operation_count"], 2);
         assert_eq!(json["data"]["would_create_backup_tag"], true);
     }
 
@@ -229,9 +262,30 @@ mod tests {
             rendered.contains("replay onto target base: pr:beta (1 commit(s), 1 ignored after)")
         );
         assert!(rendered.contains("planned cherry-pick operations: 2"));
+        assert!(rendered.contains("planned executor: temp-worktree cherry-pick replay"));
         assert!(
             rendered.contains("not validated by preview: remote freshness; cherry-pick conflicts")
         );
+    }
+
+    #[test]
+    fn restack_preview_human_renderer_names_native_rebase_executor() {
+        let data = RestackPreviewData {
+            planned_executor: RestackExecutorPlan::NativeRebase {
+                upstream_exclusive: "alpha123".to_string(),
+                commit_count: 3,
+            },
+            would_create_temp_worktree: false,
+            ..sample_preview_data()
+        };
+
+        let rendered = render_human_preview("Restack preview", &data);
+
+        assert!(
+            rendered.contains("planned executor: native git rebase of 3 commit(s) after alpha123")
+        );
+        assert!(rendered.contains("skip temp restack worktree on the planned executor"));
+        assert!(!rendered.contains("create temp restack worktree"));
     }
 
     #[test]

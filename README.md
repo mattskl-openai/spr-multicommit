@@ -215,9 +215,12 @@ Behavior:
 - Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest; ignore blocks are preserved but excluded from grouping)
 - `spr restack --after ... --preview` uses local refs only and reports that remote freshness, replay conflicts, tests, hooks, GitHub mergeability, and update/push results have not been validated
 - Normal human `spr restack --after ...` prints the same high-level plan immediately before it starts the rewrite phase
-- Drops the first N groups, then rebuilds the remaining commits onto `--base` via a temp worktree
+- Drops the first N groups, then rebuilds the remaining commits onto `--base`
   - Ignored commits attached to dropped groups are kept before the remaining stack
   - Ignored commits attached to kept groups move with those groups
+- Uses an in-place Git rebase for clean contiguous-suffix plans.
+- Uses the existing temp-worktree cherry-pick executor when the plan is not one contiguous suffix,
+  or when the fast rebase conflicts and can be aborted cleanly.
 - Updates the current branch to the rebuilt tip
 - With `--safe`, a backup tag named like `backup/restack/<current-branch>-<short-sha>` is created first
 - Conflict handling is controlled by `restack_conflict` in config.
@@ -415,17 +418,18 @@ Example suspend payload:
 }
 ```
 
-Mental model:
+Fallback rewrite mental model:
 
-- `spr` is not running `git rebase`; it is running a local rewrite engine that replays planned commits as individual cherry-picks in a temp worktree
+- `spr` uses the temp rewrite executor when a rewrite cannot run as a native Git operation
+- The temp rewrite executor replays planned commits as individual cherry-picks in a temp worktree
 - The temp rewrite worktree is the execution sandbox
-- The resume file is a checkpoint for that paused rewrite
-- The original checked-out branch is not updated until the entire replay finishes successfully
+- The resume file is a checkpoint for a paused temp-worktree rewrite
+- During a temp-worktree rewrite, the original checked-out branch is not updated until the entire replay finishes successfully
 
 Suspend/resume flow:
 
 1. The original command (`spr restack`, `spr absorb`, `spr move`, or `spr fix-pr`) computes a replay plan for the rewritten stack.
-2. `spr` creates a temp branch and temp worktree at the right base commit.
+2. If that command uses the temp rewrite executor, `spr` creates a temp branch and temp worktree at the right base commit.
 3. `spr` starts replaying the plan as individual cherry-picks in that temp worktree.
 4. If Git reports a cherry-pick conflict, `spr` records the paused rewrite state in the resume file, including the temp worktree path, the original branch identity, the paused temp-worktree `HEAD`, and the index of the failed replay step.
 5. `spr` prints the temp worktree path, temp branch, original branch, and `spr resume <path>`, then leaves the temp worktree in place. The original branch has still not moved.
