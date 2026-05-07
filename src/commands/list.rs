@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use tracing::info;
 
 use crate::branch_names::{
-    canonical_branch_conflict_key, find_synthetic_branch_name_collision, group_branch_identities,
-    CanonicalBranchConflictKey, SyntheticBranchIdentity, SyntheticBranchNameCollision,
+    canonical_branch_conflict_key, find_group_branch_name_collision, group_branch_identities,
+    CanonicalBranchConflictKey, GroupBranchIdentity, GroupBranchNameCollision,
 };
 use crate::config::{ListOrder, LocalPrBranchSyncPolicy};
 use crate::github::{
@@ -27,7 +27,7 @@ use crate::parsing::{derive_local_groups, Group};
 
 #[derive(Debug)]
 pub enum ReadOnlyQueryError {
-    SyntheticBranchNameCollision(SyntheticBranchNameCollision),
+    SyntheticBranchNameCollision(GroupBranchNameCollision),
     Internal(anyhow::Error),
 }
 
@@ -235,10 +235,10 @@ fn derive_groups_and_identities(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
-) -> std::result::Result<(Vec<Group>, Vec<SyntheticBranchIdentity>), ReadOnlyQueryError> {
+) -> std::result::Result<(Vec<Group>, Vec<GroupBranchIdentity>), ReadOnlyQueryError> {
     let (_merge_base, groups) =
         derive_local_groups(base, ignore_tag).map_err(ReadOnlyQueryError::Internal)?;
-    if let Some(collision) = find_synthetic_branch_name_collision(&groups, prefix) {
+    if let Some(collision) = find_group_branch_name_collision(&groups, prefix) {
         Err(ReadOnlyQueryError::SyntheticBranchNameCollision(collision))
     } else {
         let identities =
@@ -248,7 +248,7 @@ fn derive_groups_and_identities(
 }
 
 fn fetch_remote_pr_metadata(
-    branch_identities: &[SyntheticBranchIdentity],
+    branch_identities: &[GroupBranchIdentity],
 ) -> Result<HashMap<CanonicalBranchConflictKey, RemotePrMetadata>> {
     let heads: Vec<String> = branch_identities
         .iter()
@@ -290,7 +290,7 @@ fn build_remote_pr_metadata(
 
 fn build_pr_list_data(
     groups: &[Group],
-    branch_identities: &[SyntheticBranchIdentity],
+    branch_identities: &[GroupBranchIdentity],
     remote_by_head: &HashMap<CanonicalBranchConflictKey, RemotePrMetadata>,
     local_pr_branch_drift: Vec<crate::local_pr_branches::LocalPrBranchAction>,
 ) -> PrListData {
@@ -301,7 +301,7 @@ fn build_pr_list_data(
             let identity = &branch_identities[group_idx];
             PrGroupData {
                 local_pr_number: group_idx + 1,
-                stable_handle: crate::commands::common::stable_handle_text(&group.tag),
+                stable_handle: crate::commands::common::group_selector_text(group),
                 head_branch: identity.exact.clone(),
                 first_commit_sha: group.commits.first().cloned().unwrap_or_default(),
                 commit_count: group.commits.len(),
@@ -324,7 +324,7 @@ fn build_pr_list_data(
 
 fn build_commit_list_data(
     groups: &[Group],
-    branch_identities: &[SyntheticBranchIdentity],
+    branch_identities: &[GroupBranchIdentity],
     remote_by_head: &HashMap<CanonicalBranchConflictKey, RemotePrMetadata>,
     local_pr_branch_drift: Vec<crate::local_pr_branches::LocalPrBranchAction>,
 ) -> CommitListData {
@@ -355,7 +355,7 @@ fn build_commit_list_data(
                 .collect();
             CommitGroupData {
                 local_pr_number: group_idx + 1,
-                stable_handle: crate::commands::common::stable_handle_text(&group.tag),
+                stable_handle: crate::commands::common::group_selector_text(group),
                 head_branch: identity.exact.clone(),
                 remote: remote_by_head
                     .get(&identity.conflict_key)
@@ -681,7 +681,20 @@ mod tests {
 
     fn group(tag: &str, commits: &[(&str, &str)]) -> Group {
         Group {
-            tag: tag.to_string(),
+            marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
+            subjects: commits
+                .iter()
+                .map(|(_, subject)| (*subject).to_string())
+                .collect(),
+            commits: commits.iter().map(|(sha, _)| (*sha).to_string()).collect(),
+            first_message: None,
+            ignored_after: Vec::new(),
+        }
+    }
+
+    fn branch_group(branch_name: &str, commits: &[(&str, &str)]) -> Group {
+        Group {
+            marker: crate::group_markers::GroupMarker::BranchName(branch_name.to_string()),
             subjects: commits
                 .iter()
                 .map(|(_, subject)| (*subject).to_string())
@@ -699,8 +712,8 @@ mod tests {
             group("beta", &[("bbbbbbbb1", "feat: beta")]),
         ];
         let branch_identities = vec![
-            SyntheticBranchIdentity::new("dank-spr/", "alpha"),
-            SyntheticBranchIdentity::new("dank-spr/", "beta"),
+            GroupBranchIdentity::new("dank-spr/alpha".to_string()),
+            GroupBranchIdentity::new("dank-spr/beta".to_string()),
         ];
         let remote_by_head = HashMap::from([(
             canonical_branch_conflict_key("dank-spr/beta"),
@@ -730,6 +743,25 @@ mod tests {
             RemotePrState::RemoteWithCiReview { url, .. }
                 if url == "https://github.com/o/r/pull/17"
         ));
+    }
+
+    #[test]
+    fn build_pr_list_data_renders_explicit_branch_selectors_and_heads() {
+        let groups = vec![
+            branch_group("feature/login", &[("aaaaaaaa1", "feat: login")]),
+            group("beta", &[("bbbbbbbb1", "feat: beta")]),
+        ];
+        let branch_identities = vec![
+            GroupBranchIdentity::new("feature/login".to_string()),
+            GroupBranchIdentity::new("dank-spr/beta".to_string()),
+        ];
+
+        let data = build_pr_list_data(&groups, &branch_identities, &HashMap::new(), Vec::new());
+
+        assert_eq!(data.groups[0].stable_handle, "branch:feature/login");
+        assert_eq!(data.groups[0].head_branch, "feature/login");
+        assert_eq!(data.groups[1].stable_handle, "pr:beta");
+        assert_eq!(data.groups[1].head_branch, "dank-spr/beta");
     }
 
     #[test]
@@ -790,8 +822,8 @@ mod tests {
             group("beta", &[("bbbbbbbb1", "feat: beta one")]),
         ];
         let branch_identities = vec![
-            SyntheticBranchIdentity::new("dank-spr/", "alpha"),
-            SyntheticBranchIdentity::new("dank-spr/", "beta"),
+            GroupBranchIdentity::new("dank-spr/alpha".to_string()),
+            GroupBranchIdentity::new("dank-spr/beta".to_string()),
         ];
         let remote_by_head = HashMap::from([(
             canonical_branch_conflict_key("dank-spr/alpha"),
@@ -969,8 +1001,8 @@ mod tests {
 
         match err {
             ReadOnlyQueryError::SyntheticBranchNameCollision(collision) => {
-                assert_eq!(collision.first.stable_handle, "pr:alpha");
-                assert_eq!(collision.second.stable_handle, "pr:Alpha");
+                assert_eq!(collision.first.selector, "pr:alpha");
+                assert_eq!(collision.second.selector, "pr:Alpha");
             }
             other => panic!("unexpected error: {:?}", other),
         }

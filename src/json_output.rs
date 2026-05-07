@@ -179,18 +179,18 @@ impl ErrorOutput {
 
     pub fn synthetic_branch_name_collision(
         command: JsonCommand,
-        collision: &crate::branch_names::SyntheticBranchNameCollision,
+        collision: &crate::branch_names::GroupBranchNameCollision,
     ) -> Self {
         Self::new(
             command,
             JsonError::SyntheticBranchNameCollision {
                 conflicting_groups: vec![
                     CollisionGroup {
-                        stable_handle: collision.first.stable_handle.clone(),
+                        stable_handle: collision.first.selector.clone(),
                         head_branch: collision.first.head_branch.clone(),
                     },
                     CollisionGroup {
-                        stable_handle: collision.second.stable_handle.clone(),
+                        stable_handle: collision.second.selector.clone(),
                         head_branch: collision.second.head_branch.clone(),
                     },
                 ],

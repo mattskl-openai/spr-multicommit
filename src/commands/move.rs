@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use tracing::info;
 
-use crate::branch_names::{group_branch_identities, synthetic_branch_name};
+use crate::branch_names::{group_branch_identities, group_branch_name};
 use crate::commands::common;
 use crate::commands::common::CherryPickOp;
 use crate::commands::rewrite_resume::{
@@ -97,14 +97,14 @@ fn enforce_bottom_pr_automerge_guard(
 ) -> Result<()> {
     if changes_stack_bottom(new_order) {
         let bottom_group = &groups[0];
-        let bottom_head = synthetic_branch_name(prefix, &bottom_group.tag);
+        let bottom_head = group_branch_name(prefix, bottom_group);
         if let Some(bottom_pr) = get_open_pr_automerge_for_head(&bottom_head)? {
             if should_block_for_bottom_pr_automerge(bottom_pr.auto_merge_enabled, new_order) {
                 Err(anyhow!(
-                    "Refusing to change the stack bottom because {} (#{} / pr:{}) has auto-merge enabled. Disable auto-merge on that bottom PR before moving any PR below it.",
+                    "Refusing to change the stack bottom because {} (#{} / {}) has auto-merge enabled. Disable auto-merge on that bottom PR before moving any PR below it.",
                     bottom_head,
                     bottom_pr.number,
-                    bottom_group.tag
+                    bottom_group.selector_text()
                 ))
             } else {
                 Ok(())
@@ -280,7 +280,9 @@ mod tests {
     use crate::config::DirtyWorktreePolicy;
     use crate::execution::ExecutionMode;
     use crate::parsing::Group;
-    use crate::selectors::{AfterSelector, GroupRangeSelector, GroupSelector, StableHandle};
+    use crate::selectors::{
+        AfterSelector, ExplicitGroupSelector, GroupRangeSelector, GroupSelector,
+    };
     use crate::test_support::{commit_file, git, lock_cwd, log_subjects, write_file, DirGuard};
     use std::env;
     use std::fs;
@@ -314,7 +316,7 @@ mod tests {
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
             .map(|tag| Group {
-                tag: tag.to_string(),
+                marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
                 subjects: vec![format!("feat: {tag}")],
                 commits: vec![format!("{tag}1")],
                 first_message: Some(format!("feat: {tag} pr:{tag}")),
@@ -327,16 +329,12 @@ mod tests {
     fn move_range_and_after_resolve_from_stable_handles() {
         let groups = groups(&["alpha", "beta", "gamma"]);
         let range = GroupRangeSelector::Inclusive {
-            start: GroupSelector::Stable(StableHandle {
-                tag: "beta".to_string(),
-            }),
-            end: GroupSelector::Stable(StableHandle {
-                tag: "gamma".to_string(),
-            }),
+            start: GroupSelector::Explicit(ExplicitGroupSelector::PrLabel("beta".to_string())),
+            end: GroupSelector::Explicit(ExplicitGroupSelector::PrLabel("gamma".to_string())),
         };
-        let after = AfterSelector::Group(GroupSelector::Stable(StableHandle {
-            tag: "alpha".to_string(),
-        }));
+        let after = AfterSelector::Group(GroupSelector::Explicit(ExplicitGroupSelector::PrLabel(
+            "alpha".to_string(),
+        )));
 
         assert_eq!(
             resolve_move_targets(&groups, &range, &after).unwrap(),

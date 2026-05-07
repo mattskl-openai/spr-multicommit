@@ -247,7 +247,7 @@ pub fn prep_squash(
             let tip = group
                 .commits
                 .last()
-                .ok_or_else(|| anyhow!("Empty group {}", group.tag))?;
+                .ok_or_else(|| anyhow!("Empty group {}", group.selector_text()))?;
             args.push(format!("{}^{{tree}}", tip));
         }
         let ref_args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -311,7 +311,7 @@ pub fn prep_squash(
                 parent_sha = new_commit.clone();
                 selected_groups.push(PreparedGroupData {
                     local_pr_number: start_idx + offset + 1,
-                    stable_handle: crate::commands::common::stable_handle_text(&group.tag),
+                    stable_handle: crate::commands::common::group_selector_text(group),
                     source_commit_count: group.commits.len(),
                     action,
                     target_sha: Some(new_commit),
@@ -319,7 +319,7 @@ pub fn prep_squash(
             } else {
                 selected_groups.push(PreparedGroupData {
                     local_pr_number: start_idx + offset + 1,
-                    stable_handle: crate::commands::common::stable_handle_text(&group.tag),
+                    stable_handle: crate::commands::common::group_selector_text(group),
                     source_commit_count: group.commits.len(),
                     action: PreparedGroupAction::SkippedEmpty,
                     target_sha: None,
@@ -453,8 +453,8 @@ pub fn prep_squash(
                     };
                     Some(PrepNextChildData {
                         local_pr_number: next_idx + 1,
-                        stable_handle: crate::commands::common::stable_handle_text(
-                            &groups[next_idx].tag,
+                        stable_handle: crate::commands::common::group_selector_text(
+                            &groups[next_idx],
                         ),
                         head_branch: next_branch,
                         remote_pr_number: Some(pr.number),
@@ -463,9 +463,7 @@ pub fn prep_squash(
                 }
                 None => Some(PrepNextChildData {
                     local_pr_number: next_idx + 1,
-                    stable_handle: crate::commands::common::stable_handle_text(
-                        &groups[next_idx].tag,
-                    ),
+                    stable_handle: crate::commands::common::group_selector_text(&groups[next_idx]),
                     head_branch: next_branch,
                     remote_pr_number: None,
                     action: PrepNextChildAction::MissingOpenPr,
@@ -512,13 +510,13 @@ mod tests {
     use crate::execution::ExecutionMode;
     use crate::maintenance_output::{PreparedGroupAction, ResolvedPrepSelection};
     use crate::parsing::Group;
-    use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
+    use crate::selectors::{ExplicitGroupSelector, GroupSelector, InclusiveSelector};
     use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
 
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
             .map(|tag| Group {
-                tag: tag.to_string(),
+                marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
                 subjects: vec![format!("feat: {tag}")],
                 commits: vec![format!("{tag}1")],
                 first_message: Some(format!("feat: {tag} pr:{tag}")),
@@ -530,10 +528,8 @@ mod tests {
     #[test]
     fn prep_until_stable_handle_resolves_inclusive_window() {
         let groups = groups(&["alpha", "beta", "gamma"]);
-        let selection = PrepSelection::Until(InclusiveSelector::Group(GroupSelector::Stable(
-            StableHandle {
-                tag: "beta".to_string(),
-            },
+        let selection = PrepSelection::Until(InclusiveSelector::Group(GroupSelector::Explicit(
+            ExplicitGroupSelector::PrLabel("beta".to_string()),
         )));
 
         assert_eq!(resolve_prep_window(&groups, &selection).unwrap(), (0, 2));
@@ -542,9 +538,9 @@ mod tests {
     #[test]
     fn prep_exact_stable_handle_resolves_single_group_window() {
         let groups = groups(&["alpha", "beta", "gamma"]);
-        let selection = PrepSelection::Exact(GroupSelector::Stable(StableHandle {
-            tag: "beta".to_string(),
-        }));
+        let selection = PrepSelection::Exact(GroupSelector::Explicit(
+            ExplicitGroupSelector::PrLabel("beta".to_string()),
+        ));
 
         assert_eq!(resolve_prep_window(&groups, &selection).unwrap(), (1, 2));
     }
@@ -552,9 +548,9 @@ mod tests {
     #[test]
     fn prep_from_stable_handle_resolves_suffix_window() {
         let groups = groups(&["alpha", "beta", "gamma"]);
-        let selection = PrepSelection::From(GroupSelector::Stable(StableHandle {
-            tag: "beta".to_string(),
-        }));
+        let selection = PrepSelection::From(GroupSelector::Explicit(
+            ExplicitGroupSelector::PrLabel("beta".to_string()),
+        ));
 
         assert_eq!(resolve_prep_window(&groups, &selection).unwrap(), (1, 3));
     }
@@ -616,7 +612,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+                .contains("pr:alpha and pr:Alpha derive conflicting branch names"),
             "unexpected error: {err}"
         );
     }

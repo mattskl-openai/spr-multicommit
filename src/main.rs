@@ -15,6 +15,7 @@ mod execution;
 mod format;
 mod git;
 mod github;
+mod group_markers;
 mod json_output;
 mod limit;
 mod local_pr_branches;
@@ -1145,7 +1146,7 @@ mod tests {
     };
     use crate::parsing::{derive_local_groups_with_ignored, Group};
     use crate::read_only_output::ReadOnlyPayload;
-    use crate::selectors::{GroupSelector, StableHandle};
+    use crate::selectors::{ExplicitGroupSelector, GroupSelector};
     use crate::test_support::{
         commit_file, git, init_case_conflicting_stack_repo, init_repo as init_stack_repo, lock_cwd,
         write_file, DirGuard,
@@ -1218,7 +1219,7 @@ mod tests {
 
     fn group(tag: &str) -> Group {
         Group {
-            tag: tag.to_string(),
+            marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
             subjects: vec![format!("feat: {tag}")],
             commits: vec![format!("{tag}1")],
             first_message: Some(format!("feat: {tag} pr:{tag}")),
@@ -1231,9 +1232,9 @@ mod tests {
         let groups = vec![group("alpha")];
         let result = resolve_update_pr_limit(
             &groups,
-            Some(GroupSelector::Stable(StableHandle {
-                tag: "alpha".to_string(),
-            })),
+            Some(GroupSelector::Explicit(ExplicitGroupSelector::PrLabel(
+                "alpha".to_string(),
+            ))),
             Some(1),
             None,
         );
@@ -1253,9 +1254,9 @@ mod tests {
         let groups = vec![group("alpha")];
         let result = resolve_update_pr_limit(
             &groups,
-            Some(GroupSelector::Stable(StableHandle {
-                tag: "beta".to_string(),
-            })),
+            Some(GroupSelector::Explicit(ExplicitGroupSelector::PrLabel(
+                "beta".to_string(),
+            ))),
             None,
             None,
         );
@@ -1266,7 +1267,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("No outstanding PR group matches stable handle `pr:beta`"),
+                .contains("No outstanding PR group matches selector `pr:beta`"),
             "unexpected error: {err}"
         );
     }

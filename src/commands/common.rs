@@ -715,7 +715,7 @@ impl CherryPickOp {
 /// Build expected (head, base) chain bottom→top from local groups.
 ///
 /// This validates that the current stack does not derive case-colliding
-/// synthetic branch names before returning any branch chain.
+/// concrete branch names before returning any branch chain.
 pub fn build_head_base_chain(
     base: &str,
     groups: &[Group],
@@ -730,17 +730,19 @@ pub fn build_head_base_chain(
     Ok(expected)
 }
 
-pub fn stable_handle_text(tag: &str) -> String {
-    format!("pr:{tag}")
+pub fn group_selector_text(group: &Group) -> String {
+    group.selector_text()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_temp_worktree, create_backup_tag, create_temp_worktree,
+        build_head_base_chain, cleanup_temp_worktree, create_backup_tag, create_temp_worktree,
         get_current_branch_and_short,
     };
     use crate::execution::ExecutionMode;
+    use crate::group_markers::GroupMarker;
+    use crate::parsing::Group;
     use crate::test_support::{lock_cwd, DirGuard};
     use std::fs;
     use std::path::Path;
@@ -773,6 +775,36 @@ mod tests {
         git(repo, ["add", "."].as_slice());
         git(repo, ["commit", "-m", "init"].as_slice());
         dir
+    }
+
+    fn group(marker: GroupMarker) -> Group {
+        Group {
+            marker,
+            subjects: Vec::new(),
+            commits: vec!["sha".to_string()],
+            first_message: None,
+            ignored_after: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_head_base_chain_uses_resolved_concrete_branch_names() {
+        let groups = vec![
+            group(GroupMarker::BranchName("feature/login".to_string())),
+            group(GroupMarker::PrLabel("beta".to_string())),
+            group(GroupMarker::BranchName("release/docs".to_string())),
+        ];
+
+        let chain = build_head_base_chain("main", &groups, "dank-spr/").unwrap();
+
+        assert_eq!(
+            chain,
+            vec![
+                ("feature/login".to_string(), "main".to_string()),
+                ("dank-spr/beta".to_string(), "feature/login".to_string()),
+                ("release/docs".to_string(), "dank-spr/beta".to_string()),
+            ]
+        );
     }
 
     #[test]

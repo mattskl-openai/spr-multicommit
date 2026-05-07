@@ -208,7 +208,7 @@ fn resolve_restack_after_count(groups: &[Group], after: &AfterSelector) -> Resul
 
 fn group_preview(group: &Group) -> RestackPreviewGroup {
     RestackPreviewGroup {
-        stable_handle: format!("pr:{}", group.tag),
+        stable_handle: group.selector_text(),
         commit_count: group.commits.len(),
         ignored_after_count: group.ignored_after.len(),
     }
@@ -725,7 +725,7 @@ mod tests {
     use crate::execution::ExecutionMode;
     use crate::parsing::Group;
     use crate::restack_output::RestackExecutorPlan;
-    use crate::selectors::{AfterSelector, GroupSelector, StableHandle};
+    use crate::selectors::{AfterSelector, ExplicitGroupSelector, GroupSelector};
     use crate::test_support::{commit_file, git, lock_cwd, write_file, DirGuard};
     use std::env;
     use std::fs;
@@ -743,7 +743,7 @@ mod tests {
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
             .map(|tag| Group {
-                tag: tag.to_string(),
+                marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
                 subjects: vec![format!("feat: {tag}")],
                 commits: vec![format!("{tag}1")],
                 first_message: Some(format!("feat: {tag} pr:{tag}")),
@@ -755,9 +755,9 @@ mod tests {
     #[test]
     fn restack_after_stable_handle_keeps_that_group_and_lower_groups() {
         let groups = groups(&["alpha", "beta", "gamma"]);
-        let after = AfterSelector::Group(GroupSelector::Stable(StableHandle {
-            tag: "beta".to_string(),
-        }));
+        let after = AfterSelector::Group(GroupSelector::Explicit(ExplicitGroupSelector::PrLabel(
+            "beta".to_string(),
+        )));
 
         assert_eq!(resolve_restack_after_count(&groups, &after).unwrap(), 2);
     }
@@ -766,14 +766,14 @@ mod tests {
     fn kept_ignored_segments_preserve_group_boundaries() {
         let groups = vec![
             Group {
-                tag: "alpha".to_string(),
+                marker: crate::group_markers::GroupMarker::PrLabel("alpha".to_string()),
                 subjects: vec!["feat: alpha".to_string()],
                 commits: vec!["a1".to_string()],
                 first_message: Some("feat: alpha pr:alpha".to_string()),
                 ignored_after: vec!["i1".to_string(), "i2".to_string()],
             },
             Group {
-                tag: "beta".to_string(),
+                marker: crate::group_markers::GroupMarker::PrLabel("beta".to_string()),
                 subjects: vec!["feat: beta".to_string()],
                 commits: vec!["b1".to_string()],
                 first_message: Some("feat: beta pr:beta".to_string()),
@@ -839,14 +839,14 @@ mod tests {
         assert_eq!(
             plan.dropped_groups
                 .iter()
-                .map(|group| group.tag.as_str())
+                .map(Group::bare_selector_text)
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta"]
         );
         assert_eq!(
             plan.remaining_groups
                 .iter()
-                .map(|group| group.tag.as_str())
+                .map(Group::bare_selector_text)
                 .collect::<Vec<_>>(),
             vec!["gamma"]
         );
@@ -1051,9 +1051,9 @@ mod tests {
 
         let preview = preview_restack_after(
             &metadata_context(),
-            &AfterSelector::Group(GroupSelector::Stable(StableHandle {
-                tag: "alpha".to_string(),
-            })),
+            &AfterSelector::Group(GroupSelector::Explicit(ExplicitGroupSelector::PrLabel(
+                "alpha".to_string(),
+            ))),
             true,
         )
         .unwrap();

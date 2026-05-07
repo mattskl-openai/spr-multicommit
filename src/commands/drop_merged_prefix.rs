@@ -24,7 +24,7 @@ use crate::stack_metadata::RefreshMetadataContext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MergedPrefixCandidate {
-    tag: String,
+    selector: String,
     head: String,
     pr_number: u64,
     local_tip: String,
@@ -65,7 +65,7 @@ fn select_bottom_merged_prefix(
 ) -> Result<Vec<MergedPrefixCandidate>> {
     if groups.len() != heads.len() {
         bail!(
-            "internal error: {} local groups but {} synthetic branch heads",
+            "internal error: {} local groups but {} resolved branch heads",
             groups.len(),
             heads.len()
         );
@@ -78,10 +78,13 @@ fn select_bottom_merged_prefix(
         if let Some(remote_pr) = remote_pr {
             if remote_pr.state == PrState::Merged {
                 let local_tip = group.commits.last().cloned().ok_or_else(|| {
-                    anyhow!("local PR group pr:{} has no local commits", group.tag)
+                    anyhow!(
+                        "local PR group {} has no local commits",
+                        group.selector_text()
+                    )
                 })?;
                 selected.push(MergedPrefixCandidate {
-                    tag: group.tag.clone(),
+                    selector: group.selector_text(),
                     head: head.clone(),
                     pr_number: remote_pr.number,
                     local_tip,
@@ -162,7 +165,7 @@ fn log_drop_plan(plan: &DropMergedPrefixPlan, execution_mode: ExecutionMode, bas
     let handles = plan
         .dropped
         .iter()
-        .map(|candidate| format!("pr:{} (#{})", candidate.tag, candidate.pr_number))
+        .map(|candidate| format!("{} (#{})", candidate.selector, candidate.pr_number))
         .collect::<Vec<_>>()
         .join(", ");
     let mode = if execution_mode == ExecutionMode::DryRun {
@@ -336,7 +339,7 @@ mod tests {
 
     fn group(tag: &str, commits: &[&str]) -> Group {
         Group {
-            tag: tag.to_string(),
+            marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
             subjects: vec![format!("feat: {tag}")],
             commits: commits.iter().map(|commit| (*commit).to_string()).collect(),
             first_message: Some(format!("feat: {tag} pr:{tag}")),
@@ -361,7 +364,7 @@ mod tests {
         local_tip: &str,
     ) -> MergedPrefixCandidate {
         MergedPrefixCandidate {
-            tag: tag.to_string(),
+            selector: format!("pr:{tag}"),
             head: head.to_string(),
             pr_number,
             local_tip: local_tip.to_string(),

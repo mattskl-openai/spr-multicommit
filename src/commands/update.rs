@@ -491,7 +491,7 @@ fn build_from_groups_internal(
             .commits
             .last()
             .cloned()
-            .ok_or_else(|| anyhow!("Group {} has no commits", group.tag))?;
+            .ok_or_else(|| anyhow!("Group {} has no commits", group.selector_text()))?;
         let kind = if remote_head.as_deref() == Some(target_sha.as_str()) {
             PushKind::Skip
         } else if let Some(ref remote_sha) = remote_head {
@@ -883,7 +883,7 @@ fn build_from_groups_internal(
         .enumerate()
         .map(
             |(group_idx, planned_push)| crate::local_pr_branches::LocalPrBranchTarget {
-                stable_handle: common::stable_handle_text(&groups[group_idx].tag),
+                stable_handle: common::group_selector_text(&groups[group_idx]),
                 branch_name: planned_push.branch.clone(),
                 tip: planned_push.target_sha.clone(),
             },
@@ -903,7 +903,7 @@ fn build_from_groups_internal(
         .map(
             |(group_idx, ((group, identity), planned_push))| UpdateGroupData {
                 local_pr_number: group_idx + 1,
-                stable_handle: common::stable_handle_text(&group.tag),
+                stable_handle: common::group_selector_text(group),
                 head_branch: identity.exact.clone(),
                 base_ref: desired_base_by_head
                     .get(&identity.exact)
@@ -1133,7 +1133,7 @@ mod tests {
 
     fn group(tag: &str) -> Group {
         Group {
-            tag: tag.to_string(),
+            marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
             subjects: vec![format!("feat: {tag}")],
             commits: vec![format!("{tag}1")],
             first_message: Some(format!("feat: {tag} pr:{tag}")),
@@ -1199,7 +1199,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+                .contains("pr:alpha and pr:Alpha derive conflicting branch names"),
             "unexpected error: {err}"
         );
     }

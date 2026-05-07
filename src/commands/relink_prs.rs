@@ -75,7 +75,7 @@ pub fn relink_prs(
         .map(
             |(group_idx, (head_branch, expected_base_ref))| RelinkExpectedBaseData {
                 local_pr_number: group_idx + 1,
-                stable_handle: common::stable_handle_text(&groups[group_idx].tag),
+                stable_handle: common::group_selector_text(&groups[group_idx]),
                 head_branch: head_branch.clone(),
                 expected_base_ref: expected_base_ref.clone(),
             },

@@ -21,7 +21,7 @@ cargo install --path .
 Quick start
 -----------
 
-1. Create commits with `pr:<tag>` markers to define PR groups, bottom → top. Use `pr:ignore` to skip commits until the next `pr:<tag>`. Example:
+1. Create commits with `pr:<tag>` or `branch:<branch-name>` markers to define PR groups, bottom → top. Use `pr:ignore` to skip commits until the next group marker. Example:
 
 ```bash
 git commit -m "feat: parser groundwork pr:alpha"
@@ -31,8 +31,8 @@ git commit -m "wip: spike cleanup"
 git commit -m "feat: new API pr:beta" -m "Body explaining the change"
 ```
 
-Ignored blocks are local-only. If an ignored block sits below later `pr:<tag>`
-groups, `spr update` warns and leaves those later groups local-only instead of
+Ignored blocks are local-only. If an ignored block sits below later group
+markers, `spr update` warns and leaves those later groups local-only instead of
 publishing PRs whose GitHub diffs would include the ignored commits.
 
 2. Configure defaults (optional) in `.spr_multicommit_cfg.yml` (see below), then:
@@ -57,15 +57,16 @@ spr list commit
 spr update
 ```
 
-`pr:<tag>` is the stable handle for a PR group, and `<tag>` must start with an
-ASCII letter. Commands that target groups accept either a bare label like
-`beta` or the explicit `pr:beta` form. `LPR #N` is only the current local
-position in the outstanding stack and may renumber after lower groups land or
-are removed. For example, `spr land flatten --until beta` and `spr move beta
---after gamma` both target stable PR-group labels. Stable handles remain
-exact-case. Synthetic branch-name conflict checks are separate and fold case on
-the full derived branch name.
-Any command that derives synthetic branch names from the live stack may halt
+Each PR group has exactly one marker. `pr:<tag>` derives `prefix + tag`, while
+`branch:<branch-name>` preserves that exact Git branch name. `pr:` labels must
+start with an ASCII letter; `branch:` payloads use Git branch-name validation.
+Commands that target groups accept explicit selectors such as `pr:beta` or
+`branch:feature/login`, plus bare selectors such as `beta` only when exactly one
+current-stack group matches. `LPR #N` is only the current local position in the
+outstanding stack and may renumber after lower groups land or are removed.
+Concrete branch-name conflict checks are separate and fold case on the resolved
+branch name.
+Any command that derives concrete branch names from the live stack may halt
 before doing command-specific work if two outstanding groups would collide
 under that case-insensitive branch-name comparison.
 
@@ -93,7 +94,7 @@ prefix: mattskl-spr/
 land: flatten
 
 # Tag used to ignore commits between PR groups
-# Commit with pr:ignore_tag starts ignore mode until the next pr:<tag>
+# Commit with pr:ignore_tag starts ignore mode until the next group marker
 # Must start with an ASCII letter
 ignore_tag: ignore
 
@@ -108,7 +109,7 @@ pr_description_mode: overwrite | stack_only
 # one of: "recent_on_bottom" (default) or "recent_on_top"
 list_order: recent_on_bottom
 
-# Optional local synchronization for branches named like `prefix + <tag>`.
+# Optional local synchronization for each group's resolved concrete branch.
 # - `off` (default): do not create or move local per-PR branches
 # - `update-existing`: move matching local branches that already exist
 # - `create-or-update`: create missing matching local branches and move existing ones
@@ -149,8 +150,8 @@ Global flags
 - `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
 - `--local-pr-branches <off|update-existing|create-or-update>`: override local per-PR branch synchronization for this run
-- `--until <N|0|label|pr:<label>>`: target range used by `prep` and `land` (`0` means all)
-- `--exact <I|label|pr:<label>>`: used by `prep` to select exactly one PR group
+- `--until <N|0|name|pr:<label>|branch:<branch-name>>`: target range used by `prep` and `land` (`0` means all)
+- `--exact <I|name|pr:<label>|branch:<branch-name>>`: used by `prep` to select exactly one PR group
 - `--verbose`: enable verbose logging of underlying git/gh commands
 
 Example:
@@ -178,28 +179,28 @@ Key options:
 - `--allow-branch-reuse`: bypass the recent closed-or-merged branch-name reuse guard
 - `--json`: write exactly one update summary object to stdout
 - Extent (optional subcommand):
-  - `pr --to <N|label|pr:<label>>`: canonical selector for limiting updates to the first N PRs from the bottom
+  - `pr --to <N|name|pr:<label>|branch:<branch-name>>`: canonical selector for limiting updates to the first N PRs from the bottom
   - `pr --n <N>`: legacy numeric-only form
   - `pr <N>`: backward-compatible positional numeric form
   - `commits --n <N>`: limit to first N commits (untested)
 
 Behavior:
 
-- Parses `pr:<tag>` markers from `merge-base(base, from)..from` (commits between `pr:ignore` and the next `pr:<tag>` are ignored)
+- Parses group markers from `merge-base(base, from)..from` (commits between `pr:ignore` and the next group marker are ignored)
 - Creates/updates per-PR branches and GitHub PRs
 - Warns and skips any PR groups above an ignored block, because GitHub would include the ignored commits in those higher PRs
 - When a PR is first created, `spr` always seeds it from the bottom commit in that PR group:
   the PR title comes from the first line of that commit message, and the PR description comes
   from the rest of that same commit message, regardless of `pr_description_mode`
-- Before creating a PR for a branch head without an open PR, checks whether the same synthetic
+- Before creating a PR for a branch head without an open PR, checks whether the same concrete
   branch name, including case-only variants, had a recently merged or closed PR and halts within
   `branch_reuse_guard_days`
-- Refuses to operate when two live PR groups would derive synthetic branch names that differ only
+- Refuses to operate when two live PR groups would derive concrete branch names that differ only
   by case, because those names are unsafe on case-insensitive filesystems
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
   - When `pr_description_mode` is `stack_only`, only the stack block (between markers) is updated; the rest of the body is preserved
   - May temporarily set existing PR bases to the repo base while pushing, then re-chain them to match the local stack
-- When `local_pr_branches` is enabled, synchronizes local branches named exactly like the synthetic PR branches after the update succeeds. `update-existing` only moves existing local branches; `create-or-update` also creates missing ones.
+- When `local_pr_branches` is enabled, synchronizes local branches named exactly like each group's resolved concrete branch after the update succeeds. `update-existing` only moves existing local branches; `create-or-update` also creates missing ones.
 
 ### spr restack
 
@@ -210,17 +211,17 @@ up, prefer `spr drop-merged-prefix`.
 
 Options:
 
-- `--after <N|0|bottom|top|last|all|label|pr:<label>>`: keep groups through this selector in place, then rebase only the groups above it onto `--base`
+- `--after <N|0|bottom|top|last|all|name|pr:<label>|branch:<branch-name>>`: keep groups through this selector in place, then rebase only the groups above it onto `--base`
   - `0` or `bottom`: restack all groups (moves everything after merge-base)
   - `top` or `last` or `all`: skip all PRs; ignored commits (pr:ignore blocks) are preserved, so the branch may remain ahead of base
-  - `label` or `pr:<label>`: keep that stable group and everything below it in place even if local PR numbers renumber
+  - bare name, `pr:<label>`, or `branch:<branch-name>`: keep that group and everything below it in place even if local PR numbers renumber
 - `--safe`: create a local backup tag at current `HEAD` before rebasing
 - `--preview`: print the resolved high-level plan and stop before fetch, backup tags, temp worktrees, resume files, cherry-picks, branch resets, metadata writes, pushes, or GitHub calls
 - `--json`: with `--preview`, write exactly one preview object to stdout
 
 Behavior:
 
-- Computes PR groups from `merge-base(base, HEAD)..HEAD` using `pr:<tag>` markers (oldest → newest; ignore blocks are preserved but excluded from grouping)
+- Computes PR groups from `merge-base(base, HEAD)..HEAD` using group markers (oldest → newest; ignore blocks are preserved but excluded from grouping)
 - `spr restack --after ... --preview` uses local refs only and reports that remote freshness, replay conflicts, tests, hooks, GitHub mergeability, and update/push results have not been validated
 - Normal human `spr restack --after ...` prints the same high-level plan immediately before it starts the rewrite phase
 - Drops the first N groups, then rebuilds the remaining commits onto `--base`
@@ -230,7 +231,7 @@ Behavior:
 - Uses the existing temp-worktree cherry-pick executor when the plan is not one contiguous suffix,
   or when the fast rebase conflicts and can be aborted cleanly.
 - Updates the current branch to the rebuilt tip
-- When `local_pr_branches` is enabled, synchronizes local synthetic PR branches to the final rewritten group tips after a successful rewrite.
+- When `local_pr_branches` is enabled, synchronizes local resolved PR branches to the final rewritten group tips after a successful rewrite.
 - With `--safe`, a backup tag named like `backup/restack/<current-branch>-<short-sha>` is created first
 - Conflict handling is controlled by `restack_conflict` in config.
 - Before rewriting the checked-out branch, `spr restack` follows the `dirty_worktree` config.
@@ -266,7 +267,7 @@ Behavior:
 - With `--safe`, creates a local backup tag named like `backup/drop-merged-prefix/<current-branch>-<short-sha>` before moving the branch
 - Does not merge, close, retarget, comment on, push, or otherwise mutate GitHub PRs
 - Does not run `spr update`; run it afterwards to publish the remaining open PR branch updates
-- When `local_pr_branches` is enabled, synchronizes local synthetic PR branches for the remaining stack after the local rewrite succeeds.
+- When `local_pr_branches` is enabled, synchronizes local resolved PR branches for the remaining stack after the local rewrite succeeds.
 
 ### spr absorb
 
@@ -275,10 +276,10 @@ Absorb commits appended to canonical local per-PR branches back into the checked
 Behavior:
 
 - If you append commits to the end of a local PR branch such as `user-spr/alpha`, `spr absorb` rebuilds the local stack so the new commits become part of the matching PR group while preserving PR-group order
-- Inspects only exact local branches named `prefix + tag`
+- Inspects only each group's exact resolved local branch
 - Skips missing branches, branches whose rewritten-equivalent prefix still descends from the same stack merge-base and ends at the same pre-tail tree as the current stack, and branches that are behind the current stack
-- Refuses to operate when two live PR groups would derive synthetic branch names that differ only by case
-- Refuses to guess through divergence, source branches that incorporated later stack commits, merge commits, or absorbed commits that contain `pr:<tag>` markers
+- Refuses to operate when two live PR groups would derive concrete branch names that differ only by case
+- Refuses to guess through divergence, source branches that incorporated later stack commits, merge commits, or absorbed commits that contain group markers
 - By default, also blocks copied later stack commits whose original replay would otherwise become empty or ambiguous
 - `--allow-replayed-duplicates` overrides that copied-commit blocker for safe cases by absorbing the copied commit and keeping its later non-seed replay in the rebuilt stack
 - Rebuilds the current stack from its existing `merge-base(base, HEAD)` rather than restacking onto the latest base tip
@@ -287,9 +288,9 @@ Behavior:
 - Before rewriting the checked-out branch, `spr absorb` follows the `dirty_worktree` config.
 - On cherry-pick conflict, `spr absorb` suspends the rewrite, leaves the temp worktree in place, and prints `spr resume <path>`
 - Does not update GitHub; inspect the rewritten stack first, then run `spr update`
-- When `local_pr_branches` is enabled, synchronizes local synthetic PR branches to the absorbed stack's final group tips after the local rewrite succeeds. A branch checked out in any worktree is reported as blocked and is not moved.
-- `--from <N|label|pr:<label>>` constrains absorb to one explicit selected-and-higher suffix.
-- `--query-changed-branches --json` reports the stack branch plus every synthetic PR branch whose logical tip would change if the absorb rewrite ran, without creating backup tags, temp worktrees, or rewrite side effects. When paired with `--from`, it reports the full selected suffix even when only some branches currently have absorbable tails, so callers can query and apply one stable transaction boundary.
+- When `local_pr_branches` is enabled, synchronizes local resolved PR branches to the absorbed stack's final group tips after the local rewrite succeeds. A branch checked out in any worktree is reported as blocked and is not moved.
+- `--from <N|name|pr:<label>|branch:<branch-name>>` constrains absorb to one explicit selected-and-higher suffix.
+- `--query-changed-branches --json` reports the stack branch plus every resolved PR branch whose logical tip would change if the absorb rewrite ran, without creating backup tags, temp worktrees, or rewrite side effects. When paired with `--from`, it reports the full selected suffix even when only some branches currently have absorbable tails, so callers can query and apply one stable transaction boundary.
 
 Typical workflow:
 
@@ -353,7 +354,7 @@ spr resolve-stack --json https://github.com/org/repo/pull/123
 
 ### spr sync-local-branches
 
-Reconcile local synthetic PR branches with the checked-out stack without publishing or rewriting
+Reconcile local resolved PR branches with the checked-out stack without publishing or rewriting
 the stack itself.
 
 Behavior:
@@ -504,7 +505,7 @@ Operator rules:
 
 ### spr list pr
 
-Lists PRs in the current stack for the configured prefix. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers remain bottom → top, but the output now shows both the current `LPR #N` and the stable `pr:<label>` handle for each group.
+Lists PRs in the current stack for the configured prefix. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers remain bottom → top, but the output now shows both the current `LPR #N` and each group's explicit selector.
 
 Aliases:
 
@@ -523,12 +524,12 @@ Example summary line:
 ```
 
 Before listing, `spr list pr` validates that no two live PR groups derive
-synthetic branch names that collide under case-insensitive comparison. If they
+concrete branch names that collide under case-insensitive comparison. If they
 do, it halts before loading GitHub PR state.
 
 `spr list --json pr` emits one read-only JSON object instead of human-formatted lines.
 The payload always uses canonical bottom-up group order, includes remote PR metadata plus explicit
-CI/review state when available, and reports case-colliding synthetic branch failures as a typed
+CI/review state when available, and reports case-colliding concrete branch failures as a typed
 `synthetic_branch_name_collision` error payload.
 
 ### spr status
@@ -539,7 +540,7 @@ Aliases:
 
 Alias for `spr list pr`.
 
-`spr status` runs the same early synthetic branch-collision validation as
+`spr status` runs the same early concrete branch-collision validation as
 `spr list pr` before printing anything.
 
 `spr status --json` emits the same read-only payload shape as `spr list --json pr`, but keeps the
@@ -547,10 +548,10 @@ top-level command identity as `status`.
 
 ### spr list commit
 
-Lists commits in the current stack, grouped by local PR. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers and commit indices remain bottom → top, and each group header also shows its stable `pr:<label>` handle.
+Lists commits in the current stack, grouped by local PR. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers and commit indices remain bottom → top, and each group header also shows its explicit selector.
 
 Before listing, `spr list commit` validates that no two live PR groups derive
-synthetic branch names that collide under case-insensitive comparison. If they
+concrete branch names that collide under case-insensitive comparison. If they
 do, it halts before loading GitHub PR state.
 
 `spr list --json commit` emits one read-only JSON object instead of human-formatted lines.
@@ -570,7 +571,7 @@ current bottom PR has auto-merge enabled before allowing a rewrite that would
 move another PR below it.
 
 Before planning the move, `spr move` validates that no two live PR groups
-derive synthetic branch names that collide under case-insensitive comparison.
+derive concrete branch names that collide under case-insensitive comparison.
 If they do, it halts before the GitHub auto-merge lookup or any rewrite
 planning.
 
@@ -580,8 +581,8 @@ Aliases:
 
 - `spr move A --after C`: move PR at position A to come after PR C (C ∈ [0..N])
 - `spr move A..B --after C`: move PRs A..B to come after PR C (requires A < B and C ∉ [A..B]; C ∈ [0..N])
-- `spr move beta --after gamma`: move a stable group handle without caring what its current local PR number is
-- `spr move beta..gamma --after delta`: stable-handle range form
+- `spr move beta --after gamma`: move a bare selector without caring what its current local PR number is
+- `spr move beta..gamma --after delta`: bare-selector range form
   - `--after bottom` is the same as `--after 0`
   - `--after top` is the same as `--after N`
 - `--safe`: create a local backup tag at current `HEAD` before rewriting
@@ -597,11 +598,11 @@ Land PRs using either flatten or per-pr strategy.
 
 Shared options (global):
 
-- `--until <N|0|label|pr:<label>>`: land bottom-up through this local position or stable handle (`0` means all)
+- `--until <N|0|name|pr:<label>|branch:<branch-name>>`: land bottom-up through this local position or selector (`0` means all)
 - `--no-restack`: do not automatically restack after landing
 
 Before any GitHub land work, `spr land` validates that no two live PR groups
-derive synthetic branch names that collide under case-insensitive comparison.
+derive concrete branch names that collide under case-insensitive comparison.
 If they do, it halts before resolving the PR segment to land.
 
 Safety checks:
@@ -638,10 +639,11 @@ Default follow-up behavior:
 
 Prepare PRs for landing per-PR - squashes each PR's commits into a single commit.
 
-- Uses global `--until <N|0|label|pr:<label>>`, global `--exact <I|label|pr:<label>>`,
-  or local `--from <N|label|pr:<label>>`; these selectors are mutually exclusive
+- Uses global `--until <N|0|name|pr:<label>|branch:<branch-name>>`, global
+  `--exact <I|name|pr:<label>|branch:<branch-name>>`, or local
+  `--from <N|name|pr:<label>|branch:<branch-name>>`; these selectors are mutually exclusive
 - Before rewriting or pushing, `spr prep` validates that no two live PR groups
-  derive synthetic branch names that collide under case-insensitive
+  derive concrete branch names that collide under case-insensitive
   comparison. If they do, it halts before the local squash or follow-on
   `spr update`.
 
@@ -655,7 +657,7 @@ Behavior:
   tip tree already matches the parent tree.
 - Pushes branches (respects `--dry-run`)
 - Adds a warning to the next PR not included in the push
-- When `local_pr_branches` is enabled, the nested update path also synchronizes local synthetic PR
+- When `local_pr_branches` is enabled, the nested update path also synchronizes local resolved PR
   branches after the prepared rewrite succeeds.
 - `--json` writes the typed prep summary instead of human log lines
 - In `--dry-run`, prep still computes the hypothetical rewritten commit chain so the JSON summary
@@ -663,7 +665,7 @@ Behavior:
 
 ### spr fix-pr
 
-Move the tail M commits (top of stack) to the tail of a PR group selected by local PR number or stable handle.
+Move the tail M commits (top of stack) to the tail of a PR group selected by local PR number or selector.
 
 Aliases:
 
@@ -727,7 +729,7 @@ Behavior:
 - Computes the expected bottom → top chain from local commits and updates each PR’s base to match.
 - Skips PRs that are already correct; warns for missing PRs.
 - Before comparing local and remote connectivity, `spr relink-prs` validates
-  that no two live PR groups derive synthetic branch names that collide under
+  that no two live PR groups derive concrete branch names that collide under
   case-insensitive comparison. If they do, it halts before any GitHub edit.
 - `--json` writes the typed relink summary instead of human log lines
 

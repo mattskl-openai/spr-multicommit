@@ -22,7 +22,7 @@ fn resolve_land_take_count(
 
 fn resolve_landed_pr_segment<'a>(
     groups: &[crate::parsing::Group],
-    branch_identities: &[crate::branch_names::SyntheticBranchIdentity],
+    branch_identities: &[crate::branch_names::GroupBranchIdentity],
     prs_by_head: &HashMap<
         crate::branch_names::CanonicalBranchConflictKey,
         &'a crate::github::PrInfo,
@@ -38,7 +38,7 @@ fn resolve_landed_pr_segment<'a>(
         } else {
             bail!(
                 "No open PR found for local group '{}' (branch '{}')",
-                g.tag,
+                g.selector_text(),
                 head_branch
             );
         }
@@ -288,14 +288,14 @@ mod tests {
     use crate::execution::ExecutionMode;
     use crate::github::PrInfo;
     use crate::parsing::Group;
-    use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
+    use crate::selectors::{ExplicitGroupSelector, GroupSelector, InclusiveSelector};
     use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
     use std::collections::HashMap;
 
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
             .map(|tag| Group {
-                tag: tag.to_string(),
+                marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
                 subjects: vec![format!("feat: {tag}")],
                 commits: vec![format!("{tag}1")],
                 first_message: Some(format!("feat: {tag} pr:{tag}")),
@@ -315,9 +315,9 @@ mod tests {
     #[test]
     fn land_until_resolves_stable_handle_as_inclusive_prefix() {
         let groups = groups(&["alpha", "beta", "gamma"]);
-        let until = InclusiveSelector::Group(GroupSelector::Stable(StableHandle {
-            tag: "beta".to_string(),
-        }));
+        let until = InclusiveSelector::Group(GroupSelector::Explicit(
+            ExplicitGroupSelector::PrLabel("beta".to_string()),
+        ));
 
         assert_eq!(resolve_land_take_count(&groups, &until).unwrap(), 2);
     }
@@ -370,7 +370,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "No open PR found for local group 'sigma' (branch 'skilltest/sigma')"
+            "No open PR found for local group 'pr:sigma' (branch 'skilltest/sigma')"
         );
     }
 
@@ -394,7 +394,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+                .contains("pr:alpha and pr:Alpha derive conflicting branch names"),
             "unexpected error: {err}"
         );
     }

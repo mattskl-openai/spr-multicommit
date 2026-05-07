@@ -7,8 +7,8 @@ use crate::execution::ExecutionMode;
 pub enum Extent {
     /// Update the first N PRs (bottom-up)
     Pr {
-        /// Limit updates through this local PR number or stable handle
-        #[arg(long, value_name = "N|label|pr:<label>", conflicts_with_all = ["n", "legacy_n"])]
+        /// Limit updates through this local PR number or group selector
+        #[arg(long, value_name = "N|name|pr:<label>|branch:<branch-name>", conflicts_with_all = ["n", "legacy_n"])]
         to: Option<crate::selectors::GroupSelector>,
         /// Legacy numeric-only limit
         #[arg(long, value_name = "N", conflicts_with_all = ["to", "legacy_n"])]
@@ -73,10 +73,10 @@ impl From<DryRunArgs> for ExecutionMode {
 
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub enum ListWhat {
-    /// List PRs in the stack (halts early if live groups derive case-colliding synthetic branch names)
+    /// List PRs in the stack (halts early if live groups derive case-colliding concrete branch names)
     #[command(alias = "p")]
     Pr,
-    /// List commits in the stack (halts early if live groups derive case-colliding synthetic branch names)
+    /// List commits in the stack (halts early if live groups derive case-colliding concrete branch names)
     #[command(alias = "c")]
     Commit,
 }
@@ -107,7 +107,7 @@ pub enum Cmd {
         pr_description_mode: Option<crate::config::PrDescriptionMode>,
 
         /// Bypass the recent branch-name reuse guard and allow creating a new PR even when the
-        /// same synthetic branch name, including case-only variants, had a recently closed or
+        /// same concrete branch name, including case-only variants, had a recently closed or
         /// merged PR.
         #[arg(long)]
         allow_branch_reuse: bool,
@@ -126,7 +126,10 @@ pub enum Cmd {
     )]
     Restack {
         /// Keep groups through this selector in place and rebuild only the groups above it
-        #[arg(long, value_name = "N|0|bottom|top|last|all|label|pr:<label>")]
+        #[arg(
+            long,
+            value_name = "N|0|bottom|top|last|all|name|pr:<label>|branch:<branch-name>"
+        )]
         after: crate::selectors::AfterSelector,
 
         /// Create a local backup tag at current HEAD before rebasing
@@ -156,11 +159,11 @@ pub enum Cmd {
 
     /// Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch
     #[command(
-        long_about = "Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.\n\nIf you append commits to the end of a local PR branch such as `user-spr/alpha`, run `spr absorb` while the stack branch is checked out. `spr` rebuilds the local stack so the new commits become part of the matching PR group. The PR-group order stays the same.\n\nThis command is local-only: it rewrites the current stack branch, creates a backup tag, and does not update GitHub. After checking the result, run `spr update`.\n\nOnly exact local branches named `prefix + tag` are considered. If one of those branches still points at rewritten-equivalent stack commits, `spr absorb` accepts that prefix only when the branch still descends from the same stack merge-base and the matched pre-tail commit ends at the same tree as the canonical stack prefix. A no-op rewritten match is reported as `skip (rewritten-equivalent prefix)`, and only commits appended above that proven prefix are absorbed. `spr absorb` also refuses to operate when two live PR groups would derive synthetic branch names that differ only by case.\n\nUse `--from <N|label|pr:<label>>` to constrain absorb to one PR group and every group above it. For example, `spr absorb --from pr:beta` considers only the `pr:beta..top` suffix and leaves unrelated lower-group branch tails out of scope.\n\nExample:\n- The current stack has three PR groups: `pr:alpha`, `pr:beta`, and `pr:gamma`.\n- Check out `user-spr/alpha` and append 2 commits.\n- Check out the stack branch.\n- Run `spr absorb`.\n- Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same.\n- Then run `spr update`.\n\nOn cherry-pick conflict, `spr absorb` leaves the temp rewrite worktree in place, writes a resume file under the repository common Git directory, and prints `spr resume <path>`. Resolve conflicts in that temp worktree, stage the resolution, and run the printed resume command.\n\nAdvanced:\n- By default, absorb blocks copied later commits when replaying the stack would become empty or ambiguous.\n- `--allow-replayed-duplicates` allows an earlier copied non-seed follow-up commit to coexist with its later replayed copy by keeping both commits in the rewritten stack."
+        long_about = "Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.\n\nIf you append commits to the end of a local PR branch such as `user-spr/alpha`, run `spr absorb` while the stack branch is checked out. `spr` rebuilds the local stack so the new commits become part of the matching PR group. The PR-group order stays the same.\n\nThis command is local-only: it rewrites the current stack branch, creates a backup tag, and does not update GitHub. After checking the result, run `spr update`.\n\nOnly each group's exact resolved local branch is considered. If one of those branches still points at rewritten-equivalent stack commits, `spr absorb` accepts that prefix only when the branch still descends from the same stack merge-base and the matched pre-tail commit ends at the same tree as the canonical stack prefix. A no-op rewritten match is reported as `skip (rewritten-equivalent prefix)`, and only commits appended above that proven prefix are absorbed. `spr absorb` also refuses to operate when two live PR groups would derive concrete branch names that differ only by case.\n\nUse `--from <N|name|pr:<label>|branch:<branch-name>>` to constrain absorb to one PR group and every group above it. For example, `spr absorb --from pr:beta` considers only the `pr:beta..top` suffix and leaves unrelated lower-group branch tails out of scope.\n\nExample:\n- The current stack has three PR groups: `pr:alpha`, `pr:beta`, and `pr:gamma`.\n- Check out `user-spr/alpha` and append 2 commits.\n- Check out the stack branch.\n- Run `spr absorb`.\n- Result: the 2 new commits are folded into the `pr:alpha` group, and the PR-group order stays the same.\n- Then run `spr update`.\n\nOn cherry-pick conflict, `spr absorb` leaves the temp rewrite worktree in place, writes a resume file under the repository common Git directory, and prints `spr resume <path>`. Resolve conflicts in that temp worktree, stage the resolution, and run the printed resume command.\n\nAdvanced:\n- By default, absorb blocks copied later commits when replaying the stack would become empty or ambiguous.\n- `--allow-replayed-duplicates` allows an earlier copied non-seed follow-up commit to coexist with its later replayed copy by keeping both commits in the rewritten stack."
     )]
     Absorb {
         /// Absorb only this PR group and every group above it
-        #[arg(long, value_name = "N|label|pr:<label>")]
+        #[arg(long, value_name = "N|name|pr:<label>|branch:<branch-name>")]
         from: Option<crate::selectors::GroupSelector>,
 
         /// Allow replayed duplicates and keep both copies when the later replay is non-seed
@@ -175,10 +178,10 @@ pub enum Cmd {
         dry_run: DryRunArgs,
     },
 
-    /// Prepare PRs for landing (e.g., squash) and halt early on case-colliding synthetic branch names
+    /// Prepare PRs for landing (e.g., squash) and halt early on case-colliding concrete branch names
     Prep {
         /// Prepare this PR group and every group above it
-        #[arg(long, value_name = "N|label|pr:<label>")]
+        #[arg(long, value_name = "N|name|pr:<label>|branch:<branch-name>")]
         from: Option<crate::selectors::GroupSelector>,
 
         // Additional selection is provided via global --until/--exact flags.
@@ -196,14 +199,14 @@ pub enum Cmd {
         path: PathBuf,
     },
 
-    /// List entities and halt early on case-colliding synthetic branch names
+    /// List entities and halt early on case-colliding concrete branch names
     #[command(alias = "ls")]
     List {
         #[command(subcommand)]
         what: ListWhat,
     },
 
-    /// Status overview (alias for `list pr`) with the same early synthetic branch-collision guard
+    /// Status overview (alias for `list pr`) with the same early concrete branch-collision guard
     #[command(alias = "stat")]
     Status,
 
@@ -219,7 +222,7 @@ pub enum Cmd {
         target: Option<String>,
     },
 
-    /// Land PRs (merge variants) and halt early on case-colliding synthetic branch names
+    /// Land PRs (merge variants) and halt early on case-colliding concrete branch names
     Land {
         // Target PR index is provided via global --until. For `flatten`, 0 means the top PR. For `per-pr`, 0 means all
         #[command(subcommand)]
@@ -234,7 +237,7 @@ pub enum Cmd {
         dry_run: DryRunArgs,
     },
 
-    /// Relink PR stack to match local commit stack and halt early on case-colliding synthetic branch names
+    /// Relink PR stack to match local commit stack and halt early on case-colliding concrete branch names
     RelinkPrs {
         #[command(flatten)]
         dry_run: DryRunArgs,
@@ -250,7 +253,7 @@ pub enum Cmd {
     /// Move the last M commits (top of stack) to the tail of a selected PR group
     #[command(visible_alias = "fix")]
     FixPr {
-        /// Target local PR number or stable handle
+        /// Target local PR number or group selector
         target: crate::selectors::GroupSelector,
         /// Number of top commits to move to the selected PR group's tail
         #[arg(short = 't', long = "tail", default_value_t = 1)]
@@ -262,13 +265,16 @@ pub enum Cmd {
         dry_run: DryRunArgs,
     },
 
-    /// Reorder local PR groups by moving one or a range to come after a target PR, halting early on case-colliding synthetic branch names
+    /// Reorder local PR groups by moving one or a range to come after a target PR, halting early on case-colliding concrete branch names
     #[command(alias = "mv")]
     Move {
-        /// Position or range to move: `A`, `A..B`, `label`, `pr:<label>`, `a..b`, or `pr:<a>..pr:<b>`
+        /// Position or range to move: ordinal, bare selector, explicit selector, or selector range
         range: crate::selectors::GroupRangeSelector,
-        /// Target PR position to come after: number, stable handle, or one of bottom/top/last/all
-        #[arg(long, value_name = "C|bottom|top|last|all|label|pr:<label>")]
+        /// Target PR position to come after: number, group selector, or one of bottom/top/last/all
+        #[arg(
+            long,
+            value_name = "C|bottom|top|last|all|name|pr:<label>|branch:<branch-name>"
+        )]
         after: crate::selectors::AfterSelector,
         /// Create a local backup tag at current HEAD before rewriting
         #[arg(long)]
@@ -305,14 +311,22 @@ pub struct Cli {
     /// Global branch prefix for per-PR branches
     #[arg(long, global = true)]
     pub prefix: Option<String>,
-    /// Sync local per-PR branches named like synthetic PR branches
+    /// Sync local per-PR branches named like each group's resolved concrete branch
     #[arg(long, global = true, value_enum)]
     pub local_pr_branches: Option<crate::config::LocalPrBranchSyncPolicy>,
-    /// Global until (used by prep/land). Accepts 0, a local PR number, or a stable handle
-    #[arg(long, global = true, value_name = "N|0|label|pr:<label>")]
+    /// Global until (used by prep/land). Accepts 0, a local PR number, or a group selector
+    #[arg(
+        long,
+        global = true,
+        value_name = "N|0|name|pr:<label>|branch:<branch-name>"
+    )]
     pub until: Option<crate::selectors::InclusiveSelector>,
-    /// Global exact (used by prep). Accepts a local PR number or a stable handle
-    #[arg(long, global = true, value_name = "I|label|pr:<label>")]
+    /// Global exact (used by prep). Accepts a local PR number or a group selector
+    #[arg(
+        long,
+        global = true,
+        value_name = "I|name|pr:<label>|branch:<branch-name>"
+    )]
     pub exact: Option<crate::selectors::GroupSelector>,
     #[command(flatten)]
     pub output: OutputArgs,
@@ -361,9 +375,12 @@ mod tests {
 
         match cli.cmd {
             Cmd::Absorb {
-                from: Some(crate::selectors::GroupSelector::Stable(handle)),
+                from:
+                    Some(crate::selectors::GroupSelector::Explicit(
+                        crate::selectors::ExplicitGroupSelector::PrLabel(label),
+                    )),
                 ..
-            } => assert_eq!(handle.tag, "beta"),
+            } => assert_eq!(label, "beta"),
             other => panic!("unexpected command: {:?}", other),
         }
     }
@@ -374,9 +391,12 @@ mod tests {
 
         match cli.cmd {
             Cmd::Prep {
-                from: Some(crate::selectors::GroupSelector::Stable(handle)),
+                from:
+                    Some(crate::selectors::GroupSelector::Explicit(
+                        crate::selectors::ExplicitGroupSelector::PrLabel(label),
+                    )),
                 ..
-            } => assert_eq!(handle.tag, "beta"),
+            } => assert_eq!(label, "beta"),
             other => panic!("unexpected command: {:?}", other),
         }
     }

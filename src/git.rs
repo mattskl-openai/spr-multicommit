@@ -194,6 +194,24 @@ pub fn normalize_branch_name(name: &str) -> String {
     out.to_string()
 }
 
+/// Validate one branch name using Git's own refname rules.
+pub fn validate_branch_name(branch_name: &str) -> Result<()> {
+    let out = Command::new("git")
+        .args(["check-ref-format", "--branch", branch_name])
+        .output()
+        .with_context(|| "failed to spawn git check-ref-format")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!("invalid branch name `{branch_name}`")
+        } else {
+            bail!("invalid branch name `{branch_name}`: {stderr}")
+        }
+    }
+}
+
 pub fn repo_root() -> Result<Option<String>> {
     match git_ro(["rev-parse", "--show-toplevel"].as_slice()) {
         Ok(path) => Ok(Some(path.trim().to_string())),

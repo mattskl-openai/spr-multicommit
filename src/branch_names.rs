@@ -1,22 +1,17 @@
-//! Shared synthetic branch-name derivation and conflict checks.
+//! Shared group branch-name derivation and conflict checks.
 //!
-//! `spr` stores exact-case `pr:<tag>` handles in commit history, but most
-//! commands also derive synthetic branch names such as `dank-spr/alpha` by
-//! concatenating the configured prefix and the stored tag. On
-//! case-insensitive filesystems, two exact handles can still collide once they
-//! become branch names, so branch-conflict decisions must use a canonicalized
-//! comparison key instead of raw string equality.
+//! `pr:<label>` groups derive branch names by concatenating the configured
+//! prefix and label, while `branch:<branch-name>` groups use their exact branch
+//! name. On case-insensitive filesystems, two exact marker identities can still
+//! collide once they become concrete branch names, so conflict decisions use a
+//! canonicalized comparison key instead of raw string equality.
 
 use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::parsing::Group;
 
-/// Canonical comparison key for synthetic branch-name conflicts.
-///
-/// The stored `pr:<tag>` grammar is ASCII-only, so ASCII lowercasing is enough
-/// to catch the case-only collisions this rollout targets without changing the
-/// user-visible exact tag spelling.
+/// Canonical comparison key for concrete branch-name conflicts.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CanonicalBranchConflictKey(String);
 
@@ -26,33 +21,32 @@ impl CanonicalBranchConflictKey {
     }
 }
 
-/// Exact derived branch name plus the canonical key used only for comparisons.
+/// Exact concrete branch name plus the canonical key used only for comparisons.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyntheticBranchIdentity {
+pub struct GroupBranchIdentity {
     pub exact: String,
     pub conflict_key: CanonicalBranchConflictKey,
 }
 
-/// One live PR group whose synthetic branch name participates in a collision.
+/// One live PR group whose concrete branch name participates in a collision.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyntheticBranchCollisionEntry {
-    pub stable_handle: String,
+pub struct GroupBranchCollisionEntry {
+    pub selector: String,
     pub head_branch: String,
 }
 
-/// Two live PR groups whose derived synthetic branch names collide under case-folding.
+/// Two live PR groups whose concrete branch names collide under case-folding.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyntheticBranchNameCollision {
-    pub first: SyntheticBranchCollisionEntry,
-    pub second: SyntheticBranchCollisionEntry,
+pub struct GroupBranchNameCollision {
+    pub first: GroupBranchCollisionEntry,
+    pub second: GroupBranchCollisionEntry,
 }
 
-impl SyntheticBranchIdentity {
-    pub fn new(prefix: &str, tag: &str) -> Self {
-        let exact = format!("{prefix}{tag}");
-        let conflict_key = CanonicalBranchConflictKey::new(&exact);
+impl GroupBranchIdentity {
+    pub fn new(branch_name: String) -> Self {
+        let conflict_key = CanonicalBranchConflictKey::new(&branch_name);
         Self {
-            exact,
+            exact: branch_name,
             conflict_key,
         }
     }
@@ -62,46 +56,41 @@ pub fn canonical_branch_conflict_key(branch_name: &str) -> CanonicalBranchConfli
     CanonicalBranchConflictKey::new(branch_name)
 }
 
-pub fn synthetic_branch_identity(prefix: &str, tag: &str) -> SyntheticBranchIdentity {
-    SyntheticBranchIdentity::new(prefix, tag)
+pub fn group_branch_name(prefix: &str, group: &Group) -> String {
+    group.concrete_branch_name(prefix)
 }
 
-pub fn synthetic_branch_name(prefix: &str, tag: &str) -> String {
-    synthetic_branch_identity(prefix, tag).exact
-}
-
-impl std::fmt::Display for SyntheticBranchNameCollision {
+impl std::fmt::Display for GroupBranchNameCollision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Refusing to operate on this stack because {} and {} derive conflicting synthetic branch names (`{}` and `{}`) under case-insensitive comparison. Stable handles remain exact-case, but these branch names are not safe to treat as distinct on a case-insensitive filesystem.",
-            self.first.stable_handle,
-            self.second.stable_handle,
+            "Refusing to operate on this stack because {} and {} derive conflicting branch names (`{}` and `{}`) under case-insensitive comparison. Group selectors remain exact-case, but these branch names are not safe to treat as distinct on a case-insensitive filesystem.",
+            self.first.selector,
+            self.second.selector,
             self.first.head_branch,
             self.second.head_branch
         )
     }
 }
 
-impl std::error::Error for SyntheticBranchNameCollision {}
+impl std::error::Error for GroupBranchNameCollision {}
 
-/// Return the first case-folding synthetic-branch collision in `groups`, if any.
-pub fn find_synthetic_branch_name_collision(
+/// Return the first case-folding concrete-branch collision in `groups`, if any.
+pub fn find_group_branch_name_collision(
     groups: &[Group],
     prefix: &str,
-) -> Option<SyntheticBranchNameCollision> {
-    let mut seen: HashMap<CanonicalBranchConflictKey, SyntheticBranchCollisionEntry> =
-        HashMap::new();
+) -> Option<GroupBranchNameCollision> {
+    let mut seen: HashMap<CanonicalBranchConflictKey, GroupBranchCollisionEntry> = HashMap::new();
     for group in groups {
-        let head_branch = synthetic_branch_name(prefix, &group.tag);
-        let stable_handle = format!("pr:{}", group.tag);
+        let head_branch = group_branch_name(prefix, group);
+        let selector = group.selector_text();
         let conflict_key = canonical_branch_conflict_key(&head_branch);
-        let entry = SyntheticBranchCollisionEntry {
-            stable_handle,
+        let entry = GroupBranchCollisionEntry {
+            selector,
             head_branch,
         };
         if let Some(previous) = seen.get(&conflict_key) {
-            return Some(SyntheticBranchNameCollision {
+            return Some(GroupBranchNameCollision {
                 first: previous.clone(),
                 second: entry,
             });
@@ -112,21 +101,14 @@ pub fn find_synthetic_branch_name_collision(
     None
 }
 
-/// Derive synthetic branch identities for `groups` and reject canonical collisions.
-///
-/// The returned vector preserves the input order. On collision, the error names
-/// both exact tags and both exact branch spellings so the user can fix history
-/// without guessing which pair caused the problem.
-pub fn group_branch_identities(
-    groups: &[Group],
-    prefix: &str,
-) -> Result<Vec<SyntheticBranchIdentity>> {
-    if let Some(collision) = find_synthetic_branch_name_collision(groups, prefix) {
+/// Derive concrete branch identities for `groups` and reject canonical collisions.
+pub fn group_branch_identities(groups: &[Group], prefix: &str) -> Result<Vec<GroupBranchIdentity>> {
+    if let Some(collision) = find_group_branch_name_collision(groups, prefix) {
         Err(collision.into())
     } else {
         Ok(groups
             .iter()
-            .map(|group| synthetic_branch_identity(prefix, &group.tag))
+            .map(|group| GroupBranchIdentity::new(group_branch_name(prefix, group)))
             .collect())
     }
 }
@@ -134,26 +116,48 @@ pub fn group_branch_identities(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_branch_conflict_key, find_synthetic_branch_name_collision,
-        group_branch_identities, synthetic_branch_identity,
+        canonical_branch_conflict_key, find_group_branch_name_collision, group_branch_identities,
+        GroupBranchIdentity,
     };
+    use crate::group_markers::GroupMarker;
     use crate::parsing::Group;
 
-    fn group(tag: &str) -> Group {
+    fn pr_group(label: &str) -> Group {
         Group {
-            tag: tag.to_string(),
-            subjects: vec![format!("feat: {tag}")],
-            commits: vec![format!("{tag}1")],
-            first_message: Some(format!("feat: {tag}\n\npr:{tag}")),
+            marker: GroupMarker::PrLabel(label.to_string()),
+            subjects: vec![format!("feat: {label}")],
+            commits: vec![format!("{label}1")],
+            first_message: Some(format!("feat: {label}\n\npr:{label}")),
+            ignored_after: Vec::new(),
+        }
+    }
+
+    fn branch_group(branch_name: &str) -> Group {
+        Group {
+            marker: GroupMarker::BranchName(branch_name.to_string()),
+            subjects: vec![format!("feat: {branch_name}")],
+            commits: vec![format!("{branch_name}1")],
+            first_message: Some(format!("feat: {branch_name}\n\nbranch:{branch_name}")),
             ignored_after: Vec::new(),
         }
     }
 
     #[test]
-    fn synthetic_branch_identity_preserves_exact_branch_name() {
-        let identity = synthetic_branch_identity("dank-spr/", "Alpha");
+    fn branch_identity_preserves_exact_branch_name() {
+        let identity = GroupBranchIdentity::new(
+            GroupMarker::PrLabel("Alpha".to_string()).concrete_branch_name("dank-spr/"),
+        );
 
         assert_eq!(identity.exact, "dank-spr/Alpha");
+    }
+
+    #[test]
+    fn branch_identity_uses_exact_explicit_branch_name() {
+        let identity = GroupBranchIdentity::new(
+            GroupMarker::BranchName("feature/login".to_string()).concrete_branch_name("dank-spr/"),
+        );
+
+        assert_eq!(identity.exact, "feature/login");
     }
 
     #[test]
@@ -173,17 +177,9 @@ mod tests {
     }
 
     #[test]
-    fn group_branch_identities_keep_prefix_in_collision_domain() {
-        let alpha = canonical_branch_conflict_key("dank-spr/alpha");
-        let other = canonical_branch_conflict_key("other-spr/alpha");
-
-        assert_ne!(alpha, other);
-    }
-
-    #[test]
     fn group_branch_identities_reject_case_only_collision() {
-        let err =
-            group_branch_identities(&[group("alpha"), group("Alpha")], "dank-spr/").unwrap_err();
+        let err = group_branch_identities(&[pr_group("alpha"), pr_group("Alpha")], "dank-spr/")
+            .unwrap_err();
 
         assert!(err.to_string().contains("pr:alpha and pr:Alpha"));
         assert!(err.to_string().contains("dank-spr/alpha"));
@@ -191,14 +187,25 @@ mod tests {
     }
 
     #[test]
-    fn find_synthetic_branch_name_collision_returns_typed_entries() {
+    fn group_branch_identities_reject_explicit_collision() {
+        let err = group_branch_identities(
+            &[pr_group("beta"), branch_group("dank-spr/beta")],
+            "dank-spr/",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("pr:beta and branch:dank-spr/beta"));
+    }
+
+    #[test]
+    fn find_group_branch_name_collision_returns_typed_entries() {
         let collision =
-            find_synthetic_branch_name_collision(&[group("alpha"), group("Alpha")], "dank-spr/")
+            find_group_branch_name_collision(&[pr_group("alpha"), pr_group("Alpha")], "dank-spr/")
                 .unwrap();
 
-        assert_eq!(collision.first.stable_handle, "pr:alpha");
+        assert_eq!(collision.first.selector, "pr:alpha");
         assert_eq!(collision.first.head_branch, "dank-spr/alpha");
-        assert_eq!(collision.second.stable_handle, "pr:Alpha");
+        assert_eq!(collision.second.selector, "pr:Alpha");
         assert_eq!(collision.second.head_branch, "dank-spr/Alpha");
     }
 }
