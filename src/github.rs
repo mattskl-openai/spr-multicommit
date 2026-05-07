@@ -9,7 +9,7 @@
 //! recent merges or closes.
 
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::info;
@@ -36,7 +36,8 @@ pub struct OpenPrAutomergeInfo {
     pub auto_merge_enabled: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrState {
     /// The head ref currently has an open pull request.
     Open,
@@ -53,7 +54,9 @@ pub enum PrState {
 pub struct PrInfoWithState {
     pub number: u64,
     pub head: String,
+    pub base: String,
     pub state: PrState,
+    pub url: String,
 }
 
 /// Terminal state for a branch-name reuse guard lookup.
@@ -605,7 +608,7 @@ pub fn fetch_pr_bodies_graphql(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInf
     Ok(out)
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrCiReviewStatus {
     pub ci_state: String, // SUCCESS | FAILURE | ERROR | PENDING | EXPECTED | UNKNOWN
     pub review_decision: String, // APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | UNKNOWN
@@ -908,7 +911,21 @@ pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoW
             out.push(PrInfoWithState {
                 number: pr.number,
                 head: pr.head,
+                base: pr.base.ok_or_else(|| {
+                    anyhow!(
+                        "Open PR #{} missing baseRefName for requested head {}",
+                        pr.number,
+                        head
+                    )
+                })?,
                 state: PrState::Open,
+                url: pr.url.ok_or_else(|| {
+                    anyhow!(
+                        "Open PR #{} missing url for requested head {}",
+                        pr.number,
+                        head
+                    )
+                })?,
             });
         } else {
             heads_without_open_prs.push(head.clone());
@@ -934,7 +951,21 @@ pub fn list_open_or_merged_prs_for_heads(heads: &[String]) -> Result<Vec<PrInfoW
                 out.push(PrInfoWithState {
                     number: pr.number,
                     head: pr.head,
+                    base: pr.base.ok_or_else(|| {
+                        anyhow!(
+                            "Merged PR #{} missing baseRefName for requested head {}",
+                            pr.number,
+                            head
+                        )
+                    })?,
                     state: PrState::Merged,
+                    url: pr.url.ok_or_else(|| {
+                        anyhow!(
+                            "Merged PR #{} missing url for requested head {}",
+                            pr.number,
+                            head
+                        )
+                    })?,
                 });
             }
         }
@@ -1499,39 +1530,40 @@ mod tests {
     }
 
     #[test]
-    fn list_open_or_merged_prs_for_heads_uses_exact_open_then_exact_merged() {
+    fn list_open_or_merged_prs_for_heads_keeps_urls_for_exact_open_and_merged_matches() {
         let _lock = lock_cwd();
-        let exact_merged_json = graphql_nodes_response(&[
+        let exact_open_json = graphql_nodes_response(&[
             (
                 "pr0",
                 json!([{
-                    "number": 21,
+                    "number": 17,
                     "headRefName": "skilltest/alpha",
                     "baseRefName": "main",
-                    "state": "MERGED",
-                    "mergedAt": "2026-02-01T00:00:00Z",
-                    "closedAt": "2026-02-01T00:00:00Z",
-                    "url": "https://github.com/o/r/pull/21",
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "closedAt": null,
+                    "url": "https://github.com/o/r/pull/17",
                     "autoMergeRequest": null
                 }]),
             ),
-            (
-                "pr1",
-                json!([{
-                    "number": 22,
-                    "headRefName": "skilltest/beta",
-                    "baseRefName": "main",
-                    "state": "MERGED",
-                    "mergedAt": "2026-02-02T00:00:00Z",
-                    "closedAt": "2026-02-02T00:00:00Z",
-                    "url": "https://github.com/o/r/pull/22",
-                    "autoMergeRequest": null
-                }]),
-            ),
+            ("pr1", json!([])),
         ]);
+        let exact_merged_json = graphql_nodes_response(&[(
+            "pr0",
+            json!([{
+                "number": 22,
+                "headRefName": "skilltest/beta",
+                "baseRefName": "main",
+                "state": "MERGED",
+                "mergedAt": "2026-02-02T00:00:00Z",
+                "closedAt": "2026-02-02T00:00:00Z",
+                "url": "https://github.com/o/r/pull/22",
+                "autoMergeRequest": null
+            }]),
+        )]);
         let open_search_json = graphql_search_response(&[("pr0", json!([])), ("pr1", json!([]))]);
         let (_wrapper_dir, _data_dir, _path_guard, log_path) = install_gh_graphql_and_list_wrapper(
-            "[]",
+            &exact_open_json,
             &exact_merged_json,
             &graphql_nodes_response(&[]),
             &open_search_json,
@@ -1546,14 +1578,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(prs.len(), 2);
-        assert_eq!(prs[0].number, 21);
-        assert_eq!(prs[0].state, PrState::Merged);
+        assert_eq!(prs[0].number, 17);
+        assert_eq!(prs[0].state, PrState::Open);
+        assert_eq!(prs[0].url, "https://github.com/o/r/pull/17");
         assert_eq!(prs[1].number, 22);
         assert_eq!(prs[1].state, PrState::Merged);
+        assert_eq!(prs[1].url, "https://github.com/o/r/pull/22");
 
         let log = fs::read_to_string(log_path).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 4);
         assert!(lines[0].contains("api graphql"));
         assert!(lines[0].contains("states:[OPEN]"));
         assert!(lines[1].contains("api graphql"));
@@ -1561,8 +1595,8 @@ mod tests {
         assert!(lines[1].contains("is:pr is:open head:skilltest/beta"));
         assert!(lines[2].contains("api graphql"));
         assert!(lines[2].contains("states:[MERGED]"));
-        assert!(lines[3].contains("pr list --state merged --search head:skilltest/alpha"));
-        assert!(lines[4].contains("pr list --state merged --search head:skilltest/beta"));
+        assert!(lines[2].contains("skilltest/beta"));
+        assert!(lines[3].contains("pr list --state merged --search head:skilltest/beta"));
     }
 
     #[test]

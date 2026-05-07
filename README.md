@@ -307,8 +307,17 @@ Behavior:
 
 Machine-readable `--json` mode:
 
-- Supported on `spr restack`, `spr absorb`, `spr move`, `spr fix-pr`, `spr land`, and `spr resume`
+- Supported on `spr list pr`, `spr list commit`, `spr status`, `spr restack`, `spr absorb`,
+  `spr move`, `spr fix-pr`, `spr land`, and `spr resume`
 - In `--json` mode, stdout is exactly one JSON object and stderr is normally empty
+- `spr list pr --json`, `spr list commit --json`, and `spr status --json` use a read-only output
+  envelope and never suspend
+- Read-only JSON includes `repo_root`, `current_branch`, `base_branch`, `prefix`, and
+  `remote_metadata_state`
+- Read-only JSON always emits groups and commits in canonical bottom-up stack order, even when
+  `list_order: recent_on_top` changes the human display order
+- Read-only JSON error payloads use typed `error_kind` values such as
+  `synthetic_branch_name_collision`, `invalid_arguments`, and `internal`
 - Exit codes are:
   - `0` for completed
   - `1` for hard error, including CLI parse failures when `--json` was requested
@@ -406,6 +415,11 @@ Before listing, `spr list pr` validates that no two live PR groups derive
 synthetic branch names that collide under case-insensitive comparison. If they
 do, it halts before loading GitHub PR state.
 
+`spr list pr --json` emits one read-only JSON object instead of human-formatted lines.
+The payload always uses canonical bottom-up group order, includes remote PR metadata plus explicit
+CI/review state when available, and reports case-colliding synthetic branch failures as a typed
+`synthetic_branch_name_collision` error payload.
+
 ### spr status
 
 Aliases:
@@ -417,6 +431,9 @@ Alias for `spr list pr`.
 `spr status` runs the same early synthetic branch-collision validation as
 `spr list pr` before printing anything.
 
+`spr status --json` emits the same read-only payload shape as `spr list pr --json`, but keeps the
+top-level command identity as `status`.
+
 ### spr list commit
 
 Lists commits in the current stack, grouped by local PR. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers and commit indices remain bottom → top, and each group header also shows its stable `pr:<label>` handle.
@@ -424,6 +441,10 @@ Lists commits in the current stack, grouped by local PR. Display order is contro
 Before listing, `spr list commit` validates that no two live PR groups derive
 synthetic branch names that collide under case-insensitive comparison. If they
 do, it halts before loading GitHub PR state.
+
+`spr list commit --json` emits one read-only JSON object instead of human-formatted lines.
+The payload uses the same canonical bottom-up group order as `spr list pr --json`, keeps canonical
+global commit indices, and ignores `list_order` in JSON mode.
 
 Aliases:
 

@@ -14,6 +14,7 @@ mod limit;
 mod machine_output;
 mod parsing;
 mod pr_labels;
+mod read_only_output;
 mod selectors;
 mod stack_metadata;
 #[cfg(test)]
@@ -66,9 +67,9 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
             .map(crate::commands::looks_like_pr_url)
             .unwrap_or(false),
         crate::cli::Cmd::Update { .. }
-        | crate::cli::Cmd::Prep {}
         | crate::cli::Cmd::List { .. }
-        | crate::cli::Cmd::Status {}
+        | crate::cli::Cmd::Status { .. }
+        | crate::cli::Cmd::Prep {}
         | crate::cli::Cmd::Land { .. }
         | crate::cli::Cmd::RelinkPrs {}
         | crate::cli::Cmd::Cleanup {}
@@ -82,9 +83,11 @@ enum OutputMode {
     Json,
 }
 
+#[derive(Debug)]
 enum CommandOutput {
     None,
     Machine(crate::machine_output::MachineOutput),
+    ReadOnly(crate::read_only_output::ReadOnlyOutput),
     ResolveStack(crate::commands::ResolveStackOutput),
 }
 
@@ -199,6 +202,56 @@ fn ensure_resume_completed(
         Ok(crate::machine_output::MachineOutput::completed(
             crate::machine_output::MachineCommand::Resume,
         ))
+    }
+}
+
+fn read_only_pr_list_output(
+    command: crate::read_only_output::ReadOnlyCommand,
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+) -> crate::read_only_output::ReadOnlyOutput {
+    match crate::commands::collect_pr_list_data_for_json(base, prefix, ignore_tag) {
+        Ok(data) => crate::read_only_output::ReadOnlyOutput::pr_list(command, base, prefix, data),
+        Err(crate::commands::ReadOnlyQueryError::SyntheticBranchNameCollision(collision)) => {
+            crate::read_only_output::ReadOnlyOutput::synthetic_branch_name_collision(
+                command, base, prefix, &collision,
+            )
+        }
+        Err(crate::commands::ReadOnlyQueryError::Internal(err)) => {
+            crate::read_only_output::ReadOnlyOutput::internal(
+                command,
+                base,
+                prefix,
+                format!("{err:#}"),
+            )
+        }
+    }
+}
+
+fn read_only_commit_list_output(
+    command: crate::read_only_output::ReadOnlyCommand,
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+) -> crate::read_only_output::ReadOnlyOutput {
+    match crate::commands::collect_commit_list_data_for_json(base, prefix, ignore_tag) {
+        Ok(data) => {
+            crate::read_only_output::ReadOnlyOutput::commit_list(command, base, prefix, data)
+        }
+        Err(crate::commands::ReadOnlyQueryError::SyntheticBranchNameCollision(collision)) => {
+            crate::read_only_output::ReadOnlyOutput::synthetic_branch_name_collision(
+                command, base, prefix, &collision,
+            )
+        }
+        Err(crate::commands::ReadOnlyQueryError::Internal(err)) => {
+            crate::read_only_output::ReadOnlyOutput::internal(
+                command,
+                base,
+                prefix,
+                format!("{err:#}"),
+            )
+        }
     }
 }
 
@@ -363,20 +416,52 @@ fn run_cli(cli: crate::cli::Cli, output_mode: OutputMode) -> Result<CommandOutpu
             Ok(CommandOutput::None)
         }
         crate::cli::Cmd::List { what } => {
-            match what {
-                crate::cli::ListWhat::Pr => {
-                    crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?;
+            if output_mode == OutputMode::Json {
+                match what {
+                    crate::cli::ListWhat::Pr { .. } => {
+                        Ok(CommandOutput::ReadOnly(read_only_pr_list_output(
+                            crate::read_only_output::ReadOnlyCommand::ListPr,
+                            &base,
+                            &prefix,
+                            &ignore_tag,
+                        )))
+                    }
+                    crate::cli::ListWhat::Commit { .. } => {
+                        Ok(CommandOutput::ReadOnly(read_only_commit_list_output(
+                            crate::read_only_output::ReadOnlyCommand::ListCommit,
+                            &base,
+                            &prefix,
+                            &ignore_tag,
+                        )))
+                    }
                 }
-                crate::cli::ListWhat::Commit => {
-                    crate::commands::list_commits_display(&base, &prefix, &ignore_tag, list_order)?;
+            } else {
+                match what {
+                    crate::cli::ListWhat::Pr { .. } => {
+                        crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
+                    }
+                    crate::cli::ListWhat::Commit { .. } => crate::commands::list_commits_display(
+                        &base,
+                        &prefix,
+                        &ignore_tag,
+                        list_order,
+                    )?,
                 }
+                Ok(CommandOutput::None)
             }
-            Ok(CommandOutput::None)
         }
-        crate::cli::Cmd::Status {} => {
-            // alias for `spr list pr`
-            crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?;
-            Ok(CommandOutput::None)
+        crate::cli::Cmd::Status { json: _ } => {
+            if output_mode == OutputMode::Json {
+                Ok(CommandOutput::ReadOnly(read_only_pr_list_output(
+                    crate::read_only_output::ReadOnlyCommand::Status,
+                    &base,
+                    &prefix,
+                    &ignore_tag,
+                )))
+            } else {
+                crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?;
+                Ok(CommandOutput::None)
+            }
         }
         crate::cli::Cmd::ResolveStack { target, json: _ } => Ok(CommandOutput::ResolveStack(
             crate::commands::resolve_stack(target, &ignore_tag)?,
@@ -541,6 +626,58 @@ fn raw_args_request_json(args: &[OsString]) -> bool {
         .any(|arg| arg.as_os_str() == OsStr::new("--json"))
 }
 
+fn read_only_command_for_cli(
+    cmd: &crate::cli::Cmd,
+) -> Option<crate::read_only_output::ReadOnlyCommand> {
+    match cmd {
+        crate::cli::Cmd::List {
+            what: crate::cli::ListWhat::Pr { .. },
+        } => Some(crate::read_only_output::ReadOnlyCommand::ListPr),
+        crate::cli::Cmd::List {
+            what: crate::cli::ListWhat::Commit { .. },
+        } => Some(crate::read_only_output::ReadOnlyCommand::ListCommit),
+        crate::cli::Cmd::Status { .. } => Some(crate::read_only_output::ReadOnlyCommand::Status),
+        _ => None,
+    }
+}
+
+fn read_only_command_for_raw_args(
+    args: &[OsString],
+) -> Option<crate::read_only_output::ReadOnlyCommand> {
+    let mut skip_value = false;
+    let mut saw_list = false;
+    for arg in args.iter().skip(1) {
+        if skip_value {
+            skip_value = false;
+        } else if let Some(arg) = arg.to_str() {
+            if arg == "--cd"
+                || arg == "--base"
+                || arg == "--prefix"
+                || arg == "--until"
+                || arg == "--exact"
+                || arg == "-b"
+            {
+                skip_value = true;
+            } else if saw_list && (arg == "pr" || arg == "p") {
+                return Some(crate::read_only_output::ReadOnlyCommand::ListPr);
+            } else if saw_list && (arg == "commit" || arg == "c") {
+                return Some(crate::read_only_output::ReadOnlyCommand::ListCommit);
+            } else if arg == "list" || arg == "ls" {
+                saw_list = true;
+            } else if arg == "status" || arg == "stat" {
+                return Some(crate::read_only_output::ReadOnlyCommand::Status);
+            } else if !arg.starts_with('-') {
+                saw_list = false;
+            }
+        }
+    }
+    if saw_list {
+        Some(crate::read_only_output::ReadOnlyCommand::Cli)
+    } else {
+        None
+    }
+}
+
 fn machine_command_for_raw_args(args: &[OsString]) -> crate::machine_output::MachineCommand {
     let mut skip_value = false;
     for arg in args.iter().skip(1) {
@@ -577,19 +714,36 @@ fn machine_command_for_raw_args(args: &[OsString]) -> crate::machine_output::Mac
     crate::machine_output::MachineCommand::Cli
 }
 
-fn parse_failure_as_machine_output(
+#[derive(Debug)]
+enum JsonParseFailureOutput {
+    Machine(crate::machine_output::MachineOutput),
+    ReadOnly(crate::read_only_output::ReadOnlyOutput),
+}
+
+fn parse_failure_as_json_output(
     args: &[OsString],
     err: &clap::Error,
-) -> Option<crate::machine_output::MachineOutput> {
+) -> Option<JsonParseFailureOutput> {
     let is_display_only = matches!(
         err.kind(),
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     );
     if raw_args_request_json(args) && !is_display_only {
-        Some(crate::machine_output::MachineOutput::error(
-            machine_command_for_raw_args(args),
-            err.to_string(),
-        ))
+        if let Some(command) = read_only_command_for_raw_args(args) {
+            Some(JsonParseFailureOutput::ReadOnly(
+                crate::read_only_output::ReadOnlyOutput::invalid_arguments(
+                    command,
+                    err.to_string(),
+                ),
+            ))
+        } else {
+            Some(JsonParseFailureOutput::Machine(
+                crate::machine_output::MachineOutput::error(
+                    machine_command_for_raw_args(args),
+                    err.to_string(),
+                ),
+            ))
+        }
     } else {
         None
     }
@@ -600,9 +754,17 @@ fn main() {
     let cli = match crate::cli::Cli::try_parse_from(raw_args.clone()) {
         Ok(cli) => cli,
         Err(err) => {
-            if let Some(output) = parse_failure_as_machine_output(&raw_args, &err) {
-                println!("{}", serde_json::to_string(&output).unwrap());
-                std::process::exit(crate::machine_output::EXIT_FAILURE);
+            if let Some(output) = parse_failure_as_json_output(&raw_args, &err) {
+                match output {
+                    JsonParseFailureOutput::Machine(output) => {
+                        println!("{}", serde_json::to_string(&output).unwrap());
+                        std::process::exit(crate::machine_output::EXIT_FAILURE);
+                    }
+                    JsonParseFailureOutput::ReadOnly(output) => {
+                        println!("{}", serde_json::to_string(&output).unwrap());
+                        std::process::exit(crate::machine_output::EXIT_FAILURE);
+                    }
+                }
             } else {
                 err.exit();
             }
@@ -614,7 +776,8 @@ fn main() {
         OutputMode::Human
     };
     init_logging(cli.verbose, output_mode);
-    let command = machine_command_for_cli(&cli.cmd);
+    let rewrite_command = machine_command_for_cli(&cli.cmd);
+    let read_only_command = read_only_command_for_cli(&cli.cmd);
     match run_cli(cli, output_mode) {
         Ok(output) => match output {
             CommandOutput::None => {}
@@ -622,6 +785,11 @@ fn main() {
                 if output_mode == OutputMode::Json {
                     println!("{}", serde_json::to_string(&output).unwrap());
                     std::process::exit(output.exit_code());
+                }
+            }
+            CommandOutput::ReadOnly(output) => {
+                if output_mode == OutputMode::Json {
+                    println!("{}", serde_json::to_string(&output).unwrap());
                 }
             }
             CommandOutput::ResolveStack(output) => {
@@ -634,9 +802,19 @@ fn main() {
         },
         Err(err) => {
             if output_mode == OutputMode::Json {
-                let output =
-                    crate::machine_output::MachineOutput::error(command, format!("{err:#}"));
-                println!("{}", serde_json::to_string(&output).unwrap());
+                if let Some(command) = read_only_command {
+                    let output = crate::read_only_output::ReadOnlyOutput::internal_without_context(
+                        command,
+                        format!("{err:#}"),
+                    );
+                    println!("{}", serde_json::to_string(&output).unwrap());
+                } else {
+                    let output = crate::machine_output::MachineOutput::error(
+                        rewrite_command,
+                        format!("{err:#}"),
+                    );
+                    println!("{}", serde_json::to_string(&output).unwrap());
+                }
             } else {
                 eprintln!("Error: {err:#}");
             }
@@ -657,7 +835,7 @@ fn machine_command_for_cli(cmd: &crate::cli::Cmd) -> crate::machine_output::Mach
         crate::cli::Cmd::Update { .. }
         | crate::cli::Cmd::Prep {}
         | crate::cli::Cmd::List { .. }
-        | crate::cli::Cmd::Status {}
+        | crate::cli::Cmd::Status { .. }
         | crate::cli::Cmd::RelinkPrs {}
         | crate::cli::Cmd::Cleanup {} => crate::machine_output::MachineCommand::Restack,
     }
@@ -667,15 +845,23 @@ fn machine_command_for_cli(cmd: &crate::cli::Cmd) -> crate::machine_output::Mach
 mod tests {
     use super::{
         apply_working_directory_override, command_requires_gh, machine_command_for_raw_args,
-        parse_failure_as_machine_output, resolve_update_pr_limit,
+        parse_failure_as_json_output, read_only_command_for_raw_args, resolve_update_pr_limit,
+        run_cli, CommandOutput, JsonParseFailureOutput, OutputMode,
     };
     use crate::machine_output::{MachineCommand, MachinePayload};
     use crate::parsing::Group;
+    use crate::read_only_output::{
+        ReadOnlyCommand, ReadOnlyError, ReadOnlyPayload, RemoteMetadataState,
+    };
     use crate::selectors::{GroupSelector, StableHandle};
-    use crate::test_support::lock_cwd;
+    use crate::test_support::{
+        commit_file, git, init_case_conflicting_stack_repo, init_repo as init_stack_repo, lock_cwd,
+    };
     use clap::Parser;
+    use std::env;
     use std::ffi::OsString;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
     use tempfile::TempDir;
@@ -696,6 +882,44 @@ mod tests {
         fn drop(&mut self) {
             std::env::set_current_dir(&self.original).unwrap();
         }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: String) -> Self {
+            let original = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                env::set_var(self.key, original);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn install_gh_wrapper(script_body: &str) -> (TempDir, EnvVarGuard) {
+        let wrapper_dir = tempfile::tempdir().unwrap();
+        let script_path = wrapper_dir.path().join("gh");
+        fs::write(&script_path, script_body).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+        let original_path = env::var("PATH").unwrap_or_default();
+        let path_guard = EnvVarGuard::set(
+            "PATH",
+            format!("{}:{}", wrapper_dir.path().display(), original_path),
+        );
+        (wrapper_dir, path_guard)
     }
 
     fn group(tag: &str) -> Group {
@@ -770,8 +994,10 @@ mod tests {
     }
 
     #[test]
-    fn status_still_requires_github_cli() {
-        assert!(command_requires_gh(&crate::cli::Cmd::Status {}));
+    fn status_requires_github_cli() {
+        assert!(command_requires_gh(&crate::cli::Cmd::Status {
+            json: false
+        }));
     }
 
     #[test]
@@ -845,27 +1071,88 @@ mod tests {
     }
 
     #[test]
-    fn parse_failure_with_json_returns_machine_error() {
+    fn read_only_command_for_raw_args_detects_list_status_commands() {
+        let list_args = vec![
+            OsString::from("spr"),
+            OsString::from("list"),
+            OsString::from("pr"),
+            OsString::from("--json"),
+        ];
+        let status_args = vec![
+            OsString::from("spr"),
+            OsString::from("status"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(
+            read_only_command_for_raw_args(&list_args),
+            Some(ReadOnlyCommand::ListPr)
+        );
+        assert_eq!(
+            read_only_command_for_raw_args(&status_args),
+            Some(ReadOnlyCommand::Status)
+        );
+    }
+
+    #[test]
+    fn parse_failure_with_json_returns_machine_error_for_rewrite_command() {
         let args = vec![
             OsString::from("spr"),
             OsString::from("restack"),
             OsString::from("--json"),
         ];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
-        let output = parse_failure_as_machine_output(&args, &err)
-            .expect("json parse failure should serialize");
+        let output =
+            parse_failure_as_json_output(&args, &err).expect("json parse failure should serialize");
 
-        match output.payload {
-            MachinePayload::Error {
-                command,
-                ref message,
-            } => {
-                assert_eq!(command, MachineCommand::Restack);
-                assert!(message.contains("--after"));
+        match output {
+            JsonParseFailureOutput::Machine(output) => {
+                match output.payload {
+                    MachinePayload::Error {
+                        command,
+                        ref message,
+                    } => {
+                        assert_eq!(command, MachineCommand::Restack);
+                        assert!(message.contains("--after"));
+                    }
+                    other => panic!("unexpected parse-failure payload: {:?}", other),
+                }
+                assert_eq!(output.exit_code(), crate::machine_output::EXIT_FAILURE);
             }
-            other => panic!("unexpected parse-failure payload: {:?}", other),
+            other => panic!("unexpected parse-failure output: {:?}", other),
         }
-        assert_eq!(output.exit_code(), crate::machine_output::EXIT_FAILURE);
+    }
+
+    #[test]
+    fn parse_failure_with_json_returns_read_only_error_for_list_command() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("list"),
+            OsString::from("pr"),
+            OsString::from("--json"),
+            OsString::from("--bogus"),
+        ];
+        let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
+        let output =
+            parse_failure_as_json_output(&args, &err).expect("json parse failure should serialize");
+
+        match output {
+            JsonParseFailureOutput::ReadOnly(output) => {
+                assert_eq!(output.command, ReadOnlyCommand::ListPr);
+                assert_eq!(output.schema_version, 1);
+                match output.payload {
+                    ReadOnlyPayload::Error {
+                        remote_metadata_state,
+                        error: ReadOnlyError::InvalidArguments { ref message },
+                    } => {
+                        assert_eq!(remote_metadata_state, RemoteMetadataState::NotRequested);
+                        assert!(message.contains("--bogus"));
+                    }
+                    other => panic!("unexpected read-only payload: {:?}", other),
+                }
+            }
+            other => panic!("unexpected parse-failure output: {:?}", other),
+        }
     }
 
     #[test]
@@ -873,7 +1160,7 @@ mod tests {
         let args = vec![OsString::from("spr"), OsString::from("restack")];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
 
-        assert!(parse_failure_as_machine_output(&args, &err).is_none());
+        assert!(parse_failure_as_json_output(&args, &err).is_none());
     }
 
     #[test]
@@ -886,6 +1173,464 @@ mod tests {
         ];
         let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected help output");
 
-        assert!(parse_failure_as_machine_output(&args, &err).is_none());
+        assert!(parse_failure_as_json_output(&args, &err).is_none());
+    }
+
+    fn init_local_stack_repo() -> TempDir {
+        let dir = init_stack_repo();
+        let repo = dir.path();
+        git(repo, ["checkout", "-b", "stack"].as_slice());
+        git(
+            repo,
+            ["remote", "add", "origin", "git@github.com:o/r.git"].as_slice(),
+        );
+        commit_file(repo, "alpha.txt", "alpha-1\n", "feat: alpha start pr:alpha");
+        commit_file(
+            repo,
+            "alpha.txt",
+            "alpha-1\nalpha-2\n",
+            "feat: alpha follow-up",
+        );
+        commit_file(repo, "beta.txt", "beta-1\n", "feat: beta start pr:beta");
+        fs::write(
+            repo.join(".spr_multicommit_cfg.yml"),
+            "list_order: recent_on_top\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn list_json_gh_script(
+        log_path: &std::path::Path,
+        open_json_path: &std::path::Path,
+        status_json_path: &std::path::Path,
+    ) -> String {
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'gh test wrapper'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*)\n      cat \"{}\" ;;\n    *\"is:pr is:open head:dank-spr/alpha\"*)\n      echo '{{\"data\":{{\"pr0\":{{\"nodes\":[]}},\"pr1\":{{\"nodes\":[]}}}}}}' ;;\n    *\"pullRequest(number: 17)\"*\"pullRequest(number: 18)\"*)\n      cat \"{}\" ;;\n    *)\n      echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[]'\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            log_path.display(),
+            open_json_path.display(),
+            status_json_path.display()
+        )
+    }
+
+    #[test]
+    fn run_cli_list_pr_json_uses_canonical_group_order() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_local_stack_repo();
+        let log_path = repo.path().join("gh.log");
+        let open_json_path = repo.path().join("gh-open.json");
+        let status_json_path = repo.path().join("gh-status.json");
+        fs::write(
+            &open_json_path,
+            serde_json::to_string(&serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "nodes": [{
+                                "number": 17,
+                                "headRefName": "dank-spr/alpha",
+                                "baseRefName": "main",
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/17",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        },
+                        "pr1": {
+                            "nodes": [{
+                                "number": 18,
+                                "headRefName": "dank-spr/beta",
+                                "baseRefName": "main",
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/18",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &status_json_path,
+            serde_json::to_string(&serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "reviewDecision": "APPROVED",
+                            "isDraft": false,
+                            "reviewRequests": { "totalCount": 0 },
+                            "reviews": { "nodes": [{ "state": "APPROVED" }] },
+                            "commits": {
+                                "nodes": [{
+                                    "commit": {
+                                        "statusCheckRollup": { "state": "SUCCESS" }
+                                    }
+                                }]
+                            }
+                        },
+                        "pr1": {
+                            "reviewDecision": "REVIEW_REQUIRED",
+                            "isDraft": false,
+                            "reviewRequests": { "totalCount": 0 },
+                            "reviews": { "nodes": [] },
+                            "commits": {
+                                "nodes": [{
+                                    "commit": {
+                                        "statusCheckRollup": { "state": "PENDING" }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let script = list_json_gh_script(&log_path, &open_json_path, &status_json_path);
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.path().to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "list",
+            "pr",
+            "--json",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputMode::Json).unwrap();
+
+        match output {
+            CommandOutput::ReadOnly(output) => {
+                assert_eq!(output.command, ReadOnlyCommand::ListPr);
+                match output.payload {
+                    ReadOnlyPayload::PrList { data } => {
+                        assert_eq!(data.remote_metadata_state, RemoteMetadataState::Complete);
+                        assert_eq!(data.groups.len(), 2);
+                        assert_eq!(data.groups[0].stable_handle, "pr:alpha");
+                        assert_eq!(data.groups[0].local_pr_number, 1);
+                        assert_eq!(data.groups[1].stable_handle, "pr:beta");
+                        assert_eq!(
+                            data.groups[1]
+                                .remote
+                                .as_ref()
+                                .and_then(|remote| remote.ci_review_status.as_ref())
+                                .map(|status| status.review_decision.as_str()),
+                            Some("REVIEW_REQUIRED")
+                        );
+                        let json = serde_json::to_string(
+                            &crate::read_only_output::ReadOnlyOutput::pr_list(
+                                ReadOnlyCommand::ListPr,
+                                "main",
+                                "dank-spr/",
+                                data,
+                            ),
+                        )
+                        .unwrap();
+                        assert!(!json.contains("CI status"));
+                        assert!(!json.contains("review status"));
+                    }
+                    other => panic!("unexpected read-only payload: {:?}", other),
+                }
+            }
+            other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_cli_status_json_matches_list_pr_payload() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_local_stack_repo();
+        let log_path = repo.path().join("gh.log");
+        let open_json_path = repo.path().join("gh-open.json");
+        let status_json_path = repo.path().join("gh-status.json");
+        fs::write(
+            &open_json_path,
+            serde_json::to_string(&serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "nodes": [{
+                                "number": 17,
+                                "headRefName": "dank-spr/alpha",
+                                "baseRefName": "main",
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/17",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        },
+                        "pr1": {
+                            "nodes": [{
+                                "number": 18,
+                                "headRefName": "dank-spr/beta",
+                                "baseRefName": "main",
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/18",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &status_json_path,
+            serde_json::to_string(&serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "reviewDecision": "APPROVED",
+                            "isDraft": false,
+                            "reviewRequests": { "totalCount": 0 },
+                            "reviews": { "nodes": [{ "state": "APPROVED" }] },
+                            "commits": {
+                                "nodes": [{
+                                    "commit": {
+                                        "statusCheckRollup": { "state": "SUCCESS" }
+                                    }
+                                }]
+                            }
+                        },
+                        "pr1": {
+                            "reviewDecision": "REVIEW_REQUIRED",
+                            "isDraft": false,
+                            "reviewRequests": { "totalCount": 0 },
+                            "reviews": { "nodes": [] },
+                            "commits": {
+                                "nodes": [{
+                                    "commit": {
+                                        "statusCheckRollup": { "state": "PENDING" }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let script = list_json_gh_script(&log_path, &open_json_path, &status_json_path);
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let list_cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.path().to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "list",
+            "pr",
+            "--json",
+        ])
+        .unwrap();
+        let status_cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.path().to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "status",
+            "--json",
+        ])
+        .unwrap();
+
+        let list_output = run_cli(list_cli, OutputMode::Json).unwrap();
+        let status_output = run_cli(status_cli, OutputMode::Json).unwrap();
+
+        match (list_output, status_output) {
+            (CommandOutput::ReadOnly(list_output), CommandOutput::ReadOnly(status_output)) => {
+                assert_eq!(list_output.command, ReadOnlyCommand::ListPr);
+                assert_eq!(status_output.command, ReadOnlyCommand::Status);
+                assert_eq!(list_output.payload, status_output.payload);
+            }
+            other => panic!("unexpected command outputs: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_cli_list_commit_json_preserves_canonical_indices() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_local_stack_repo();
+        let log_path = repo.path().join("gh.log");
+        let open_json_path = repo.path().join("gh-open.json");
+        let status_json_path = repo.path().join("gh-status.json");
+        fs::write(
+            &open_json_path,
+            serde_json::to_string(&serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "nodes": [{
+                                "number": 17,
+                                "headRefName": "dank-spr/alpha",
+                                "baseRefName": "main",
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/17",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        },
+                        "pr1": {
+                            "nodes": [{
+                                "number": 18,
+                                "headRefName": "dank-spr/beta",
+                                "baseRefName": "main",
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/18",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &status_json_path,
+            serde_json::to_string(&serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "reviewDecision": "APPROVED",
+                            "isDraft": false,
+                            "reviewRequests": { "totalCount": 0 },
+                            "reviews": { "nodes": [{ "state": "APPROVED" }] },
+                            "commits": {
+                                "nodes": [{
+                                    "commit": {
+                                        "statusCheckRollup": { "state": "SUCCESS" }
+                                    }
+                                }]
+                            }
+                        },
+                        "pr1": {
+                            "reviewDecision": "REVIEW_REQUIRED",
+                            "isDraft": false,
+                            "reviewRequests": { "totalCount": 0 },
+                            "reviews": { "nodes": [] },
+                            "commits": {
+                                "nodes": [{
+                                    "commit": {
+                                        "statusCheckRollup": { "state": "PENDING" }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let script = list_json_gh_script(&log_path, &open_json_path, &status_json_path);
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.path().to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "list",
+            "commit",
+            "--json",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputMode::Json).unwrap();
+
+        match output {
+            CommandOutput::ReadOnly(output) => match output.payload {
+                ReadOnlyPayload::CommitList { data } => {
+                    assert_eq!(data.remote_metadata_state, RemoteMetadataState::Complete);
+                    assert_eq!(data.groups[0].stable_handle, "pr:alpha");
+                    assert_eq!(
+                        data.groups[0]
+                            .commits
+                            .iter()
+                            .map(|commit| commit.global_commit_index)
+                            .collect::<Vec<_>>(),
+                        vec![1, 2]
+                    );
+                    assert_eq!(data.groups[1].stable_handle, "pr:beta");
+                    assert_eq!(data.groups[1].commits[0].global_commit_index, 3);
+                }
+                other => panic!("unexpected read-only payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_cli_list_pr_json_collision_error_is_typed() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_case_conflicting_stack_repo();
+        let log_path = repo.path().join("gh.log");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'gh test wrapper'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> \"{}\"\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            log_path.display()
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.path().to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "list",
+            "pr",
+            "--json",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputMode::Json).unwrap();
+
+        match output {
+            CommandOutput::ReadOnly(output) => match output.payload {
+                ReadOnlyPayload::Error {
+                    remote_metadata_state,
+                    error: ReadOnlyError::SyntheticBranchNameCollision { conflicting_groups },
+                } => {
+                    assert_eq!(remote_metadata_state, RemoteMetadataState::NotRequested);
+                    assert_eq!(conflicting_groups[0].stable_handle, "pr:alpha");
+                    assert_eq!(conflicting_groups[1].head_branch, "dank-spr/Alpha");
+                    let gh_log = fs::read_to_string(log_path).unwrap_or_default();
+                    assert!(gh_log.is_empty());
+                }
+                other => panic!("unexpected read-only payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
     }
 }
