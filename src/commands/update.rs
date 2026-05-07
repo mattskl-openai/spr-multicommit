@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tracing::{info, warn};
@@ -17,6 +17,10 @@ use crate::github::{
 };
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::{derive_groups_between_with_ignored, split_groups_for_update, Group};
+use crate::update_output::{
+    SkippedUpdateGroupData, UpdateEditAction, UpdateExecutionData, UpdateGroupData, UpdatePrAction,
+    UpdatePushAction, UpdateSkippedReason,
+};
 
 /// Replace the existing spr stack block with `new_block`, or append it if missing.
 ///
@@ -180,6 +184,35 @@ const MAX_BASE_MUTATION_CHARS: usize = 20_000;
 const MAX_BODY_UPDATES_PER_MUTATION: usize = 1;
 const MAX_BODY_MUTATION_CHARS: usize = 100_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushKind {
+    Skip,
+    FastForward,
+    Force,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedPush {
+    branch: String,
+    target_sha: String,
+    remote_exists: bool,
+    kind: PushKind,
+}
+
+impl UpdatePushAction {
+    fn from_planned_push(planned_push: &PlannedPush) -> Self {
+        if planned_push.kind == PushKind::Skip {
+            Self::Unchanged
+        } else if !planned_push.remote_exists {
+            Self::CreateBranch
+        } else if planned_push.kind == PushKind::FastForward {
+            Self::FastForwardBranch
+        } else {
+            Self::ForcePushBranch
+        }
+    }
+}
+
 fn mutation_len_for_inputs(update_inputs: &[String]) -> usize {
     let mut current_len = "mutation {".len() + 1;
     for (i, input) in update_inputs.iter().enumerate() {
@@ -255,14 +288,16 @@ fn run_update_chunk(dry: bool, update_inputs: &[String]) -> Result<()> {
 fn run_update_chunk_with_retry(
     dry: bool,
     update_inputs: &[String],
-    pb: &ProgressBar,
+    progress_bar: Option<&ProgressBar>,
 ) -> Result<()> {
     if update_inputs.is_empty() {
         return Ok(());
     }
     match run_update_chunk(dry, update_inputs) {
         Ok(()) => {
-            pb.inc(update_inputs.len() as u64);
+            if let Some(progress_bar) = progress_bar {
+                progress_bar.inc(update_inputs.len() as u64);
+            }
             Ok(())
         }
         Err(e) if is_resource_limit_error(&e) && update_inputs.len() > 1 => {
@@ -272,8 +307,8 @@ fn run_update_chunk_with_retry(
             );
             let mid = update_inputs.len() / 2;
             let (left, right) = update_inputs.split_at(mid);
-            run_update_chunk_with_retry(dry, left, pb)?;
-            run_update_chunk_with_retry(dry, right, pb)?;
+            run_update_chunk_with_retry(dry, left, progress_bar)?;
+            run_update_chunk_with_retry(dry, right, progress_bar)?;
             Ok(())
         }
         Err(e) => Err(e),
@@ -287,30 +322,40 @@ fn run_update_mutations(
     max_ops: usize,
     max_chars: usize,
     prefer_single: bool,
+    render_progress: bool,
 ) -> Result<()> {
     if update_inputs.is_empty() {
         return Ok(());
     }
     let total_updates = update_inputs.len();
-    let pb = ProgressBar::new(total_updates as u64);
-    pb.set_style(
-        ProgressStyle::with_template(&format!("{{spinner}} {} {{pos}}/{{len}} PR(s)…", label))
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    pb.enable_steady_tick(Duration::from_millis(120));
+    let progress_bar = if render_progress {
+        let progress_bar = ProgressBar::new(total_updates as u64);
+        progress_bar.set_style(
+            ProgressStyle::with_template(&format!("{{spinner}} {} {{pos}}/{{len}} PR(s)…", label))
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        progress_bar.enable_steady_tick(Duration::from_millis(120));
+        Some(progress_bar)
+    } else {
+        None
+    };
     let chunks = if prefer_single && mutation_len_for_inputs(&update_inputs) <= max_chars {
         vec![update_inputs]
     } else {
         chunk_update_inputs(&update_inputs, max_ops, max_chars)
     };
     for chunk in chunks {
-        if let Err(e) = run_update_chunk_with_retry(dry, &chunk, &pb) {
-            pb.finish_and_clear();
+        if let Err(e) = run_update_chunk_with_retry(dry, &chunk, progress_bar.as_ref()) {
+            if let Some(progress_bar) = &progress_bar {
+                progress_bar.finish_and_clear();
+            }
             return Err(e);
         }
     }
-    pb.finish_and_clear();
+    if let Some(progress_bar) = &progress_bar {
+        progress_bar.finish_and_clear();
+    }
     Ok(())
 }
 
@@ -321,16 +366,38 @@ fn ignored_boundary_warning(skipped_handles: &[String]) -> String {
     )
 }
 
-/// Bootstrap/refresh stack from already-parsed PR groups.
-///
-/// `groups` must be in local stack order (bottom-up); that order is still used for base
-/// chaining and local PR numbering even when display is reversed. `list_order` controls
-/// the order in which groups are visited for rebuild logging and list output. If a caller
-/// shuffles `groups`, PR base updates will target the wrong branches. Groups above the first
-/// ignored block are kept local-only because publishing them would drag the ignored commits
-/// into their GitHub diffs.
+fn skipped_group_data(skipped_handles: &[String]) -> Vec<SkippedUpdateGroupData> {
+    skipped_handles
+        .iter()
+        .map(|stable_handle| SkippedUpdateGroupData {
+            stable_handle: stable_handle.clone(),
+            reason: UpdateSkippedReason::IgnoredBoundary,
+        })
+        .collect()
+}
+
+fn stable_handle_text(tag: &str) -> String {
+    format!("pr:{tag}")
+}
+
+fn update_warnings(skipped_handles: &[String]) -> Vec<String> {
+    if skipped_handles.is_empty() {
+        Vec::new()
+    } else {
+        vec![ignored_boundary_warning(skipped_handles)]
+    }
+}
+
+fn empty_update_execution(skipped_handles: &[String]) -> UpdateExecutionData {
+    UpdateExecutionData {
+        warnings: update_warnings(skipped_handles),
+        skipped_groups: skipped_group_data(skipped_handles),
+        groups: Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn build_from_groups(
+fn build_from_groups_internal(
     base: &str,
     prefix: &str,
     skipped_handles: &[String],
@@ -342,7 +409,8 @@ pub fn build_from_groups(
     list_order: ListOrder,
     allow_branch_reuse: bool,
     branch_reuse_guard_days: u32,
-) -> Result<()> {
+    render_progress: bool,
+) -> Result<UpdateExecutionData> {
     if groups.is_empty() {
         if skipped_handles.is_empty() {
             info!("No groups discovered; nothing to do.");
@@ -350,10 +418,9 @@ pub fn build_from_groups(
             warn!("{}", ignored_boundary_warning(skipped_handles));
             info!("No pushable groups remain after applying the ignored-block rule.");
         }
-        return Ok(());
+        return Ok(empty_update_execution(skipped_handles));
     }
 
-    // Apply extent limits
     groups = apply_limit_groups(groups, limit)?;
     if !skipped_handles.is_empty() {
         warn!("{}", ignored_boundary_warning(skipped_handles));
@@ -364,25 +431,28 @@ pub fn build_from_groups(
         } else {
             info!("No pushable groups remain after applying the ignored-block rule.");
         }
-        return Ok(());
+        return Ok(empty_update_execution(skipped_handles));
     }
     let total_groups = groups.len();
     let branch_identities = group_branch_identities(&groups, prefix)?;
+    let desired_base_by_head: HashMap<String, String> =
+        common::build_head_base_chain(base, &groups, prefix)?
+            .into_iter()
+            .collect();
 
     info!("Preparing {} group(s)…", groups.len());
 
-    // Build bottom→top and collect PR refs for the visual update pass.
-    let mut just_created_numbers: Vec<u64> = vec![];
     let heads: Vec<String> = branch_identities
         .iter()
         .map(|identity| identity.exact.clone())
         .collect();
-    let pr_list = list_open_prs_for_heads(&heads)?;
     let mut prs_by_head: HashMap<CanonicalBranchConflictKey, u64> = HashMap::new();
     let mut current_base_by_number: HashMap<u64, String> = HashMap::new();
-    for p in pr_list {
-        prs_by_head.insert(head_key(&p.head), p.number);
-        current_base_by_number.insert(p.number, p.base);
+    if !no_pr {
+        for pr in list_open_prs_for_heads(&heads)? {
+            prs_by_head.insert(head_key(&pr.head), pr.number);
+            current_base_by_number.insert(pr.number, pr.base);
+        }
     }
     enforce_branch_reuse_guard(
         no_pr,
@@ -391,34 +461,16 @@ pub fn build_from_groups(
         &heads,
         &prs_by_head,
     )?;
-    // Allow force-push within the selected scope when branch diverged from remote
 
-    // Batch fetch remote SHAs for all target branches
     let mut branch_names = heads.clone();
-    // Ensure we also include the repository base branch for remote SHA comparisons
     let base_ref_for_remote = sanitize_gh_base_ref(base);
     if !branch_names.contains(&base_ref_for_remote) {
         branch_names.push(base_ref_for_remote);
     }
-    let remote_map = get_remote_branches_sha(&branch_names)?; // branch -> sha
-
-    // Stage push actions to batch git push calls
-    #[derive(Clone, Copy, PartialEq)]
-    enum PushKind {
-        Skip,
-        FastForward,
-        Force,
-    }
-    struct PlannedPush {
-        branch: String,
-        target_sha: String,
-        kind: PushKind,
-    }
-    let mut planned: Vec<PlannedPush> = vec![];
+    let remote_map = get_remote_branches_sha(&branch_names)?;
 
     let display_indices = list_order.display_indices(groups.len());
     for (display_idx, group_idx) in display_indices.iter().enumerate() {
-        let g = &groups[*group_idx];
         let branch = branch_identities[*group_idx].exact.clone();
         info!(
             "({}/{}) Rebuilding branch {}",
@@ -426,61 +478,59 @@ pub fn build_from_groups(
             total_groups,
             branch
         );
+    }
 
-        // Use local commit SHA as source of truth; avoid rewriting commits when possible
+    let mut planned: Vec<PlannedPush> = Vec::with_capacity(groups.len());
+    for (group, identity) in groups.iter().zip(branch_identities.iter()) {
+        let branch = identity.exact.clone();
         let remote_head = remote_map.get(&branch).cloned();
-        let target_sha = g
+        let target_sha = group
             .commits
             .last()
             .cloned()
-            .ok_or_else(|| anyhow!("Group {} has no commits", g.tag))?;
+            .ok_or_else(|| anyhow!("Group {} has no commits", group.tag))?;
         let kind = if remote_head.as_deref() == Some(target_sha.as_str()) {
             PushKind::Skip
         } else if let Some(ref remote_sha) = remote_head {
-            let ff_ok = git_is_ancestor(remote_sha, &target_sha)?;
-            if ff_ok {
+            if git_is_ancestor(remote_sha, &target_sha)? {
                 PushKind::FastForward
             } else {
                 PushKind::Force
             }
         } else {
-            // No remote exists; create the branch
             PushKind::FastForward
         };
         planned.push(PlannedPush {
-            branch: branch.clone(),
-            target_sha: target_sha.clone(),
+            branch,
+            target_sha,
+            remote_exists: remote_head.is_some(),
             kind,
         });
     }
 
-    // Before pushing: If not all PRs are already chained correctly, temporarily set all existing PRs to the repo base
     if !no_pr {
-        // Gather existing PR numbers and head branches in the local stack order (bottom→top)
         let mut numbers_full_pre: Vec<u64> = vec![];
         let mut head_by_number_pre: HashMap<u64, String> = HashMap::new();
         for identity in &branch_identities {
-            if let Some(n) = pr_number_for_head(&prs_by_head, &identity.exact) {
-                numbers_full_pre.push(n);
-                head_by_number_pre.insert(n, identity.exact.clone());
+            if let Some(number) = pr_number_for_head(&prs_by_head, &identity.exact) {
+                numbers_full_pre.push(number);
+                head_by_number_pre.insert(number, identity.exact.clone());
             }
         }
         if !numbers_full_pre.is_empty() {
-            // Compute desired chained base per existing PR using local groups
             let mut desired_base_by_number_pre: HashMap<u64, String> = HashMap::new();
-            for (head, want_base) in common::build_head_base_chain(base, &groups, prefix)? {
-                if let Some(num) = pr_number_for_head(&prs_by_head, &head) {
-                    desired_base_by_number_pre.insert(num, want_base.clone());
+            for (head, want_base) in &desired_base_by_head {
+                if let Some(number) = pr_number_for_head(&prs_by_head, head) {
+                    desired_base_by_number_pre.insert(number, want_base.clone());
                 }
             }
 
-            // Check if all existing PRs already point to correct base
             let mut all_correct = true;
-            for (num, want_base) in &desired_base_by_number_pre {
-                let want_base_s = sanitize_gh_base_ref(want_base);
+            for (number, want_base) in &desired_base_by_number_pre {
+                let want_base_ref = sanitize_gh_base_ref(want_base);
                 if current_base_by_number
-                    .get(num)
-                    .map(|b| sanitize_gh_base_ref(b) != want_base_s)
+                    .get(number)
+                    .map(|base_ref| sanitize_gh_base_ref(base_ref) != want_base_ref)
                     .unwrap_or(true)
                 {
                     all_correct = false;
@@ -489,22 +539,19 @@ pub fn build_from_groups(
             }
 
             if !all_correct {
-                // Temporarily set base of all existing PRs to the repo base (e.g., main)
                 let bodies_by_number_pre = fetch_pr_bodies_graphql(&numbers_full_pre)?;
                 let mut base_updates_pre: Vec<String> = Vec::new();
-                for (num, info) in bodies_by_number_pre.iter() {
-                    // Skip if already on base
+                for (number, info) in bodies_by_number_pre.iter() {
                     let base_target = sanitize_gh_base_ref(base);
                     if current_base_by_number
-                        .get(num)
-                        .map(|b| sanitize_gh_base_ref(b) == base_target)
+                        .get(number)
+                        .map(|base_ref| sanitize_gh_base_ref(base_ref) == base_target)
                         .unwrap_or(false)
                     {
                         continue;
                     }
-                    // Avoid GitHub error when base/head are identical on remote (no new commits)
                     let mut shas_equal = false;
-                    if let Some(head_branch) = head_by_number_pre.get(num) {
+                    if let Some(head_branch) = head_by_number_pre.get(number) {
                         if let (Some(head_sha), Some(base_sha)) =
                             (remote_map.get(head_branch), remote_map.get(&base_target))
                         {
@@ -530,191 +577,250 @@ pub fn build_from_groups(
                         MAX_BASE_UPDATES_PER_MUTATION,
                         MAX_BASE_MUTATION_CHARS,
                         true,
+                        render_progress,
                     )?;
                 }
             }
         }
     }
 
-    // Execute batched pushes: first fast-forward, then force-with-lease
     let ff_refspecs: Vec<String> = planned
         .iter()
-        .filter(|p| p.kind == PushKind::FastForward)
-        .map(|p| format!("{}:refs/heads/{}", p.target_sha, p.branch))
+        .filter(|planned_push| planned_push.kind == PushKind::FastForward)
+        .map(|planned_push| {
+            format!(
+                "{}:refs/heads/{}",
+                planned_push.target_sha, planned_push.branch
+            )
+        })
         .collect();
     if !ff_refspecs.is_empty() {
-        // Build argv: ["push", "origin", refspecs...]
         let mut argv: Vec<String> = vec!["push".into(), "origin".into()];
         argv.extend(ff_refspecs.clone());
-        let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::with_template("{spinner} Pushing {pos} branch(es) (-ff)…")
-                .unwrap()
-                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-        );
-        pb.set_position(ff_refspecs.len() as u64);
-        pb.enable_steady_tick(Duration::from_millis(120));
-        let res = git_rw(dry, &args);
-        pb.finish_and_clear();
-        res?;
+        let args: Vec<&str> = argv.iter().map(|item| item.as_str()).collect();
+        if render_progress {
+            let progress_bar = ProgressBar::new_spinner();
+            progress_bar.set_style(
+                ProgressStyle::with_template("{spinner} Pushing {pos} branch(es) (-ff)…")
+                    .unwrap()
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            progress_bar.set_position(ff_refspecs.len() as u64);
+            progress_bar.enable_steady_tick(Duration::from_millis(120));
+            let result = git_rw(dry, &args);
+            progress_bar.finish_and_clear();
+            result?;
+        } else {
+            git_rw(dry, &args)?;
+        }
     }
-    // Perform force-with-lease for diverged branches in scope
+
     let force_refspecs: Vec<String> = planned
         .iter()
-        .filter(|p| p.kind == PushKind::Force)
-        .map(|p| format!("{}:refs/heads/{}", p.target_sha, p.branch))
+        .filter(|planned_push| planned_push.kind == PushKind::Force)
+        .map(|planned_push| {
+            format!(
+                "{}:refs/heads/{}",
+                planned_push.target_sha, planned_push.branch
+            )
+        })
         .collect();
     if !force_refspecs.is_empty() {
-        // Use explicit lease SHAs so we don't depend on remote-tracking refs being up-to-date.
         let force_leases: Vec<String> = planned
             .iter()
-            .filter(|p| p.kind == PushKind::Force)
-            .filter_map(|p| {
-                remote_map
-                    .get(&p.branch)
-                    .map(|sha| format!("--force-with-lease=refs/heads/{}:{}", p.branch, sha))
+            .filter(|planned_push| planned_push.kind == PushKind::Force)
+            .filter_map(|planned_push| {
+                remote_map.get(&planned_push.branch).map(|sha| {
+                    format!(
+                        "--force-with-lease=refs/heads/{}:{}",
+                        planned_push.branch, sha
+                    )
+                })
             })
             .collect();
         let mut argv: Vec<String> = vec!["push".into(), "origin".into()];
         if force_leases.is_empty() {
-            // Fallback to default lease behavior if we couldn't resolve remote SHAs.
             argv.push("--force-with-lease".into());
         } else {
             argv.extend(force_leases);
         }
         argv.extend(force_refspecs.clone());
-        let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::with_template("{spinner} Pushing {pos} branch(es) (-force-with-lease)…")
+        let args: Vec<&str> = argv.iter().map(|item| item.as_str()).collect();
+        if render_progress {
+            let progress_bar = ProgressBar::new_spinner();
+            progress_bar.set_style(
+                ProgressStyle::with_template(
+                    "{spinner} Pushing {pos} branch(es) (-force-with-lease)…",
+                )
                 .unwrap()
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-        );
-        pb.set_position(force_refspecs.len() as u64);
-        pb.enable_steady_tick(Duration::from_millis(120));
-        let res = git_rw(dry, &args);
-        pb.finish_and_clear();
-        res?;
+            );
+            progress_bar.set_position(force_refspecs.len() as u64);
+            progress_bar.enable_steady_tick(Duration::from_millis(120));
+            let result = git_rw(dry, &args);
+            progress_bar.finish_and_clear();
+            result?;
+        } else {
+            git_rw(dry, &args)?;
+        }
     }
 
-    // After pushes, (create or) update PRs
+    let mut pr_numbers_by_group: Vec<Option<u64>> = vec![None; groups.len()];
+    let mut pr_actions_by_group: Vec<UpdatePrAction> =
+        vec![UpdatePrAction::NotRequested; groups.len()];
+    let mut base_actions_by_group: Vec<UpdateEditAction> = vec![
+        if no_pr {
+            UpdateEditAction::NotRequested
+        } else {
+            UpdateEditAction::Unchanged
+        };
+        groups.len()
+    ];
+    let mut description_actions_by_group: Vec<UpdateEditAction> = vec![
+        if no_pr {
+            UpdateEditAction::NotRequested
+        } else {
+            UpdateEditAction::Unchanged
+        };
+        groups.len()
+    ];
+    let mut created_without_number: HashSet<usize> = HashSet::new();
     let mut parent_branch = base.to_string();
-    for (g, identity) in groups.iter().zip(branch_identities.iter()) {
+    for (group_idx, (group, identity)) in groups.iter().zip(branch_identities.iter()).enumerate() {
         let branch = identity.exact.clone();
         if !no_pr {
             let was_known = prs_by_head.contains_key(&identity.conflict_key);
-            let num = upsert_pr_cached(
-                &branch,
-                &sanitize_gh_base_ref(&parent_branch),
-                &g.pr_title()?,
-                &g.pr_body()?,
-                dry,
-                &mut prs_by_head,
-            )?;
-            if !was_known {
-                just_created_numbers.push(num);
+            if dry && !was_known {
+                pr_actions_by_group[group_idx] = UpdatePrAction::Created;
+                created_without_number.insert(group_idx);
+            } else {
+                let number = upsert_pr_cached(
+                    &branch,
+                    &sanitize_gh_base_ref(&parent_branch),
+                    &group.pr_title()?,
+                    &group.pr_body()?,
+                    dry,
+                    &mut prs_by_head,
+                )?;
+                pr_numbers_by_group[group_idx] = Some(number);
+                pr_actions_by_group[group_idx] = if was_known {
+                    UpdatePrAction::Existing
+                } else {
+                    current_base_by_number.insert(number, sanitize_gh_base_ref(&parent_branch));
+                    UpdatePrAction::Created
+                };
             }
         }
         parent_branch = branch;
     }
 
     if !no_pr {
-        // Derive full stack order purely from local groups (bottom→top)
-        let mut numbers_full: Vec<u64> = vec![];
-        for identity in &branch_identities {
-            if let Some(n) = pr_number_for_head(&prs_by_head, &identity.exact) {
-                numbers_full.push(n);
-            }
-        }
-        // Build desired stack blocks and base refs from local commits
+        let numbers_full: Vec<u64> = pr_numbers_by_group.iter().flatten().copied().collect();
         let mut desired_stack_by_number: HashMap<u64, String> = HashMap::new();
         let mut base_body_by_number: HashMap<u64, String> = HashMap::new();
         let mut desired_base_by_number: HashMap<u64, String> = HashMap::new();
-        let chain = common::build_head_base_chain(base, &groups, prefix)?;
         let numbers_rev: Vec<u64> = numbers_full.iter().cloned().rev().collect();
-        for (head_branch, want_base_ref) in chain {
-            if let Some(num) = pr_number_for_head(&prs_by_head, &head_branch) {
-                desired_base_by_number.insert(num, want_base_ref.clone());
-                // Stack visual (optional rewrite)
-                if let Some((g, _identity)) = groups
-                    .iter()
-                    .zip(branch_identities.iter())
-                    .find(|(_group, identity)| identity.exact == head_branch)
-                {
-                    let base = g.pr_body_base()?;
-                    base_body_by_number.insert(num, base);
-                    let mut lines = String::new();
-                    for n in &numbers_rev {
-                        let marker = if *n == num {
-                            "➡"
-                        } else {
-                            crate::format::EM_SPACE
-                        };
-                        lines.push_str(&format!("- {} #{}\n", marker, n));
-                    }
-                    let stack_block = format!(
-                        "<!-- spr-stack:start -->\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n<!-- spr-stack:end -->",
-                        lines.trim_end(),
-                    );
-                    desired_stack_by_number.insert(num, stack_block);
+        for (group_idx, identity) in branch_identities.iter().enumerate() {
+            if let Some(number) = pr_numbers_by_group[group_idx] {
+                let want_base_ref = desired_base_by_head
+                    .get(&identity.exact)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Missing desired base ref for {}", identity.exact))?;
+                desired_base_by_number.insert(number, want_base_ref);
+                let group = &groups[group_idx];
+                let base_body = group.pr_body_base()?;
+                base_body_by_number.insert(number, base_body);
+                let mut lines = String::new();
+                for pr_number in &numbers_rev {
+                    let marker = if *pr_number == number {
+                        "➡"
+                    } else {
+                        crate::format::EM_SPACE
+                    };
+                    lines.push_str(&format!("- {} #{}\n", marker, pr_number));
                 }
+                let stack_block = format!(
+                    "<!-- spr-stack:start -->\n**Stack**:\n{}\n\n⚠️ *Part of a stack created by [spr-multicommit](https://github.com/mattskl-openai/spr-multicommit). Do not merge manually using the UI - doing so may have unexpected results.*\n<!-- spr-stack:end -->",
+                    lines.trim_end(),
+                );
+                desired_stack_by_number.insert(number, stack_block);
             }
         }
 
-        // Fetch PR ids/bodies for union of all PRs we may rewrite bodies for
-        let mut fetch_set: std::collections::HashSet<u64> = numbers_full.iter().cloned().collect();
-        for &n in desired_stack_by_number.keys() {
-            fetch_set.insert(n);
+        let mut fetch_set: HashSet<u64> = numbers_full.iter().cloned().collect();
+        for &number in desired_stack_by_number.keys() {
+            fetch_set.insert(number);
         }
-        for &n in desired_base_by_number.keys() {
-            fetch_set.insert(n);
+        for &number in desired_base_by_number.keys() {
+            fetch_set.insert(number);
         }
         let fetch_list: Vec<u64> = fetch_set.into_iter().collect();
-        let bodies_by_number = fetch_pr_bodies_graphql(&fetch_list)?;
+        let bodies_by_number = if fetch_list.is_empty() {
+            HashMap::new()
+        } else {
+            fetch_pr_bodies_graphql(&fetch_list)?
+        };
+        let group_index_by_number: HashMap<u64, usize> = pr_numbers_by_group
+            .iter()
+            .enumerate()
+            .filter_map(|(group_idx, maybe_number)| maybe_number.map(|number| (number, group_idx)))
+            .collect();
         let mut body_updates: Vec<String> = Vec::new();
         let mut base_updates: Vec<String> = Vec::new();
-        // Bodies: always update (full or stack-only based on config)
-        for (&num, stack_block) in &desired_stack_by_number {
-            if let Some(info) = bodies_by_number.get(&num) {
-                match pr_description_mode {
-                    PrDescriptionMode::Overwrite => {
-                        if let Some(base) = base_body_by_number.get(&num) {
-                            let body = if base.trim().is_empty() {
+        if dry && !created_without_number.is_empty() {
+            for group_idx in group_index_by_number.values().copied() {
+                description_actions_by_group[group_idx] = UpdateEditAction::Updated;
+            }
+        } else {
+            for (&number, stack_block) in &desired_stack_by_number {
+                if let Some(info) = bodies_by_number.get(&number) {
+                    let desired_body = if pr_description_mode == PrDescriptionMode::Overwrite {
+                        if let Some(base_body) = base_body_by_number.get(&number) {
+                            if base_body.trim().is_empty() {
                                 stack_block.clone()
                             } else {
-                                format!("{}\n\n{}", base, stack_block)
-                            };
-                            let fields = [
-                                format!("pullRequestId:\"{}\"", info.id),
-                                format!("body:\"{}\"", graphql_escape(&body)),
-                            ];
-                            body_updates.push(fields.join(", "));
+                                format!("{}\n\n{}", base_body, stack_block)
+                            }
+                        } else {
+                            continue;
                         }
-                    }
-                    PrDescriptionMode::StackOnly => {
-                        let body = update_stack_block(&info.body, stack_block);
+                    } else {
+                        update_stack_block(&info.body, stack_block)
+                    };
+                    if desired_body != info.body {
+                        if let Some(&group_idx) = group_index_by_number.get(&number) {
+                            description_actions_by_group[group_idx] = UpdateEditAction::Updated;
+                        }
                         let fields = [
                             format!("pullRequestId:\"{}\"", info.id),
-                            format!("body:\"{}\"", graphql_escape(&body)),
+                            format!("body:\"{}\"", graphql_escape(&desired_body)),
                         ];
                         body_updates.push(fields.join(", "));
                     }
                 }
             }
         }
-        // Bases: set post-push to ensure final linkage
-        for (&num, want_base) in &desired_base_by_number {
-            if let Some(info) = bodies_by_number.get(&num) {
-                let fields = [
-                    format!("pullRequestId:\"{}\"", info.id),
-                    format!(
-                        "baseRefName:\"{}\"",
-                        graphql_escape(&sanitize_gh_base_ref(want_base))
-                    ),
-                ];
-                base_updates.push(fields.join(", "));
+        for (&number, want_base) in &desired_base_by_number {
+            if let Some(info) = bodies_by_number.get(&number) {
+                let desired_base_ref = sanitize_gh_base_ref(want_base);
+                let needs_update = current_base_by_number
+                    .get(&number)
+                    .map(|base_ref| sanitize_gh_base_ref(base_ref) != desired_base_ref.as_str())
+                    .unwrap_or(true);
+                if needs_update {
+                    if let Some(&group_idx) = group_index_by_number.get(&number) {
+                        base_actions_by_group[group_idx] = UpdateEditAction::Updated;
+                    }
+                    let fields = [
+                        format!("pullRequestId:\"{}\"", info.id),
+                        format!("baseRefName:\"{}\"", graphql_escape(&desired_base_ref)),
+                    ];
+                    base_updates.push(fields.join(", "));
+                }
             }
+        }
+        for group_idx in created_without_number {
+            description_actions_by_group[group_idx] = UpdateEditAction::Updated;
         }
         if !base_updates.is_empty() || !body_updates.is_empty() {
             if !base_updates.is_empty() {
@@ -725,6 +831,7 @@ pub fn build_from_groups(
                     MAX_BASE_UPDATES_PER_MUTATION,
                     MAX_BASE_MUTATION_CHARS,
                     true,
+                    render_progress,
                 )?;
             }
             if !body_updates.is_empty() {
@@ -735,6 +842,7 @@ pub fn build_from_groups(
                     MAX_BODY_UPDATES_PER_MUTATION,
                     MAX_BODY_MUTATION_CHARS,
                     false,
+                    render_progress,
                 )?;
             }
         } else {
@@ -742,37 +850,127 @@ pub fn build_from_groups(
         }
     }
 
-    // Print full stack PR list in bottom→top order: "- <url> - <title>"
     if !no_pr {
         let mut ordered: Vec<(u64, String)> = vec![];
         let display_indices = list_order.display_indices(groups.len());
         for group_idx in display_indices {
-            let g = &groups[group_idx];
+            let group = &groups[group_idx];
             let head_branch = &branch_identities[group_idx].exact;
-            if let Some(n) = pr_number_for_head(&prs_by_head, head_branch) {
-                // Use local group title (source of truth for desired title)
-                let title = g.pr_title().unwrap_or_else(|_| String::new());
-                ordered.push((n, title));
+            if let Some(number) = pr_number_for_head(&prs_by_head, head_branch) {
+                let title = group.pr_title().unwrap_or_else(|_| String::new());
+                ordered.push((number, title));
             }
         }
         if !ordered.is_empty() {
             if let Ok((owner, name)) = get_repo_owner_name() {
                 info!("PRs:");
-                for (n, title) in ordered {
-                    let url = format!("https://github.com/{}/{}/pull/{}", owner, name, n);
+                for (number, title) in ordered {
+                    let url = format!("https://github.com/{}/{}/pull/{}", owner, name, number);
                     info!("  {} - {}", url, title);
                 }
             }
         }
     }
 
+    let remote_url_prefix = get_repo_owner_name()
+        .ok()
+        .map(|(owner, name)| format!("https://github.com/{owner}/{name}/pull/"));
+    let groups = groups
+        .iter()
+        .zip(branch_identities.iter())
+        .zip(planned.iter())
+        .enumerate()
+        .map(
+            |(group_idx, ((group, identity), planned_push))| UpdateGroupData {
+                local_pr_number: group_idx + 1,
+                stable_handle: stable_handle_text(&group.tag),
+                head_branch: identity.exact.clone(),
+                base_ref: desired_base_by_head
+                    .get(&identity.exact)
+                    .cloned()
+                    .unwrap_or_else(|| base.to_string()),
+                title: group.pr_title().unwrap_or_else(|_| String::new()),
+                target_sha: planned_push.target_sha.clone(),
+                push_action: UpdatePushAction::from_planned_push(planned_push),
+                pr_action: pr_actions_by_group[group_idx],
+                base_ref_action: base_actions_by_group[group_idx],
+                description_action: description_actions_by_group[group_idx],
+                remote_pr_number: pr_numbers_by_group[group_idx],
+                remote_pr_url: match (remote_url_prefix.as_ref(), pr_numbers_by_group[group_idx]) {
+                    (Some(prefix), Some(number)) => Some(format!("{prefix}{number}")),
+                    _ => None,
+                },
+            },
+        )
+        .collect();
+    Ok(UpdateExecutionData {
+        warnings: update_warnings(skipped_handles),
+        skipped_groups: skipped_group_data(skipped_handles),
+        groups,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_from_groups_with_summary(
+    base: &str,
+    prefix: &str,
+    skipped_handles: &[String],
+    no_pr: bool,
+    dry: bool,
+    pr_description_mode: PrDescriptionMode,
+    limit: Option<Limit>,
+    groups: Vec<Group>,
+    list_order: ListOrder,
+    allow_branch_reuse: bool,
+    branch_reuse_guard_days: u32,
+) -> Result<UpdateExecutionData> {
+    build_from_groups_internal(
+        base,
+        prefix,
+        skipped_handles,
+        no_pr,
+        dry,
+        pr_description_mode,
+        limit,
+        groups,
+        list_order,
+        allow_branch_reuse,
+        branch_reuse_guard_days,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_from_groups(
+    base: &str,
+    prefix: &str,
+    skipped_handles: &[String],
+    no_pr: bool,
+    dry: bool,
+    pr_description_mode: PrDescriptionMode,
+    limit: Option<Limit>,
+    groups: Vec<Group>,
+    list_order: ListOrder,
+    allow_branch_reuse: bool,
+    branch_reuse_guard_days: u32,
+) -> Result<()> {
+    build_from_groups_internal(
+        base,
+        prefix,
+        skipped_handles,
+        no_pr,
+        dry,
+        pr_description_mode,
+        limit,
+        groups,
+        list_order,
+        allow_branch_reuse,
+        branch_reuse_guard_days,
+        true,
+    )?;
     Ok(())
 }
 
-/// Bootstrap/refresh stack from pr:<tag> markers on `from` vs merge-base(base, from).
-///
-/// This derives groups in local stack order and forwards `list_order` so rebuild progress
-/// and printed lists follow the same display order as `spr list`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_from_tags(
     base: &str,

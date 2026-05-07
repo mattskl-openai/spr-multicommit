@@ -75,6 +75,10 @@ pub enum Cmd {
         #[arg(long)]
         allow_branch_reuse: bool,
 
+        /// Emit machine-readable JSON to stdout and keep stderr quiet unless the underlying tools leak output unexpectedly
+        #[arg(long)]
+        json: bool,
+
         /// Limit how much to update (optional sub-mode)
         #[command(subcommand)]
         extent: Option<Extent>,
@@ -232,7 +236,8 @@ impl Cmd {
             Self::List {
                 what: ListWhat::Pr { json, .. } | ListWhat::Commit { json, .. },
             } => *json,
-            Self::Update { .. } | Self::Prep {} | Self::RelinkPrs {} | Self::Cleanup {} => false,
+            Self::Update { json, .. } => *json,
+            Self::Prep {} | Self::RelinkPrs {} | Self::Cleanup {} => false,
         }
     }
 }
@@ -358,6 +363,41 @@ mod tests {
     }
 
     #[test]
+    fn update_json_flag_enables_json_mode() {
+        let cli = Cli::try_parse_from(["spr", "update", "--json"]).unwrap();
+
+        assert!(cli.cmd.json_mode());
+    }
+
+    #[test]
+    fn update_json_flag_parses_with_extent_subcommand() {
+        let cli = Cli::try_parse_from(["spr", "update", "--json", "pr", "1"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Update {
+                json: true,
+                extent: Some(super::Extent::Pr { legacy_n, .. }),
+                ..
+            } => assert_eq!(legacy_n, Some(1)),
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn list_pr_json_flag_parses_after_leaf_subcommand() {
+        let cli = Cli::try_parse_from(["spr", "list", "pr", "--json"]).unwrap();
+
+        match cli.cmd {
+            Cmd::List {
+                what: super::ListWhat::Pr { json },
+            } => {
+                assert!(json);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
     fn list_command_parses_json_flag() {
         let cli = Cli::try_parse_from(["spr", "list", "commit", "--json"]).unwrap();
 
@@ -381,6 +421,16 @@ mod tests {
             }
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn update_help_includes_json_flag() {
+        let mut cli = Cli::command();
+        let update = cli.find_subcommand_mut("update").unwrap();
+
+        assert!(update
+            .get_arguments()
+            .any(|argument| argument.get_long() == Some("json")));
     }
 
     #[test]

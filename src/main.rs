@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{error::ErrorKind, Parser};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::Path;
 
 mod branch_names;
@@ -10,6 +10,7 @@ mod config;
 mod format;
 mod git;
 mod github;
+mod json_command;
 mod limit;
 mod machine_output;
 mod parsing;
@@ -19,6 +20,7 @@ mod selectors;
 mod stack_metadata;
 #[cfg(test)]
 mod test_support;
+mod update_output;
 
 fn resolve_update_pr_limit(
     groups: &[crate::parsing::Group],
@@ -66,8 +68,8 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
             .as_deref()
             .map(crate::commands::looks_like_pr_url)
             .unwrap_or(false),
-        crate::cli::Cmd::Update { .. }
-        | crate::cli::Cmd::List { .. }
+        crate::cli::Cmd::Update { no_pr, .. } => !*no_pr,
+        crate::cli::Cmd::List { .. }
         | crate::cli::Cmd::Status { .. }
         | crate::cli::Cmd::Prep {}
         | crate::cli::Cmd::Land { .. }
@@ -89,6 +91,7 @@ enum CommandOutput {
     Machine(crate::machine_output::MachineOutput),
     ReadOnly(crate::read_only_output::ReadOnlyOutput),
     ResolveStack(crate::commands::ResolveStackOutput),
+    Update(crate::update_output::UpdateOutput),
 }
 
 fn init_tools(needs_gh: bool) -> Result<()> {
@@ -286,6 +289,7 @@ fn run_cli(cli: crate::cli::Cli, output_mode: OutputMode) -> Result<CommandOutpu
             assume_existing_prs,
             pr_description_mode: pr_description_mode_override,
             allow_branch_reuse,
+            json: _,
             extent,
         } => {
             set_dry_run_env(cli.dry_run, assume_existing_prs);
@@ -307,39 +311,89 @@ fn run_cli(cli: crate::cli::Cli, output_mode: OutputMode) -> Result<CommandOutpu
                 let (groups, skipped_handles) =
                     crate::parsing::split_groups_for_update(&leading_ignored, all_groups);
                 crate::branch_names::group_branch_identities(&groups, &prefix)?;
-                let limit = if let Some(extent) = extent {
+                let (limit, resolved_extent) = if let Some(extent) = extent {
                     match extent {
                         crate::cli::Extent::Pr { to, n, legacy_n } => {
-                            Some(resolve_update_pr_limit(&groups, to, n, legacy_n)?)
+                            let limit = resolve_update_pr_limit(&groups, to, n, legacy_n)?;
+                            let count = match limit {
+                                crate::limit::Limit::ByPr(count) => count,
+                                crate::limit::Limit::ByCommits(_) => unreachable!(),
+                            };
+                            (
+                                Some(limit),
+                                crate::update_output::ResolvedUpdateLimit::ByPr { count },
+                            )
                         }
-                        crate::cli::Extent::Commits { n } => {
-                            Some(crate::limit::Limit::ByCommits(n))
-                        }
+                        crate::cli::Extent::Commits { n } => (
+                            Some(crate::limit::Limit::ByCommits(n)),
+                            crate::update_output::ResolvedUpdateLimit::ByCommits { count: n },
+                        ),
                     }
                 } else {
-                    None
+                    (None, crate::update_output::ResolvedUpdateLimit::All)
                 };
-                crate::commands::build_from_groups(
-                    &base,
-                    &prefix,
-                    &skipped_handles,
-                    no_pr,
-                    cli.dry_run,
-                    pr_description_mode,
-                    limit,
-                    groups,
-                    list_order,
-                    allow_branch_reuse,
-                    branch_reuse_guard_days,
-                )?;
-                if !cli.dry_run {
-                    crate::stack_metadata::refresh_metadata_for_current_checkout(
-                        &metadata_refresh_context.base,
-                        &metadata_refresh_context.prefix,
-                        &metadata_refresh_context.ignore_tag,
+                if output_mode == OutputMode::Json {
+                    let execution = crate::commands::build_from_groups_with_summary(
+                        &base,
+                        &prefix,
+                        &skipped_handles,
+                        no_pr,
+                        cli.dry_run,
+                        pr_description_mode,
+                        limit,
+                        groups,
+                        list_order,
+                        allow_branch_reuse,
+                        branch_reuse_guard_days,
                     )?;
+                    let summary = crate::update_output::UpdateSummaryData::from_execution(
+                        crate::update_output::UpdateRepoContext {
+                            base: base.clone(),
+                            from,
+                            prefix: prefix.clone(),
+                            ignore_tag: ignore_tag.clone(),
+                        },
+                        crate::update_output::UpdateOptions {
+                            dry_run: cli.dry_run,
+                            no_pr,
+                            pr_description_mode,
+                        },
+                        resolved_extent,
+                        execution,
+                    );
+                    if !cli.dry_run {
+                        crate::stack_metadata::refresh_metadata_for_current_checkout(
+                            &metadata_refresh_context.base,
+                            &metadata_refresh_context.prefix,
+                            &metadata_refresh_context.ignore_tag,
+                        )?;
+                    }
+                    Ok(CommandOutput::Update(
+                        crate::update_output::UpdateOutput::summary(summary),
+                    ))
+                } else {
+                    crate::commands::build_from_groups(
+                        &base,
+                        &prefix,
+                        &skipped_handles,
+                        no_pr,
+                        cli.dry_run,
+                        pr_description_mode,
+                        limit,
+                        groups,
+                        list_order,
+                        allow_branch_reuse,
+                        branch_reuse_guard_days,
+                    )?;
+                    if !cli.dry_run {
+                        crate::stack_metadata::refresh_metadata_for_current_checkout(
+                            &metadata_refresh_context.base,
+                            &metadata_refresh_context.prefix,
+                            &metadata_refresh_context.ignore_tag,
+                        )?;
+                    }
+                    Ok(CommandOutput::None)
                 }
-                Ok(CommandOutput::None)
             }
         }
         crate::cli::Cmd::Restack {
@@ -621,9 +675,7 @@ fn init_logging(verbose: bool, output_mode: OutputMode) {
 }
 
 fn raw_args_request_json(args: &[OsString]) -> bool {
-    args.iter()
-        .skip(1)
-        .any(|arg| arg.as_os_str() == OsStr::new("--json"))
+    crate::json_command::raw_args_request_json(args)
 }
 
 fn read_only_command_for_cli(
@@ -679,39 +731,7 @@ fn read_only_command_for_raw_args(
 }
 
 fn machine_command_for_raw_args(args: &[OsString]) -> crate::machine_output::MachineCommand {
-    let mut skip_value = false;
-    for arg in args.iter().skip(1) {
-        if skip_value {
-            skip_value = false;
-        } else if let Some(arg) = arg.to_str() {
-            if arg == "--cd"
-                || arg == "--base"
-                || arg == "--prefix"
-                || arg == "--until"
-                || arg == "--exact"
-                || arg == "-b"
-            {
-                skip_value = true;
-            } else if arg == "restack" {
-                return crate::machine_output::MachineCommand::Restack;
-            } else if arg == "absorb" {
-                return crate::machine_output::MachineCommand::Absorb;
-            } else if arg == "move" || arg == "mv" {
-                return crate::machine_output::MachineCommand::Move;
-            } else if arg == "fix-pr" || arg == "fix" {
-                return crate::machine_output::MachineCommand::FixPr;
-            } else if arg == "resolve-stack" {
-                return crate::machine_output::MachineCommand::ResolveStack;
-            } else if arg == "resume" {
-                return crate::machine_output::MachineCommand::Resume;
-            } else if arg == "land" {
-                return crate::machine_output::MachineCommand::Land;
-            } else if !arg.starts_with('-') {
-                return crate::machine_output::MachineCommand::Cli;
-            }
-        }
-    }
-    crate::machine_output::MachineCommand::Cli
+    crate::json_command::command_for_raw_args(args)
 }
 
 #[derive(Debug)]
@@ -792,6 +812,12 @@ fn main() {
                     println!("{}", serde_json::to_string(&output).unwrap());
                 }
             }
+            CommandOutput::Update(output) => {
+                if output_mode == OutputMode::Json {
+                    println!("{}", serde_json::to_string(&output).unwrap());
+                    std::process::exit(output.exit_code());
+                }
+            }
             CommandOutput::ResolveStack(output) => {
                 if output_mode == OutputMode::Json {
                     println!("{}", serde_json::to_string(&output).unwrap());
@@ -832,12 +858,12 @@ fn machine_command_for_cli(cmd: &crate::cli::Cmd) -> crate::machine_output::Mach
         crate::cli::Cmd::Land { .. } => crate::machine_output::MachineCommand::Land,
         crate::cli::Cmd::FixPr { .. } => crate::machine_output::MachineCommand::FixPr,
         crate::cli::Cmd::Move { .. } => crate::machine_output::MachineCommand::Move,
-        crate::cli::Cmd::Update { .. }
-        | crate::cli::Cmd::Prep {}
-        | crate::cli::Cmd::List { .. }
-        | crate::cli::Cmd::Status { .. }
-        | crate::cli::Cmd::RelinkPrs {}
-        | crate::cli::Cmd::Cleanup {} => crate::machine_output::MachineCommand::Restack,
+        crate::cli::Cmd::Update { .. } => crate::machine_output::MachineCommand::Update,
+        crate::cli::Cmd::Prep {} => crate::machine_output::MachineCommand::Prep,
+        crate::cli::Cmd::List { .. } => crate::machine_output::MachineCommand::List,
+        crate::cli::Cmd::Status { .. } => crate::machine_output::MachineCommand::Status,
+        crate::cli::Cmd::RelinkPrs {} => crate::machine_output::MachineCommand::RelinkPrs,
+        crate::cli::Cmd::Cleanup {} => crate::machine_output::MachineCommand::Cleanup,
     }
 }
 
@@ -856,7 +882,9 @@ mod tests {
     use crate::selectors::{GroupSelector, StableHandle};
     use crate::test_support::{
         commit_file, git, init_case_conflicting_stack_repo, init_repo as init_stack_repo, lock_cwd,
+        write_file, DirGuard,
     };
+    use crate::update_output::{ResolvedUpdateLimit, UpdatePayload};
     use clap::Parser;
     use std::env;
     use std::ffi::OsString;
@@ -1001,6 +1029,34 @@ mod tests {
     }
 
     #[test]
+    fn update_without_no_pr_requires_github_cli() {
+        assert!(command_requires_gh(&crate::cli::Cmd::Update {
+            from: "HEAD".to_string(),
+            no_pr: false,
+            restack: false,
+            assume_existing_prs: false,
+            pr_description_mode: None,
+            allow_branch_reuse: false,
+            json: false,
+            extent: None,
+        }));
+    }
+
+    #[test]
+    fn update_no_pr_stays_git_only_for_tool_checks() {
+        assert!(!command_requires_gh(&crate::cli::Cmd::Update {
+            from: "HEAD".to_string(),
+            no_pr: true,
+            restack: false,
+            assume_existing_prs: false,
+            pr_description_mode: None,
+            allow_branch_reuse: false,
+            json: true,
+            extent: None,
+        }));
+    }
+
+    #[test]
     fn resolve_stack_without_pr_url_stays_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::ResolveStack {
             target: Some("dank-spr/alpha".to_string()),
@@ -1026,6 +1082,52 @@ mod tests {
             .unwrap();
         assert!(status.success(), "git init failed");
         dir
+    }
+
+    fn init_update_stack_repo() -> TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        git(&repo, ["init", "-b", "main"].as_slice());
+        git(
+            &repo,
+            ["config", "user.email", "spr@example.com"].as_slice(),
+        );
+        git(&repo, ["config", "user.name", "SPR Tests"].as_slice());
+        write_file(&repo, "README.md", "init\n");
+        git(&repo, ["add", "README.md"].as_slice());
+        git(&repo, ["commit", "-m", "init"].as_slice());
+
+        let origin = dir.path().join("origin.git");
+        git(
+            &repo,
+            ["init", "--bare", origin.to_str().unwrap()].as_slice(),
+        );
+        git(
+            &repo,
+            ["remote", "add", "origin", origin.to_str().unwrap()].as_slice(),
+        );
+        git(&repo, ["push", "-u", "origin", "main"].as_slice());
+
+        git(&repo, ["checkout", "-b", "stack"].as_slice());
+        commit_file(
+            &repo,
+            "alpha.txt",
+            "alpha-1\n",
+            "feat: alpha start pr:alpha",
+        );
+        commit_file(
+            &repo,
+            "alpha.txt",
+            "alpha-1\nalpha-2\n",
+            "feat: alpha follow-up",
+        );
+        commit_file(&repo, "beta.txt", "beta-1\n", "feat: beta start pr:beta");
+        dir
+    }
+
+    fn install_failing_gh_wrapper() -> (TempDir, EnvVarGuard) {
+        install_gh_wrapper("#!/bin/sh\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n")
     }
 
     #[test]
@@ -1068,6 +1170,40 @@ mod tests {
             machine_command_for_raw_args(&args),
             MachineCommand::ResolveStack
         );
+    }
+
+    #[test]
+    fn machine_command_for_raw_args_detects_status() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("status"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(machine_command_for_raw_args(&args), MachineCommand::Status);
+    }
+
+    #[test]
+    fn machine_command_for_raw_args_detects_list_alias() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("ls"),
+            OsString::from("pr"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(machine_command_for_raw_args(&args), MachineCommand::List);
+    }
+
+    #[test]
+    fn machine_command_for_raw_args_detects_update() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("update"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(machine_command_for_raw_args(&args), MachineCommand::Update);
     }
 
     #[test]
@@ -1151,6 +1287,30 @@ mod tests {
                     other => panic!("unexpected read-only payload: {:?}", other),
                 }
             }
+            other => panic!("unexpected parse-failure output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_failure_with_update_json_uses_update_command_identity() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("update"),
+            OsString::from("--json"),
+            OsString::from("pr"),
+            OsString::from("--bogus"),
+        ];
+        let err = crate::cli::Cli::try_parse_from(args.clone()).expect_err("expected parse error");
+        let output =
+            parse_failure_as_json_output(&args, &err).expect("json parse failure should serialize");
+
+        match output {
+            JsonParseFailureOutput::Machine(output) => match output.payload {
+                MachinePayload::Error { command, .. } => {
+                    assert_eq!(command, MachineCommand::Update);
+                }
+                other => panic!("unexpected parse-failure payload: {:?}", other),
+            },
             other => panic!("unexpected parse-failure output: {:?}", other),
         }
     }
@@ -1629,6 +1789,183 @@ mod tests {
                     assert!(gh_log.is_empty());
                 }
                 other => panic!("unexpected read-only payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_json_no_pr_summary_stays_git_only_and_reports_full_extent() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let (_wrapper_dir, _path_guard) = install_failing_gh_wrapper();
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--dry-run",
+            "update",
+            "--json",
+            "--no-pr",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputMode::Json).unwrap();
+
+        match output {
+            CommandOutput::Update(output) => match output.payload {
+                UpdatePayload::Summary { data } => {
+                    assert_eq!(data.repo.base, "main");
+                    assert_eq!(data.repo.from, "HEAD");
+                    assert_eq!(data.repo.prefix, "dank-spr/");
+                    assert_eq!(data.repo.ignore_tag, "ignore");
+                    assert!(data.options.dry_run);
+                    assert!(data.options.no_pr);
+                    assert_eq!(data.extent, ResolvedUpdateLimit::All);
+                    assert!(data.warnings.is_empty());
+                    assert!(data.skipped_groups.is_empty());
+                    assert_eq!(data.groups.len(), 2);
+                    assert_eq!(data.groups[0].stable_handle, "pr:alpha");
+                    assert_eq!(
+                        data.groups[0].push_action,
+                        crate::update_output::UpdatePushAction::CreateBranch
+                    );
+                    assert_eq!(
+                        data.groups[0].pr_action,
+                        crate::update_output::UpdatePrAction::NotRequested
+                    );
+                    assert_eq!(
+                        data.groups[0].description_action,
+                        crate::update_output::UpdateEditAction::NotRequested
+                    );
+                    assert_eq!(data.groups[1].stable_handle, "pr:beta");
+                    assert_eq!(data.groups[1].base_ref, "dank-spr/alpha");
+                }
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_json_pr_selector_reports_resolved_pr_extent() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let (_wrapper_dir, _path_guard) = install_failing_gh_wrapper();
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--dry-run",
+            "update",
+            "--json",
+            "--no-pr",
+            "pr",
+            "--to",
+            "beta",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputMode::Json).unwrap();
+
+        match output {
+            CommandOutput::Update(output) => match output.payload {
+                UpdatePayload::Summary { data } => {
+                    assert_eq!(data.extent, ResolvedUpdateLimit::ByPr { count: 2 });
+                    assert_eq!(data.groups.len(), 2);
+                }
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_json_legacy_pr_limit_reports_resolved_pr_extent() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let (_wrapper_dir, _path_guard) = install_failing_gh_wrapper();
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--dry-run",
+            "update",
+            "--json",
+            "--no-pr",
+            "pr",
+            "1",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputMode::Json).unwrap();
+
+        match output {
+            CommandOutput::Update(output) => match output.payload {
+                UpdatePayload::Summary { data } => {
+                    assert_eq!(data.extent, ResolvedUpdateLimit::ByPr { count: 1 });
+                    assert_eq!(data.groups.len(), 1);
+                    assert_eq!(data.groups[0].stable_handle, "pr:alpha");
+                }
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_json_commit_extent_reports_resolved_commit_limit() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let (_wrapper_dir, _path_guard) = install_failing_gh_wrapper();
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--dry-run",
+            "update",
+            "--json",
+            "--no-pr",
+            "commits",
+            "2",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputMode::Json).unwrap();
+
+        match output {
+            CommandOutput::Update(output) => match output.payload {
+                UpdatePayload::Summary { data } => {
+                    assert_eq!(data.extent, ResolvedUpdateLimit::ByCommits { count: 2 });
+                    assert_eq!(data.groups.len(), 1);
+                    assert_eq!(data.groups[0].stable_handle, "pr:alpha");
+                    assert_eq!(data.groups[0].target_sha.len(), 40);
+                }
             },
             other => panic!("unexpected command output: {:?}", other),
         }
