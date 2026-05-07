@@ -20,11 +20,10 @@ use crate::branch_names::{
 };
 use crate::config::ListOrder;
 use crate::github::{
-    fetch_pr_ci_review_status, list_open_or_merged_prs_for_heads, PrCiReviewStatus,
-    PrInfoWithState, PrState,
+    fetch_pr_ci_review_status, list_open_or_merged_prs_for_heads, PrCiReviewStatus, PrCiState,
+    PrInfoWithState, PrReviewDecision, PrState,
 };
 use crate::parsing::{derive_local_groups, Group};
-use crate::read_only_output::RemoteMetadataState;
 
 #[derive(Debug)]
 pub enum ReadOnlyQueryError {
@@ -51,11 +50,27 @@ impl From<anyhow::Error> for ReadOnlyQueryError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemotePrMetadata {
-    pub pr_number: u64,
-    pub url: String,
-    pub base_branch: String,
-    pub state: PrState,
-    pub ci_review_status: Option<PrCiReviewStatus>,
+    #[serde(flatten)]
+    pub state: RemotePrState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemotePrState {
+    NoRemote,
+    RemoteWithoutCiReview {
+        pr_number: u64,
+        url: String,
+        base_branch: String,
+        state: PrState,
+    },
+    RemoteWithCiReview {
+        pr_number: u64,
+        url: String,
+        base_branch: String,
+        state: PrState,
+        ci_review_status: PrCiReviewStatus,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -66,12 +81,11 @@ pub struct PrGroupData {
     pub first_commit_sha: String,
     pub commit_count: usize,
     pub first_subject: String,
-    pub remote: Option<RemotePrMetadata>,
+    pub remote: RemotePrMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrListData {
-    pub remote_metadata_state: RemoteMetadataState,
     pub groups: Vec<PrGroupData>,
 }
 
@@ -87,13 +101,12 @@ pub struct CommitGroupData {
     pub local_pr_number: usize,
     pub stable_handle: String,
     pub head_branch: String,
-    pub remote: Option<RemotePrMetadata>,
+    pub remote: RemotePrMetadata,
     pub commits: Vec<CommitEntryData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommitListData {
-    pub remote_metadata_state: RemoteMetadataState,
     pub groups: Vec<CommitGroupData>,
 }
 
@@ -103,36 +116,63 @@ pub struct CommitListData {
 /// fixed marker `⑃M` so they are visually distinct from open green PRs (`✓✓`). If callers
 /// pass an open PR that is missing `ci_review_status`, this returns `??`; displaying anything
 /// else would incorrectly imply CI/review information was fetched.
-fn status_icons(remote: Option<&RemotePrMetadata>) -> (&'static str, &'static str) {
-    if let Some(remote) = remote {
-        if remote.state == PrState::Merged {
-            ("⑃", "M")
-        } else if let Some(status) = &remote.ci_review_status {
-            let ci_icon = if status.ci_state == "SUCCESS" {
-                "✓"
-            } else if status.ci_state == "FAILURE" || status.ci_state == "ERROR" {
-                "✗"
-            } else if status.ci_state == "PENDING" || status.ci_state == "EXPECTED" {
-                "◐"
-            } else {
-                "?"
+fn status_icons(remote: &RemotePrMetadata) -> (&'static str, &'static str) {
+    match &remote.state {
+        RemotePrState::NoRemote => ("?", "?"),
+        RemotePrState::RemoteWithoutCiReview {
+            state: PrState::Merged,
+            ..
+        }
+        | RemotePrState::RemoteWithCiReview {
+            state: PrState::Merged,
+            ..
+        } => ("⑃", "M"),
+        RemotePrState::RemoteWithoutCiReview { .. } => ("?", "?"),
+        RemotePrState::RemoteWithCiReview {
+            ci_review_status, ..
+        } => {
+            let ci_icon = match ci_review_status.ci_state {
+                PrCiState::Success => "✓",
+                PrCiState::Failure | PrCiState::Error => "✗",
+                PrCiState::Pending | PrCiState::Expected => "◐",
+                PrCiState::Unknown => "?",
             };
-            let rv_icon = if status.review_decision == "APPROVED" {
-                "✓"
-            } else if status.review_decision == "CHANGES_REQUESTED" {
-                "✗"
-            } else if status.review_decision == "REVIEW_REQUIRED" {
-                "◐"
-            } else {
-                "?"
+            let rv_icon = match ci_review_status.review_decision {
+                PrReviewDecision::Approved => "✓",
+                PrReviewDecision::ChangesRequested => "✗",
+                PrReviewDecision::ReviewRequired => "◐",
+                PrReviewDecision::Unknown => "?",
             };
             (ci_icon, rv_icon)
-        } else {
-            ("?", "?")
+        }
+    }
+}
+
+fn remote_pr_metadata(
+    pr_number: u64,
+    url: String,
+    base_branch: String,
+    state: PrState,
+    ci_review_status: Option<PrCiReviewStatus>,
+) -> RemotePrMetadata {
+    let state = if let Some(ci_review_status) = ci_review_status {
+        RemotePrState::RemoteWithCiReview {
+            pr_number,
+            url,
+            base_branch,
+            state,
+            ci_review_status,
         }
     } else {
-        ("?", "?")
-    }
+        RemotePrState::RemoteWithoutCiReview {
+            pr_number,
+            url,
+            base_branch,
+            state,
+        }
+    };
+
+    RemotePrMetadata { state }
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -141,10 +181,6 @@ fn short_sha(sha: &str) -> &str {
     } else {
         sha
     }
-}
-
-fn stable_handle_text(tag: &str) -> String {
-    format!("pr:{tag}")
 }
 
 struct PrSummaryLine<'a> {
@@ -211,10 +247,7 @@ fn derive_groups_and_identities(
 
 fn fetch_remote_pr_metadata(
     branch_identities: &[SyntheticBranchIdentity],
-) -> Result<(
-    RemoteMetadataState,
-    HashMap<CanonicalBranchConflictKey, RemotePrMetadata>,
-)> {
+) -> Result<HashMap<CanonicalBranchConflictKey, RemotePrMetadata>> {
     let heads: Vec<String> = branch_identities
         .iter()
         .map(|identity| identity.exact.clone())
@@ -225,43 +258,29 @@ fn fetch_remote_pr_metadata(
         .filter(|pr| pr.state == PrState::Open)
         .map(|pr| pr.number)
         .collect();
-    let (remote_metadata_state, status_map) = if open_numbers.is_empty() {
-        (RemoteMetadataState::Complete, HashMap::new())
-    } else if let Ok(status_map) = fetch_pr_ci_review_status(&open_numbers) {
-        (RemoteMetadataState::Complete, status_map)
+    let status_map = if open_numbers.is_empty() {
+        Some(HashMap::new())
     } else {
-        (
-            RemoteMetadataState::CiReviewStatusUnavailable,
-            HashMap::new(),
-        )
+        fetch_pr_ci_review_status(&open_numbers).ok()
     };
 
-    Ok((
-        remote_metadata_state,
-        build_remote_pr_metadata(prs, &status_map),
-    ))
+    Ok(build_remote_pr_metadata(prs, status_map.as_ref()))
 }
 
 fn build_remote_pr_metadata(
     prs: Vec<PrInfoWithState>,
-    status_map: &HashMap<u64, PrCiReviewStatus>,
+    status_map: Option<&HashMap<u64, PrCiReviewStatus>>,
 ) -> HashMap<CanonicalBranchConflictKey, RemotePrMetadata> {
     prs.into_iter()
         .map(|pr| {
             let ci_review_status = if pr.state == PrState::Open {
-                status_map.get(&pr.number).cloned()
+                status_map.and_then(|status_map| status_map.get(&pr.number).cloned())
             } else {
                 None
             };
             (
                 canonical_branch_conflict_key(&pr.head),
-                RemotePrMetadata {
-                    pr_number: pr.number,
-                    url: pr.url,
-                    base_branch: pr.base,
-                    state: pr.state,
-                    ci_review_status,
-                },
+                remote_pr_metadata(pr.number, pr.url, pr.base, pr.state, ci_review_status),
             )
         })
         .collect()
@@ -270,7 +289,6 @@ fn build_remote_pr_metadata(
 fn build_pr_list_data(
     groups: &[Group],
     branch_identities: &[SyntheticBranchIdentity],
-    remote_metadata_state: RemoteMetadataState,
     remote_by_head: &HashMap<CanonicalBranchConflictKey, RemotePrMetadata>,
 ) -> PrListData {
     let groups = groups
@@ -280,26 +298,27 @@ fn build_pr_list_data(
             let identity = &branch_identities[group_idx];
             PrGroupData {
                 local_pr_number: group_idx + 1,
-                stable_handle: stable_handle_text(&group.tag),
+                stable_handle: crate::commands::common::stable_handle_text(&group.tag),
                 head_branch: identity.exact.clone(),
                 first_commit_sha: group.commits.first().cloned().unwrap_or_default(),
                 commit_count: group.commits.len(),
                 first_subject: group.subjects.first().cloned().unwrap_or_default(),
-                remote: remote_by_head.get(&identity.conflict_key).cloned(),
+                remote: remote_by_head
+                    .get(&identity.conflict_key)
+                    .cloned()
+                    .unwrap_or(RemotePrMetadata {
+                        state: RemotePrState::NoRemote,
+                    }),
             }
         })
         .collect();
 
-    PrListData {
-        remote_metadata_state,
-        groups,
-    }
+    PrListData { groups }
 }
 
 fn build_commit_list_data(
     groups: &[Group],
     branch_identities: &[SyntheticBranchIdentity],
-    remote_metadata_state: RemoteMetadataState,
     remote_by_head: &HashMap<CanonicalBranchConflictKey, RemotePrMetadata>,
 ) -> CommitListData {
     let group_start_indices: Vec<usize> = groups
@@ -329,18 +348,20 @@ fn build_commit_list_data(
                 .collect();
             CommitGroupData {
                 local_pr_number: group_idx + 1,
-                stable_handle: stable_handle_text(&group.tag),
+                stable_handle: crate::commands::common::stable_handle_text(&group.tag),
                 head_branch: identity.exact.clone(),
-                remote: remote_by_head.get(&identity.conflict_key).cloned(),
+                remote: remote_by_head
+                    .get(&identity.conflict_key)
+                    .cloned()
+                    .unwrap_or(RemotePrMetadata {
+                        state: RemotePrState::NoRemote,
+                    }),
                 commits,
             }
         })
         .collect();
 
-    CommitListData {
-        remote_metadata_state,
-        groups,
-    }
+    CommitListData { groups }
 }
 
 pub fn collect_pr_list_data_for_json(
@@ -349,12 +370,11 @@ pub fn collect_pr_list_data_for_json(
     ignore_tag: &str,
 ) -> std::result::Result<PrListData, ReadOnlyQueryError> {
     let (groups, branch_identities) = derive_groups_and_identities(base, prefix, ignore_tag)?;
-    let (remote_metadata_state, remote_by_head) =
+    let remote_by_head =
         fetch_remote_pr_metadata(&branch_identities).map_err(ReadOnlyQueryError::Internal)?;
     Ok(build_pr_list_data(
         &groups,
         &branch_identities,
-        remote_metadata_state,
         &remote_by_head,
     ))
 }
@@ -369,12 +389,11 @@ pub fn collect_commit_list_data_for_json(
     ignore_tag: &str,
 ) -> std::result::Result<CommitListData, ReadOnlyQueryError> {
     let (groups, branch_identities) = derive_groups_and_identities(base, prefix, ignore_tag)?;
-    let (remote_metadata_state, remote_by_head) =
+    let remote_by_head =
         fetch_remote_pr_metadata(&branch_identities).map_err(ReadOnlyQueryError::Internal)?;
     Ok(build_commit_list_data(
         &groups,
         &branch_identities,
-        remote_metadata_state,
         &remote_by_head,
     ))
 }
@@ -397,7 +416,12 @@ fn render_pr_list(data: &PrListData, list_order: ListOrder) -> Vec<String> {
         ];
         for group_idx in list_order.display_indices(data.groups.len()) {
             let group = &data.groups[group_idx];
-            let (ci_icon, rv_icon) = status_icons(group.remote.as_ref());
+            let (ci_icon, rv_icon) = status_icons(&group.remote);
+            let pr_number = match &group.remote.state {
+                RemotePrState::NoRemote => None,
+                RemotePrState::RemoteWithoutCiReview { pr_number, .. }
+                | RemotePrState::RemoteWithCiReview { pr_number, .. } => Some(*pr_number),
+            };
             lines.push(format_pr_summary_line(PrSummaryLine {
                 ci_icon,
                 rv_icon,
@@ -405,7 +429,7 @@ fn render_pr_list(data: &PrListData, list_order: ListOrder) -> Vec<String> {
                 stable_handle: &group.stable_handle,
                 short: short_sha(&group.first_commit_sha),
                 head_branch: &group.head_branch,
-                pr_number: group.remote.as_ref().map(|remote| remote.pr_number),
+                pr_number,
                 count: group.commit_count,
             }));
             lines.push(format!(
@@ -425,13 +449,19 @@ fn render_commit_list(data: &CommitListData, list_order: ListOrder) -> Vec<Strin
         let mut lines = Vec::new();
         for group_idx in list_order.display_indices(data.groups.len()) {
             let group = &data.groups[group_idx];
-            let remote_pr_number = group.remote.as_ref().and_then(|remote| {
-                if remote.state == PrState::Open {
-                    Some(remote.pr_number)
-                } else {
-                    None
+            let remote_pr_number = match &group.remote.state {
+                RemotePrState::RemoteWithoutCiReview {
+                    state: PrState::Open,
+                    pr_number,
+                    ..
                 }
-            });
+                | RemotePrState::RemoteWithCiReview {
+                    state: PrState::Open,
+                    pr_number,
+                    ..
+                } => Some(*pr_number),
+                _ => None,
+            };
             lines.push(format_commit_group_header(
                 group.local_pr_number,
                 &group.stable_handle,
@@ -505,13 +535,13 @@ mod tests {
     #[test]
     fn status_icons_uses_merged_marker() {
         assert_eq!(
-            status_icons(Some(&RemotePrMetadata {
-                pr_number: 42,
-                url: "https://github.com/o/r/pull/42".to_string(),
-                base_branch: "main".to_string(),
-                state: PrState::Merged,
-                ci_review_status: None,
-            })),
+            status_icons(&remote_pr_metadata(
+                42,
+                "https://github.com/o/r/pull/42".to_string(),
+                "main".to_string(),
+                PrState::Merged,
+                None,
+            )),
             ("⑃", "M")
         );
     }
@@ -519,16 +549,16 @@ mod tests {
     #[test]
     fn status_icons_maps_open_ci_and_review_states() {
         assert_eq!(
-            status_icons(Some(&RemotePrMetadata {
-                pr_number: 7,
-                url: "https://github.com/o/r/pull/7".to_string(),
-                base_branch: "main".to_string(),
-                state: PrState::Open,
-                ci_review_status: Some(PrCiReviewStatus {
-                    ci_state: "SUCCESS".to_string(),
-                    review_decision: "APPROVED".to_string(),
+            status_icons(&remote_pr_metadata(
+                7,
+                "https://github.com/o/r/pull/7".to_string(),
+                "main".to_string(),
+                PrState::Open,
+                Some(PrCiReviewStatus {
+                    ci_state: PrCiState::Success,
+                    review_decision: PrReviewDecision::Approved,
                 }),
-            })),
+            )),
             ("✓", "✓")
         );
     }
@@ -536,13 +566,13 @@ mod tests {
     #[test]
     fn status_icons_unknown_when_status_missing() {
         assert_eq!(
-            status_icons(Some(&RemotePrMetadata {
-                pr_number: 99,
-                url: "https://github.com/o/r/pull/99".to_string(),
-                base_branch: "main".to_string(),
-                state: PrState::Open,
-                ci_review_status: None,
-            })),
+            status_icons(&remote_pr_metadata(
+                99,
+                "https://github.com/o/r/pull/99".to_string(),
+                "main".to_string(),
+                PrState::Open,
+                None,
+            )),
             ("?", "?")
         );
     }
@@ -609,41 +639,37 @@ mod tests {
         ];
         let remote_by_head = HashMap::from([(
             canonical_branch_conflict_key("dank-spr/beta"),
-            RemotePrMetadata {
-                pr_number: 17,
-                url: "https://github.com/o/r/pull/17".to_string(),
-                base_branch: "main".to_string(),
-                state: PrState::Open,
-                ci_review_status: Some(PrCiReviewStatus {
-                    ci_state: "SUCCESS".to_string(),
-                    review_decision: "APPROVED".to_string(),
+            remote_pr_metadata(
+                17,
+                "https://github.com/o/r/pull/17".to_string(),
+                "main".to_string(),
+                PrState::Open,
+                Some(PrCiReviewStatus {
+                    ci_state: PrCiState::Success,
+                    review_decision: PrReviewDecision::Approved,
                 }),
-            },
+            ),
         )]);
 
-        let data = build_pr_list_data(
-            &groups,
-            &branch_identities,
-            RemoteMetadataState::Complete,
-            &remote_by_head,
-        );
-
-        assert_eq!(data.remote_metadata_state, RemoteMetadataState::Complete);
+        let data = build_pr_list_data(&groups, &branch_identities, &remote_by_head);
         assert_eq!(data.groups[0].local_pr_number, 1);
         assert_eq!(data.groups[0].stable_handle, "pr:alpha");
         assert_eq!(data.groups[1].local_pr_number, 2);
         assert_eq!(data.groups[1].stable_handle, "pr:beta");
-        assert_eq!(
-            data.groups[1]
-                .remote
-                .as_ref()
-                .map(|remote| remote.url.as_str()),
-            Some("https://github.com/o/r/pull/17")
-        );
+        assert!(matches!(
+            data.groups[0].remote.state,
+            RemotePrState::NoRemote
+        ));
+        assert!(matches!(
+            &data.groups[1].remote.state,
+            RemotePrState::RemoteWithCiReview { url, .. }
+                if url == "https://github.com/o/r/pull/17"
+        ));
     }
 
     #[test]
     fn build_remote_pr_metadata_keeps_open_prs_when_status_map_is_empty() {
+        let status_map = HashMap::new();
         let metadata = build_remote_pr_metadata(
             vec![
                 PrInfoWithState {
@@ -661,28 +687,28 @@ mod tests {
                     url: "https://github.com/o/r/pull/18".to_string(),
                 },
             ],
-            &HashMap::new(),
+            Some(&status_map),
         );
 
         assert_eq!(
             metadata.get(&canonical_branch_conflict_key("dank-spr/alpha")),
-            Some(&RemotePrMetadata {
-                pr_number: 17,
-                url: "https://github.com/o/r/pull/17".to_string(),
-                base_branch: "main".to_string(),
-                state: PrState::Open,
-                ci_review_status: None,
-            })
+            Some(&remote_pr_metadata(
+                17,
+                "https://github.com/o/r/pull/17".to_string(),
+                "main".to_string(),
+                PrState::Open,
+                None,
+            ))
         );
         assert_eq!(
             metadata.get(&canonical_branch_conflict_key("dank-spr/beta")),
-            Some(&RemotePrMetadata {
-                pr_number: 18,
-                url: "https://github.com/o/r/pull/18".to_string(),
-                base_branch: "main".to_string(),
-                state: PrState::Merged,
-                ci_review_status: None,
-            })
+            Some(&remote_pr_metadata(
+                18,
+                "https://github.com/o/r/pull/18".to_string(),
+                "main".to_string(),
+                PrState::Merged,
+                None,
+            ))
         );
     }
 
@@ -704,21 +730,16 @@ mod tests {
         ];
         let remote_by_head = HashMap::from([(
             canonical_branch_conflict_key("dank-spr/alpha"),
-            RemotePrMetadata {
-                pr_number: 11,
-                url: "https://github.com/o/r/pull/11".to_string(),
-                base_branch: "main".to_string(),
-                state: PrState::Open,
-                ci_review_status: None,
-            },
+            remote_pr_metadata(
+                11,
+                "https://github.com/o/r/pull/11".to_string(),
+                "main".to_string(),
+                PrState::Open,
+                None,
+            ),
         )]);
 
-        let data = build_commit_list_data(
-            &groups,
-            &branch_identities,
-            RemoteMetadataState::Complete,
-            &remote_by_head,
-        );
+        let data = build_commit_list_data(&groups, &branch_identities, &remote_by_head);
 
         assert_eq!(data.groups[0].stable_handle, "pr:alpha");
         assert_eq!(
@@ -736,7 +757,6 @@ mod tests {
     #[test]
     fn render_pr_list_preserves_recent_on_top_human_order() {
         let data = PrListData {
-            remote_metadata_state: RemoteMetadataState::Complete,
             groups: vec![
                 PrGroupData {
                     local_pr_number: 1,
@@ -745,7 +765,9 @@ mod tests {
                     first_commit_sha: "aaaaaaaa1".to_string(),
                     commit_count: 1,
                     first_subject: "feat: alpha".to_string(),
-                    remote: None,
+                    remote: RemotePrMetadata {
+                        state: RemotePrState::NoRemote,
+                    },
                 },
                 PrGroupData {
                     local_pr_number: 2,
@@ -754,7 +776,9 @@ mod tests {
                     first_commit_sha: "bbbbbbbb1".to_string(),
                     commit_count: 1,
                     first_subject: "feat: beta".to_string(),
-                    remote: None,
+                    remote: RemotePrMetadata {
+                        state: RemotePrState::NoRemote,
+                    },
                 },
             ],
         };
@@ -778,13 +802,14 @@ mod tests {
     #[test]
     fn render_commit_list_preserves_recent_on_top_human_order() {
         let data = CommitListData {
-            remote_metadata_state: RemoteMetadataState::Complete,
             groups: vec![
                 CommitGroupData {
                     local_pr_number: 1,
                     stable_handle: "pr:alpha".to_string(),
                     head_branch: "dank-spr/alpha".to_string(),
-                    remote: None,
+                    remote: RemotePrMetadata {
+                        state: RemotePrState::NoRemote,
+                    },
                     commits: vec![
                         CommitEntryData {
                             global_commit_index: 1,
@@ -802,7 +827,9 @@ mod tests {
                     local_pr_number: 2,
                     stable_handle: "pr:beta".to_string(),
                     head_branch: "dank-spr/beta".to_string(),
-                    remote: None,
+                    remote: RemotePrMetadata {
+                        state: RemotePrState::NoRemote,
+                    },
                     commits: vec![CommitEntryData {
                         global_commit_index: 3,
                         sha: "bbbbbbbb1".to_string(),

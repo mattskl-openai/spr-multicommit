@@ -1,24 +1,62 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
 use crate::commands::common;
 use crate::git::{gh_rw, normalize_branch_name, sanitize_gh_base_ref};
 use crate::github::list_open_prs_for_heads;
+use crate::maintenance_output::{
+    MaintenanceOptions, MaintenanceRepoContext, RelinkExpectedBaseData, RelinkPrAction,
+    RelinkPrDecisionData, RelinkPrsSummaryData,
+};
 use crate::parsing::derive_local_groups;
 
-pub fn relink_prs(base: &str, prefix: &str, ignore_tag: &str, dry: bool) -> Result<()> {
-    let base_n = normalize_branch_name(base);
-    // Build local expected stack from base..HEAD
+fn render_relink_action(action: RelinkPrAction) -> &'static str {
+    match action {
+        RelinkPrAction::AlreadyCorrect => "already correct",
+        RelinkPrAction::Edited => "edited",
+        RelinkPrAction::DryRunEdit => "would edit",
+        RelinkPrAction::MissingOpenPr => "missing open pr",
+    }
+}
+
+pub fn print_relink_prs_summary(summary: &RelinkPrsSummaryData) {
+    if summary.decisions.is_empty() {
+        info!("No local groups found; nothing to fix.");
+    } else {
+        for decision in &summary.decisions {
+            info!(
+                "{} -> {} ({})",
+                decision.head_branch,
+                decision.expected_base_ref,
+                render_relink_action(decision.action)
+            );
+        }
+    }
+}
+
+pub fn relink_prs(
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+    dry: bool,
+) -> Result<RelinkPrsSummaryData> {
+    let normalized_base = normalize_branch_name(base);
     let (_merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
-        info!("No local groups found; nothing to fix.");
-        return Ok(());
+        return Ok(RelinkPrsSummaryData {
+            repo: MaintenanceRepoContext {
+                base: normalized_base,
+                prefix: prefix.to_string(),
+            },
+            options: MaintenanceOptions { dry_run: dry },
+            expected_chain: Vec::new(),
+            decisions: Vec::new(),
+        });
     }
     let branch_identities = group_branch_identities(&groups, prefix)?;
 
-    // Existing PRs map by head
     let heads: Vec<String> = branch_identities
         .iter()
         .map(|identity| identity.exact.clone())
@@ -28,24 +66,29 @@ pub fn relink_prs(base: &str, prefix: &str, ignore_tag: &str, dry: bool) -> Resu
         .iter()
         .map(|pr| (canonical_branch_conflict_key(&pr.head), pr))
         .collect();
-    if prs.is_empty() {
-        bail!("No open PRs with head starting with `{prefix}`.");
-    }
+    let expected = common::build_head_base_chain(&normalized_base, &groups, prefix)?;
+    let expected_chain: Vec<RelinkExpectedBaseData> = expected
+        .iter()
+        .enumerate()
+        .map(
+            |(group_idx, (head_branch, expected_base_ref))| RelinkExpectedBaseData {
+                local_pr_number: group_idx + 1,
+                stable_handle: common::stable_handle_text(&groups[group_idx].tag),
+                head_branch: head_branch.clone(),
+                expected_base_ref: expected_base_ref.clone(),
+            },
+        )
+        .collect();
 
-    // Expected connectivity bottom-up
-    let expected = common::build_head_base_chain(&base_n, &groups, prefix)?;
-
-    // Apply base edits where needed
-    for (head, want_base) in expected {
+    let mut decisions: Vec<RelinkPrDecisionData> = Vec::with_capacity(expected_chain.len());
+    for expected in &expected_chain {
         if let Some(pr) = prs_by_head
-            .get(&canonical_branch_conflict_key(&head))
+            .get(&canonical_branch_conflict_key(&expected.head_branch))
             .copied()
         {
-            if pr.base != want_base {
-                info!(
-                    "Updating base of {} (#{}) from {} to {}",
-                    head, pr.number, pr.base, want_base
-                );
+            let action = if pr.base == expected.expected_base_ref {
+                RelinkPrAction::AlreadyCorrect
+            } else {
                 gh_rw(
                     dry,
                     [
@@ -53,23 +96,53 @@ pub fn relink_prs(base: &str, prefix: &str, ignore_tag: &str, dry: bool) -> Resu
                         "edit",
                         &format!("#{}", pr.number),
                         "--base",
-                        &sanitize_gh_base_ref(&want_base),
+                        &sanitize_gh_base_ref(&expected.expected_base_ref),
                     ]
                     .as_slice(),
                 )?;
-            } else {
-                info!("{} (#{}) already basing on {}", head, pr.number, want_base);
-            }
+                if dry {
+                    RelinkPrAction::DryRunEdit
+                } else {
+                    RelinkPrAction::Edited
+                }
+            };
+            decisions.push(RelinkPrDecisionData {
+                local_pr_number: expected.local_pr_number,
+                stable_handle: expected.stable_handle.clone(),
+                head_branch: expected.head_branch.clone(),
+                expected_base_ref: expected.expected_base_ref.clone(),
+                current_base_ref: Some(pr.base.clone()),
+                remote_pr_number: Some(pr.number),
+                action,
+            });
         } else {
-            warn!("No open PR found for {}; skipping", head);
+            decisions.push(RelinkPrDecisionData {
+                local_pr_number: expected.local_pr_number,
+                stable_handle: expected.stable_handle.clone(),
+                head_branch: expected.head_branch.clone(),
+                expected_base_ref: expected.expected_base_ref.clone(),
+                current_base_ref: None,
+                remote_pr_number: None,
+                action: RelinkPrAction::MissingOpenPr,
+            });
         }
     }
-    Ok(())
+
+    Ok(RelinkPrsSummaryData {
+        repo: MaintenanceRepoContext {
+            base: normalized_base,
+            prefix: prefix.to_string(),
+        },
+        options: MaintenanceOptions { dry_run: dry },
+        expected_chain,
+        decisions,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::relink_prs;
+    use crate::maintenance_output::RelinkPrAction;
     use crate::test_support::{commit_file, git, lock_cwd, write_file, DirGuard};
     use std::env;
     use std::fs;
@@ -148,12 +221,12 @@ mod tests {
         let _guard = DirGuard::change_to(&repo);
         let log_path = repo.join("gh.log");
         let exact_open_path = repo.join("exact-open.json");
+        let search_open_path = repo.join("search-open.json");
         fs::write(
             &exact_open_path,
             "{\"data\":{\"repository\":{\"pr0\":{\"nodes\":[{\"number\":17,\"headRefName\":\"skilltest/alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}]},\"pr1\":{\"nodes\":[{\"number\":22,\"headRefName\":\"skilltest/beta\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/22\",\"autoMergeRequest\":null}]}}}}",
         )
         .unwrap();
-        let search_open_path = repo.join("search-open.json");
         fs::write(
             &search_open_path,
             "{\"data\":{\"pr0\":{\"nodes\":[]},\"pr1\":{\"nodes\":[]}}}",
@@ -167,14 +240,13 @@ mod tests {
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
 
-        relink_prs("main", "skilltest/", "ignore", false).unwrap();
+        let summary = relink_prs("main", "skilltest/", "ignore", false).unwrap();
 
+        assert_eq!(summary.decisions[0].action, RelinkPrAction::AlreadyCorrect);
+        assert_eq!(summary.decisions[1].action, RelinkPrAction::Edited);
         let log = log_contents(&log_path);
         assert!(log.contains("api graphql"));
-        assert!(log.contains("is:pr is:open head:skilltest/alpha"));
-        assert!(log.contains("is:pr is:open head:skilltest/beta"));
         assert!(log.contains("pr edit #22 --base skilltest/alpha"));
-        assert!(!log.contains("pr edit #17 --base"));
     }
 
     #[test]
@@ -197,7 +269,32 @@ mod tests {
             .contains("Exact headRefName matches are required here"));
         let log = log_contents(&log_path);
         assert!(log.contains("api graphql"));
-        assert!(log.contains("is:pr is:open head:skilltest/alpha"));
+        assert!(!log.contains("pr edit"));
+    }
+
+    #[test]
+    fn relink_prs_reports_missing_open_pr_for_all_local_heads() {
+        let _lock = lock_cwd();
+        let dir = init_stack_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+        let log_path = repo.join("gh.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  echo '{{\"data\":{{\"repository\":{{\"pr0\":{{\"nodes\":[]}},\"pr1\":{{\"nodes\":[]}}}},\"pr0\":{{\"nodes\":[]}},\"pr1\":{{\"nodes\":[]}}}}}}'\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"edit\" ]; then\n  echo \"unexpected gh invocation: $*\" >&2\n  exit 1\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            log_path.display(),
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+
+        let summary = relink_prs("main", "skilltest/", "ignore", false).unwrap();
+
+        assert_eq!(summary.expected_chain.len(), 2);
+        assert_eq!(summary.decisions.len(), 2);
+        assert!(summary
+            .decisions
+            .iter()
+            .all(|decision| decision.action == RelinkPrAction::MissingOpenPr));
+        let log = log_contents(&log_path);
+        assert!(log.contains("api graphql"));
         assert!(!log.contains("pr edit"));
     }
 }

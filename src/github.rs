@@ -608,10 +608,54 @@ pub fn fetch_pr_bodies_graphql(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInf
     Ok(out)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PrCiState {
+    Success,
+    Failure,
+    Error,
+    Pending,
+    Expected,
+    Unknown,
+}
+
+impl PrCiState {
+    fn from_graphql_state(value: &str) -> Self {
+        match value {
+            "SUCCESS" => Self::Success,
+            "FAILURE" => Self::Failure,
+            "ERROR" => Self::Error,
+            "PENDING" => Self::Pending,
+            "EXPECTED" => Self::Expected,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PrReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+    Unknown,
+}
+
+impl PrReviewDecision {
+    fn from_graphql_state(value: &str) -> Self {
+        match value {
+            "APPROVED" => Self::Approved,
+            "CHANGES_REQUESTED" => Self::ChangesRequested,
+            "REVIEW_REQUIRED" => Self::ReviewRequired,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrCiReviewStatus {
-    pub ci_state: String, // SUCCESS | FAILURE | ERROR | PENDING | EXPECTED | UNKNOWN
-    pub review_decision: String, // APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | UNKNOWN
+    pub ci_state: PrCiState,
+    pub review_decision: PrReviewDecision,
 }
 
 pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiReviewStatus>> {
@@ -648,18 +692,18 @@ pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiRev
         let key = format!("pr{}", i);
         let mut review = repo[&key]["reviewDecision"]
             .as_str()
-            .unwrap_or("")
-            .to_string();
+            .map(PrReviewDecision::from_graphql_state)
+            .unwrap_or(PrReviewDecision::Unknown);
         // Default when missing (no CI configured) → treat as passing
-        let mut ci = String::from("SUCCESS");
+        let mut ci = PrCiState::Success;
         if let Some(nodes) = repo[&key]["commits"]["nodes"].as_array() {
             if let Some(node) = nodes.first() {
                 if let Some(state) = node["commit"]["statusCheckRollup"]["state"].as_str() {
-                    ci = state.to_string();
+                    ci = PrCiState::from_graphql_state(state);
                 }
             }
         }
-        if review.is_empty() {
+        if review == PrReviewDecision::Unknown {
             // Fallback heuristic when reviewDecision is not available (e.g., no protected branch rules)
             let mut has_changes_requested = false;
             let mut has_approved = false;
@@ -673,11 +717,11 @@ pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiRev
                 }
             }
             if has_changes_requested {
-                review = "CHANGES_REQUESTED".to_string();
+                review = PrReviewDecision::ChangesRequested;
             } else if has_approved {
-                review = "APPROVED".to_string();
+                review = PrReviewDecision::Approved;
             } else {
-                review = "REVIEW_REQUIRED".to_string();
+                review = PrReviewDecision::ReviewRequired;
             }
         }
 

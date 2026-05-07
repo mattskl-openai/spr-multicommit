@@ -5,13 +5,12 @@ use serde::Serialize;
 
 use crate::git::{git_ref_exists_at, git_ro_in, repo_root};
 use crate::github::resolve_pr_url_head_ref;
+use crate::json_output::{JsonCommand, JSON_OUTPUT_SCHEMA_VERSION};
 use crate::stack_metadata::{
     current_branch_or_none, load_metadata_for_repo_path, stack_ids_for_branch,
     verify_stack_branch_for_pr_record, verify_stack_branch_for_stack_id, PrBranchName,
     PrBranchRecord, StackBranchName, StackMetadataFile, TombstoneReason,
 };
-
-const RESOLVE_STACK_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,12 +45,13 @@ pub enum ResolveStackDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolveStackOutput {
     pub schema_version: u32,
+    pub command: JsonCommand,
     #[serde(flatten)]
     pub payload: ResolveStackPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "result", rename_all = "snake_case")]
 pub enum ResolveStackPayload {
     Found {
         target_kind: ResolveStackTargetKind,
@@ -107,7 +107,8 @@ pub enum ResolveStackPayload {
 impl ResolveStackOutput {
     fn new(payload: ResolveStackPayload) -> Self {
         Self {
-            schema_version: RESOLVE_STACK_SCHEMA_VERSION,
+            schema_version: JSON_OUTPUT_SCHEMA_VERSION,
+            command: JsonCommand::ResolveStack,
             payload,
         }
     }

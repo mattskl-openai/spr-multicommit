@@ -7,6 +7,7 @@ use crate::cli::LandCmd;
 use crate::git::{gh_rw, git_ro, git_rw, sanitize_gh_base_ref, to_remote_ref};
 use crate::github::{
     fetch_pr_bodies_graphql, fetch_pr_ci_review_status, graphql_escape, list_open_prs_for_heads,
+    PrCiState, PrReviewDecision,
 };
 use crate::parsing::derive_local_groups;
 use crate::selectors::{resolve_inclusive_count, InclusiveSelector};
@@ -83,10 +84,10 @@ pub fn land_until(
             let mut rv_bad: Vec<u64> = vec![];
             for n in &numbers {
                 if let Some(st) = status_map.get(n) {
-                    if st.ci_state.as_str() != "SUCCESS" {
+                    if st.ci_state != PrCiState::Success {
                         ci_bad.push(*n);
                     }
-                    if st.review_decision.as_str() != "APPROVED" {
+                    if st.review_decision != PrReviewDecision::Approved {
                         rv_bad.push(*n);
                     }
                 } else {

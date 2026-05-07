@@ -8,11 +8,9 @@
 use serde::Serialize;
 
 use crate::commands::{RewriteCommandKind, RewriteSuspendedState};
-pub use crate::json_command::{
-    JsonCommand as MachineCommand, EXIT_FAILURE, EXIT_SUCCESS, EXIT_SUSPENDED,
+pub use crate::json_output::{
+    JsonCommand as MachineCommand, EXIT_SUSPENDED, JSON_OUTPUT_SCHEMA_VERSION,
 };
-
-pub const MACHINE_OUTPUT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -37,13 +35,13 @@ impl From<RewriteCommandKind> for MachineRewriteCommandKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MachineOutput {
     pub schema_version: u32,
+    pub command: MachineCommand,
     #[serde(flatten)]
     pub payload: MachinePayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MachineSuspendedPayload {
-    pub command: MachineCommand,
     pub rewrite_command_kind: MachineRewriteCommandKind,
     pub original_worktree_root: String,
     pub original_branch: String,
@@ -59,24 +57,19 @@ pub struct MachineSuspendedPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum MachinePayload {
-    Completed {
-        command: MachineCommand,
-    },
+    Completed,
     Suspended {
         #[serde(flatten)]
         details: Box<MachineSuspendedPayload>,
-    },
-    Error {
-        command: MachineCommand,
-        message: String,
     },
 }
 
 impl MachineOutput {
     pub fn completed(command: MachineCommand) -> Self {
         Self {
-            schema_version: MACHINE_OUTPUT_SCHEMA_VERSION,
-            payload: MachinePayload::Completed { command },
+            schema_version: JSON_OUTPUT_SCHEMA_VERSION,
+            command,
+            payload: MachinePayload::Completed,
         }
     }
 
@@ -111,10 +104,10 @@ impl MachineOutput {
             suspended_post_success_hint
         };
         Self {
-            schema_version: MACHINE_OUTPUT_SCHEMA_VERSION,
+            schema_version: JSON_OUTPUT_SCHEMA_VERSION,
+            command,
             payload: MachinePayload::Suspended {
                 details: Box::new(MachineSuspendedPayload {
-                    command,
                     rewrite_command_kind: command_kind.into(),
                     original_worktree_root,
                     original_branch,
@@ -130,20 +123,11 @@ impl MachineOutput {
         }
     }
 
-    pub fn error(command: MachineCommand, message: String) -> Self {
-        Self {
-            schema_version: MACHINE_OUTPUT_SCHEMA_VERSION,
-            payload: MachinePayload::Error { command, message },
-        }
-    }
-
     pub fn exit_code(&self) -> i32 {
         if matches!(self.payload, MachinePayload::Suspended { .. }) {
             EXIT_SUSPENDED
-        } else if matches!(self.payload, MachinePayload::Error { .. }) {
-            EXIT_FAILURE
         } else {
-            EXIT_SUCCESS
+            crate::json_output::EXIT_SUCCESS
         }
     }
 }
@@ -179,13 +163,12 @@ mod tests {
         match output.payload {
             MachinePayload::Suspended { details } => {
                 let MachineSuspendedPayload {
-                    command,
                     rewrite_command_kind,
                     resume_argv,
                     conflicted_paths,
                     ..
                 } = *details;
-                assert_eq!(command, MachineCommand::Restack);
+                assert_eq!(output.command, MachineCommand::Restack);
                 assert_eq!(rewrite_command_kind, MachineRewriteCommandKind::Restack);
                 assert_eq!(
                     resume_argv,
