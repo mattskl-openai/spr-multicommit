@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use tracing::info;
 
 use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
+use crate::execution::ExecutionMode;
 use crate::git::{git_ro, git_rw};
 use crate::github::{append_warning_to_pr, list_open_prs_for_heads};
 use crate::limit::Limit;
@@ -179,8 +180,9 @@ pub fn prep_squash(
     pr_description_mode: crate::config::PrDescriptionMode,
     list_order: crate::config::ListOrder,
     selection: crate::cli::PrepSelection,
-    dry: bool,
+    execution_mode: ExecutionMode,
 ) -> Result<PrepSummaryData> {
+    let dry_run = execution_mode == ExecutionMode::DryRun;
     let (merge_base, groups) = derive_local_groups(base, ignore_tag)?;
     if groups.is_empty() {
         return Ok(PrepSummaryData {
@@ -190,7 +192,7 @@ pub fn prep_squash(
                 ignore_tag: ignore_tag.to_string(),
             },
             options: PrepOptions {
-                dry_run: dry,
+                dry_run,
                 pr_description_mode,
             },
             selection: ResolvedPrepSelection::All,
@@ -274,7 +276,7 @@ pub fn prep_squash(
                     .to_string();
             if tree != parent_tree {
                 let new_commit = git_rw(
-                    dry,
+                    execution_mode,
                     ["commit-tree", tree, "-p", &parent_sha, "-m", &message].as_slice(),
                 )?
                 .trim()
@@ -340,7 +342,7 @@ pub fn prep_squash(
                 skipped_replay_commit_count += 1;
             } else {
                 let new_commit = git_rw(
-                    dry,
+                    execution_mode,
                     ["commit-tree", tree, "-p", &parent_sha, "-m", message].as_slice(),
                 )?
                 .trim()
@@ -355,7 +357,7 @@ pub fn prep_squash(
         .trim()
         .to_string();
     git_rw(
-        dry,
+        execution_mode,
         [
             "update-ref",
             &format!("refs/heads/{}", current_branch),
@@ -374,7 +376,7 @@ pub fn prep_squash(
         prefix,
         &skipped_handles,
         false,
-        dry,
+        execution_mode,
         pr_description_mode,
         limit,
         updated_groups,
@@ -390,7 +392,7 @@ pub fn prep_squash(
             ignore_tag: ignore_tag.to_string(),
         },
         UpdateOptions {
-            dry_run: dry,
+            dry_run,
             no_pr: false,
             pr_description_mode,
         },
@@ -413,9 +415,9 @@ pub fn prep_squash(
                             append_warning_to_pr(
                                 pr.number,
                                 "🚨🚨 parent PRs have changed, this PR may show extra diffs from parent PR 🚨🚨",
-                                dry,
+                                execution_mode,
                             )?;
-                            if dry {
+                            if dry_run {
                                 PrepNextChildAction::WouldAppendWarning
                             } else {
                                 PrepNextChildAction::WarningAppended
@@ -459,7 +461,7 @@ pub fn prep_squash(
             ignore_tag: ignore_tag.to_string(),
         },
         options: PrepOptions {
-            dry_run: dry,
+            dry_run,
             pr_description_mode,
         },
         selection: resolved_selection,
@@ -483,6 +485,7 @@ mod tests {
     use super::{prep_squash, render_prep_summary, resolve_prep_window};
     use crate::cli::PrepSelection;
     use crate::config::{ListOrder, PrDescriptionMode};
+    use crate::execution::ExecutionMode;
     use crate::maintenance_output::{PreparedGroupAction, ResolvedPrepSelection};
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, InclusiveSelector, StableHandle};
@@ -570,7 +573,7 @@ mod tests {
             PrDescriptionMode::Overwrite,
             ListOrder::RecentOnBottom,
             PrepSelection::All,
-            true,
+            ExecutionMode::DryRun,
         )
         .unwrap_err();
 

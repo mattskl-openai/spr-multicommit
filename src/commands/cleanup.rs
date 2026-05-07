@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tracing::info;
 
+use crate::execution::ExecutionMode;
 use crate::git::{git_rw, list_remote_branches_with_prefix};
 use crate::github::list_open_pr_heads;
 use crate::maintenance_output::{
@@ -33,7 +34,11 @@ pub fn print_cleanup_summary(summary: &CleanupSummaryData) {
 }
 
 /// Delete remote branches that start with the configured prefix and have only closed PRs (or no PRs)
-pub fn cleanup_remote_branches(prefix: &str, dry: bool) -> Result<CleanupSummaryData> {
+pub fn cleanup_remote_branches(
+    prefix: &str,
+    execution_mode: ExecutionMode,
+) -> Result<CleanupSummaryData> {
+    let dry_run = execution_mode == ExecutionMode::DryRun;
     let mut branches = list_remote_branches_with_prefix(prefix)?;
     branches.sort();
     if branches.is_empty() {
@@ -41,7 +46,7 @@ pub fn cleanup_remote_branches(prefix: &str, dry: bool) -> Result<CleanupSummary
             repo: CleanupRepoContext {
                 prefix: prefix.to_string(),
             },
-            options: MaintenanceOptions { dry_run: dry },
+            options: MaintenanceOptions { dry_run },
             remote_candidates: branches,
             open_pr_heads: Vec::new(),
             decisions: Vec::new(),
@@ -57,7 +62,7 @@ pub fn cleanup_remote_branches(prefix: &str, dry: bool) -> Result<CleanupSummary
             branch: branch.clone(),
             action: if open_heads.contains(branch) {
                 CleanupAction::SkipOpenPr
-            } else if dry {
+            } else if dry_run {
                 CleanupAction::DryRunDelete
             } else {
                 CleanupAction::Delete
@@ -79,14 +84,14 @@ pub fn cleanup_remote_branches(prefix: &str, dry: bool) -> Result<CleanupSummary
         let mut owned_args: Vec<String> = vec!["push".into(), "origin".into(), "--delete".into()];
         owned_args.extend(delete_batch.iter().cloned());
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        let _ = git_rw(dry, &args)?;
+        let _ = git_rw(execution_mode, &args)?;
     }
 
     Ok(CleanupSummaryData {
         repo: CleanupRepoContext {
             prefix: prefix.to_string(),
         },
-        options: MaintenanceOptions { dry_run: dry },
+        options: MaintenanceOptions { dry_run },
         remote_candidates: branches,
         open_pr_heads: open_heads,
         decisions,
@@ -97,6 +102,7 @@ pub fn cleanup_remote_branches(prefix: &str, dry: bool) -> Result<CleanupSummary
 #[cfg(test)]
 mod tests {
     use super::cleanup_remote_branches;
+    use crate::execution::ExecutionMode;
     use crate::maintenance_output::CleanupAction;
     use crate::test_support::{commit_file, git, lock_cwd, write_file, DirGuard};
     use std::env;
@@ -201,7 +207,7 @@ mod tests {
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
 
-        let summary = cleanup_remote_branches("skilltest/", true).unwrap();
+        let summary = cleanup_remote_branches("skilltest/", ExecutionMode::DryRun).unwrap();
 
         assert_eq!(
             summary.remote_candidates,
@@ -229,7 +235,7 @@ mod tests {
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
 
-        let summary = cleanup_remote_branches("missing/", true).unwrap();
+        let summary = cleanup_remote_branches("missing/", ExecutionMode::DryRun).unwrap();
 
         assert!(summary.remote_candidates.is_empty());
         assert!(summary.open_pr_heads.is_empty());

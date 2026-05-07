@@ -20,6 +20,7 @@ use crate::commands::rewrite_resume::{
     self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
 };
 use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
+use crate::execution::ExecutionMode;
 use crate::git::git_rev_list_range;
 use crate::git::git_rev_parse;
 use crate::git::git_ro;
@@ -33,7 +34,7 @@ use crate::selectors::{resolve_after_count, AfterSelector};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RestackExecutionOptions {
     safe: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     conflict_policy: RestackConflictPolicy,
     dirty_worktree_policy: DirtyWorktreePolicy,
 }
@@ -461,7 +462,11 @@ fn try_fast_suffix_rebase(
         fast_plan.upstream_exclusive.as_str(),
         cur_branch,
     ];
-    match common::run_native_rebase_with_abort(false, rebase_args.as_slice(), "fast restack")? {
+    match common::run_native_rebase_with_abort(
+        ExecutionMode::Apply,
+        rebase_args.as_slice(),
+        "fast restack",
+    )? {
         NativeRebaseOutcome::Aborted => {
             verify_fast_rebase_abort_cleanup(&fast_plan.original_head).with_context(|| {
                 format!(
@@ -498,11 +503,11 @@ fn restack_after_resolved(
     plan: RestackPlan,
     options: RestackExecutionOptions,
 ) -> Result<RewriteCommandOutcome> {
-    let planned_executor = plan.planned_executor(!options.dry)?;
+    let planned_executor = plan.planned_executor(options.execution_mode == ExecutionMode::Apply)?;
     log_human_restack_plan(&plan, options.safe, planned_executor.clone());
 
     common::with_dirty_worktree_policy(
-        options.dry,
+        options.execution_mode,
         "spr restack",
         options.dirty_worktree_policy,
         |deferred_dirty_worktree_restore| {
@@ -512,7 +517,12 @@ fn restack_after_resolved(
             let metadata_refresh_context = metadata_context.clone();
             if plan.remaining_groups.is_empty() && plan.kept_ignored_segments.is_empty() {
                 if options.safe {
-                    let _ = common::create_backup_tag(options.dry, "restack", &cur_branch, &short)?;
+                    let _ = common::create_backup_tag(
+                        options.execution_mode,
+                        "restack",
+                        &cur_branch,
+                        &short,
+                    )?;
                 }
                 info!(
                     "Skipping all {} PR(s); syncing current branch {} to {}",
@@ -520,8 +530,8 @@ fn restack_after_resolved(
                     cur_branch,
                     metadata_context.base
                 );
-                common::reset_current_branch_to(options.dry, &metadata_context.base)?;
-                if !options.dry {
+                common::reset_current_branch_to(options.execution_mode, &metadata_context.base)?;
+                if options.execution_mode == ExecutionMode::Apply {
                     crate::stack_metadata::refresh_metadata_for_branch(
                         &original_worktree_root,
                         &cur_branch,
@@ -538,7 +548,7 @@ fn restack_after_resolved(
                     } => {
                         let backup_tag = if options.safe {
                             Some(common::create_backup_tag(
-                                false,
+                                ExecutionMode::Apply,
                                 "restack",
                                 &cur_branch,
                                 &short,
@@ -570,7 +580,7 @@ fn restack_after_resolved(
                     Ok(RewriteCommandOutcome::Completed)
                 } else {
                     let resume_path = rewrite_resume::prepare_resume_path_for_new_session(
-                        options.dry,
+                        options.execution_mode,
                         RewriteCommandKind::Restack,
                         &cur_branch,
                         &original_head,
@@ -579,7 +589,7 @@ fn restack_after_resolved(
                         existing_backup_tag
                     } else if options.safe {
                         Some(common::create_backup_tag(
-                            options.dry,
+                            options.execution_mode,
                             "restack",
                             &cur_branch,
                             &short,
@@ -589,13 +599,13 @@ fn restack_after_resolved(
                     };
 
                     let (tmp_path, tmp_branch) = common::create_temp_worktree(
-                        options.dry,
+                        options.execution_mode,
                         "restack",
                         &metadata_context.base,
                         &short,
                     )?;
                     let outcome = rewrite_resume::run_rewrite_session(
-                        options.dry,
+                        options.execution_mode,
                         RewriteSession {
                             command_kind: RewriteCommandKind::Restack,
                             conflict_policy: if options.conflict_policy
@@ -652,11 +662,11 @@ pub fn restack_after(
     metadata_context: &crate::stack_metadata::RefreshMetadataContext,
     after: &AfterSelector,
     safe: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     conflict_policy: RestackConflictPolicy,
     dirty_worktree_policy: DirtyWorktreePolicy,
 ) -> Result<RewriteCommandOutcome> {
-    git_rw(dry, ["fetch", "origin"].as_slice())?;
+    git_rw(execution_mode, ["fetch", "origin"].as_slice())?;
 
     if let Some(plan) = collect_restack_plan(metadata_context, after, true)? {
         restack_after_resolved(
@@ -664,7 +674,7 @@ pub fn restack_after(
             plan,
             RestackExecutionOptions {
                 safe,
-                dry,
+                execution_mode,
                 conflict_policy,
                 dirty_worktree_policy,
             },
@@ -680,11 +690,11 @@ pub fn restack_after_count(
     metadata_context: &crate::stack_metadata::RefreshMetadataContext,
     after: usize,
     safe: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     conflict_policy: RestackConflictPolicy,
     dirty_worktree_policy: DirtyWorktreePolicy,
 ) -> Result<RewriteCommandOutcome> {
-    git_rw(dry, ["fetch", "origin"].as_slice())?;
+    git_rw(execution_mode, ["fetch", "origin"].as_slice())?;
 
     if let Some(plan) = collect_restack_plan_after_count(metadata_context, after, true)? {
         restack_after_resolved(
@@ -692,7 +702,7 @@ pub fn restack_after_count(
             plan,
             RestackExecutionOptions {
                 safe,
-                dry,
+                execution_mode,
                 conflict_policy,
                 dirty_worktree_policy,
             },
@@ -712,6 +722,7 @@ mod tests {
     use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
     use crate::commands::RewriteCommandOutcome;
     use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
+    use crate::execution::ExecutionMode;
     use crate::parsing::Group;
     use crate::restack_output::RestackExecutorPlan;
     use crate::selectors::{AfterSelector, GroupSelector, StableHandle};
@@ -1176,7 +1187,7 @@ mod tests {
             &metadata_context(),
             &AfterSelector::Group(GroupSelector::LocalPr(1)),
             true,
-            false,
+            ExecutionMode::Apply,
             RestackConflictPolicy::Halt,
             DirtyWorktreePolicy::Halt,
         )
@@ -1242,7 +1253,7 @@ mod tests {
             &metadata_context(),
             &AfterSelector::Group(GroupSelector::LocalPr(1)),
             false,
-            false,
+            ExecutionMode::Apply,
             RestackConflictPolicy::Halt,
             DirtyWorktreePolicy::Halt,
         )
@@ -1264,7 +1275,7 @@ mod tests {
         );
         resolve_restack_conflict(Path::new(&resume_state.temp_worktree_path));
 
-        let resumed = resume_rewrite(false, &resume_path).expect("resume restack");
+        let resumed = resume_rewrite(&resume_path).expect("resume restack");
         assert_eq!(resumed, RewriteCommandOutcome::Completed);
         assert!(
             !resume_path.exists(),

@@ -34,6 +34,7 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::config::DirtyWorktreePolicy;
+use crate::execution::ExecutionMode;
 use crate::git::{git_ro, git_rw, normalize_branch_name, repo_root};
 use crate::parsing::Group;
 
@@ -63,7 +64,12 @@ pub fn get_current_branch_and_short() -> Result<(String, String)> {
 ///
 /// The existence check is only used to drive the log message; the tag is
 /// always updated to point at `HEAD`.
-pub fn create_backup_tag(dry: bool, kind: &str, cur_branch: &str, short: &str) -> Result<String> {
+pub fn create_backup_tag(
+    execution_mode: ExecutionMode,
+    kind: &str,
+    cur_branch: &str,
+    short: &str,
+) -> Result<String> {
     let backup = format!("backup/{}/{}-{}", kind, cur_branch, short);
     let exists = git_ro(["tag", "--list", &backup].as_slice())?;
     if exists.trim().is_empty() {
@@ -73,7 +79,7 @@ pub fn create_backup_tag(dry: bool, kind: &str, cur_branch: &str, short: &str) -
     }
     // Use `-f` to make backup creation idempotent. When the name already
     // exists, we explicitly move it to the current HEAD.
-    let _ = git_rw(dry, ["tag", "-f", &backup, "HEAD"].as_slice())?;
+    let _ = git_rw(execution_mode, ["tag", "-f", &backup, "HEAD"].as_slice())?;
     Ok(backup)
 }
 
@@ -86,20 +92,20 @@ pub fn create_backup_tag(dry: bool, kind: &str, cur_branch: &str, short: &str) -
 /// create) rather than `-b` to avoid "branch already exists" failures when a
 /// dry-run skipped the cleanup steps.
 pub fn create_temp_worktree(
-    dry: bool,
+    execution_mode: ExecutionMode,
     kind: &str,
     merge_base: &str,
     short: &str,
 ) -> Result<(String, String)> {
     let tmp_branch = format!("spr/tmp-{}-{}", kind, short);
     let tmp_path = format!("/tmp/spr-{}-{}", kind, short);
-    cleanup_existing_temp_state(dry, &tmp_path, &tmp_branch)?;
+    cleanup_existing_temp_state(execution_mode, &tmp_path, &tmp_branch)?;
     info!(
         "Creating temp worktree {} on branch {}…",
         tmp_path, tmp_branch
     );
     let _ = git_rw(
-        dry,
+        execution_mode,
         [
             "worktree",
             "add",
@@ -133,27 +139,34 @@ pub enum NativeRebaseOutcome {
 /// rebase error is returned with context that tells the user where to repair the
 /// repository.
 pub fn run_native_rebase_with_abort(
-    dry: bool,
+    execution_mode: ExecutionMode,
     args: &[&str],
     command_label: &str,
 ) -> Result<NativeRebaseOutcome> {
-    if dry {
-        let _ = git_rw(true, args)?;
-        Ok(NativeRebaseOutcome::Completed)
-    } else if let Err(rebase_err) = git_rw(false, args) {
-        if let Err(abort_err) = git_rw(false, ["rebase", "--abort"].as_slice()) {
-            let repo = repo_root()?.unwrap_or_else(|| ".".to_string());
-            Err(rebase_err).with_context(|| {
-                format!(
-                    "{command_label} rebase failed, and `git rebase --abort` also failed: {abort_err:#}. Inspect {} and run `git rebase --abort` there before retrying.",
-                    repo
-                )
-            })
-        } else {
-            Ok(NativeRebaseOutcome::Aborted)
+    match execution_mode {
+        ExecutionMode::DryRun => {
+            let _ = git_rw(ExecutionMode::DryRun, args)?;
+            Ok(NativeRebaseOutcome::Completed)
         }
-    } else {
-        Ok(NativeRebaseOutcome::Completed)
+        ExecutionMode::Apply => {
+            if let Err(rebase_err) = git_rw(ExecutionMode::Apply, args) {
+                if let Err(abort_err) =
+                    git_rw(ExecutionMode::Apply, ["rebase", "--abort"].as_slice())
+                {
+                    let repo = repo_root()?.unwrap_or_else(|| ".".to_string());
+                    Err(rebase_err).with_context(|| {
+                        format!(
+                            "{command_label} rebase failed, and `git rebase --abort` also failed: {abort_err:#}. Inspect {} and run `git rebase --abort` there before retrying.",
+                            repo
+                        )
+                    })
+                } else {
+                    Ok(NativeRebaseOutcome::Aborted)
+                }
+            } else {
+                Ok(NativeRebaseOutcome::Completed)
+            }
+        }
     }
 }
 
@@ -218,7 +231,11 @@ fn branch_exists(branch: &str) -> Result<bool> {
 /// temp branch checked out must be removed before the branch can be deleted.
 /// We also remove a matching temp path that is not registered as a worktree,
 /// which can happen after interrupted runs.
-fn cleanup_existing_temp_state(dry: bool, tmp_path: &str, tmp_branch: &str) -> Result<()> {
+fn cleanup_existing_temp_state(
+    execution_mode: ExecutionMode,
+    tmp_path: &str,
+    tmp_branch: &str,
+) -> Result<()> {
     let entries = list_worktrees()?;
     let mut removed_paths: HashSet<String> = HashSet::new();
 
@@ -233,7 +250,7 @@ fn cleanup_existing_temp_state(dry: bool, tmp_path: &str, tmp_branch: &str) -> R
             entry.path, tmp_branch
         );
         let _ = git_rw(
-            dry,
+            execution_mode,
             ["worktree", "remove", "-f", entry.path.as_str()].as_slice(),
         )?;
         removed_paths.insert(entry.path.clone());
@@ -243,13 +260,16 @@ fn cleanup_existing_temp_state(dry: bool, tmp_path: &str, tmp_branch: &str) -> R
     // branch name is missing (e.g., detached HEAD).
     if entries.iter().any(|e| e.path == tmp_path) && !removed_paths.contains(tmp_path) {
         info!("Removing existing temp worktree at {}…", tmp_path);
-        let _ = git_rw(dry, ["worktree", "remove", "-f", tmp_path].as_slice())?;
+        let _ = git_rw(
+            execution_mode,
+            ["worktree", "remove", "-f", tmp_path].as_slice(),
+        )?;
     } else if Path::new(tmp_path).exists() {
         info!(
             "Temp path {} exists but is not registered as a worktree; removing it…",
             tmp_path
         );
-        if !dry {
+        if execution_mode == ExecutionMode::Apply {
             fs::remove_dir_all(tmp_path)
                 .with_context(|| format!("failed to remove existing temp path {}", tmp_path))?;
         }
@@ -257,7 +277,7 @@ fn cleanup_existing_temp_state(dry: bool, tmp_path: &str, tmp_branch: &str) -> R
 
     if branch_exists(tmp_branch)? {
         info!("Deleting existing temp branch {}…", tmp_branch);
-        let _ = git_rw(dry, ["branch", "-D", tmp_branch].as_slice())?;
+        let _ = git_rw(execution_mode, ["branch", "-D", tmp_branch].as_slice())?;
     }
 
     Ok(())
@@ -277,18 +297,18 @@ fn cherry_pick_args<'a>(
 }
 
 pub fn cherry_pick_commit(
-    dry: bool,
+    execution_mode: ExecutionMode,
     tmp_path: &str,
     sha: &str,
     empty_policy: CherryPickEmptyPolicy,
 ) -> Result<()> {
     let args = cherry_pick_args(tmp_path, empty_policy, &[sha]);
-    let _ = git_rw(dry, args.as_slice())?;
+    let _ = git_rw(execution_mode, args.as_slice())?;
     Ok(())
 }
 
 pub fn cherry_pick_range(
-    dry: bool,
+    execution_mode: ExecutionMode,
     tmp_path: &str,
     first: &str,
     last: &str,
@@ -296,7 +316,7 @@ pub fn cherry_pick_range(
 ) -> Result<()> {
     let range = format!("{first}^..{last}");
     let args = cherry_pick_args(tmp_path, empty_policy, &[range.as_str()]);
-    let _ = git_rw(dry, args.as_slice())?;
+    let _ = git_rw(execution_mode, args.as_slice())?;
     Ok(())
 }
 
@@ -306,14 +326,21 @@ pub fn tip_of_tmp(tmp_path: &str) -> Result<String> {
         .to_string())
 }
 
-pub fn reset_current_branch_to(dry: bool, new_tip: &str) -> Result<()> {
-    let _ = git_rw(dry, ["reset", "--hard", new_tip].as_slice())?;
+pub fn reset_current_branch_to(execution_mode: ExecutionMode, new_tip: &str) -> Result<()> {
+    let _ = git_rw(execution_mode, ["reset", "--hard", new_tip].as_slice())?;
     Ok(())
 }
 
-pub fn cleanup_temp_worktree(dry: bool, tmp_path: &str, tmp_branch: &str) -> Result<()> {
-    let _ = git_rw(dry, ["worktree", "remove", "-f", tmp_path].as_slice())?;
-    let _ = git_rw(dry, ["branch", "-D", tmp_branch].as_slice())?;
+pub fn cleanup_temp_worktree(
+    execution_mode: ExecutionMode,
+    tmp_path: &str,
+    tmp_branch: &str,
+) -> Result<()> {
+    let _ = git_rw(
+        execution_mode,
+        ["worktree", "remove", "-f", tmp_path].as_slice(),
+    )?;
+    let _ = git_rw(execution_mode, ["branch", "-D", tmp_branch].as_slice())?;
     Ok(())
 }
 
@@ -330,14 +357,14 @@ pub enum DeferredDirtyWorktreeRestore {
 impl DeferredDirtyWorktreeRestore {
     pub fn restore_after_success(
         self,
-        dry: bool,
+        execution_mode: ExecutionMode,
         command_name: &str,
         worktree_root: &str,
     ) -> Result<()> {
         match self {
             Self::Noop => Ok(()),
             Self::Stash { stash_commit } => restore_stash_in_worktree(
-                dry,
+                execution_mode,
                 command_name,
                 worktree_root,
                 &stash_commit,
@@ -407,7 +434,7 @@ fn status_line_has_conflict(line: &str) -> bool {
 }
 
 fn prepare_dirty_worktree(
-    dry: bool,
+    execution_mode: ExecutionMode,
     command_name: &str,
     policy: DirtyWorktreePolicy,
 ) -> Result<DirtyWorktreeRestore> {
@@ -435,7 +462,7 @@ fn prepare_dirty_worktree(
             command_name,
             status_lines.join("\n")
         );
-    } else if dry {
+    } else if execution_mode == ExecutionMode::DryRun {
         info!(
             "DRY-RUN: would stash local changes before {} because dirty_worktree=stash",
             command_name
@@ -444,7 +471,7 @@ fn prepare_dirty_worktree(
     } else {
         let message = format!("spr auto-stash before {}", command_name);
         let _ = git_rw(
-            false,
+            ExecutionMode::Apply,
             [
                 "stash",
                 "push",
@@ -484,11 +511,16 @@ impl DirtyWorktreeRestore {
         }
     }
 
-    fn restore(self, dry: bool, command_name: &str, outcome: RewriteOutcome) -> Result<()> {
+    fn restore(
+        self,
+        execution_mode: ExecutionMode,
+        command_name: &str,
+        outcome: RewriteOutcome,
+    ) -> Result<()> {
         match self {
             Self::Noop => Ok(()),
             Self::PlannedStash => {
-                if dry {
+                if execution_mode == ExecutionMode::DryRun {
                     info!(
                         "DRY-RUN: would restore stashed local changes after {}",
                         command_name
@@ -497,21 +529,21 @@ impl DirtyWorktreeRestore {
                 Ok(())
             }
             Self::Stashed { stash_commit } => {
-                restore_stash_in_worktree(dry, command_name, ".", &stash_commit, outcome)
+                restore_stash_in_worktree(execution_mode, command_name, ".", &stash_commit, outcome)
             }
         }
     }
 }
 
 fn restore_stash_in_worktree(
-    dry: bool,
+    execution_mode: ExecutionMode,
     command_name: &str,
     worktree_root: &str,
     stash_commit: &str,
     outcome: RewriteOutcome,
 ) -> Result<()> {
     let _ = git_rw(
-        false,
+        ExecutionMode::Apply,
         [
             "-C",
             worktree_root,
@@ -533,7 +565,7 @@ fn restore_stash_in_worktree(
     match stash_ref_for_commit_in_worktree(worktree_root, stash_commit)? {
         Some(stash_ref) => {
             if let Err(err) = git_rw(
-                false,
+                ExecutionMode::Apply,
                 ["-C", worktree_root, "stash", "drop", &stash_ref].as_slice(),
             ) {
                 warn!(
@@ -549,7 +581,7 @@ fn restore_stash_in_worktree(
             );
         }
     }
-    if dry {
+    if execution_mode == ExecutionMode::DryRun {
         info!(
             "DRY-RUN: restored stashed local changes after {}",
             command_name
@@ -580,7 +612,7 @@ fn stash_ref_for_commit_in_worktree(
 /// This is the single source of truth for commands that rebuild the
 /// checked-out branch and then replace it with a rewritten tip.
 pub fn with_dirty_worktree_policy<T, F>(
-    dry: bool,
+    execution_mode: ExecutionMode,
     command_name: &str,
     policy: DirtyWorktreePolicy,
     rewrite: F,
@@ -589,7 +621,7 @@ where
     T: DirtyWorktreeOutcome,
     F: FnOnce(DeferredDirtyWorktreeRestore) -> Result<T>,
 {
-    let restore = prepare_dirty_worktree(dry, command_name, policy)?;
+    let restore = prepare_dirty_worktree(execution_mode, command_name, policy)?;
     let deferred_restore = restore.deferred_restore();
     let rewrite_result = rewrite(deferred_restore);
     let restore_result = if rewrite_result
@@ -603,7 +635,7 @@ where
         } else {
             RewriteOutcome::Failed
         };
-        restore.restore(dry, command_name, outcome)
+        restore.restore(execution_mode, command_name, outcome)
     };
 
     match (rewrite_result, restore_result) {
@@ -708,6 +740,7 @@ mod tests {
         cleanup_temp_worktree, create_backup_tag, create_temp_worktree,
         get_current_branch_and_short,
     };
+    use crate::execution::ExecutionMode;
     use crate::test_support::{lock_cwd, DirGuard};
     use std::fs;
     use std::path::Path;
@@ -752,10 +785,10 @@ mod tests {
         let (cur_branch, short) =
             get_current_branch_and_short().expect("get current branch and short sha");
 
-        let backup =
-            create_backup_tag(false, "restack", &cur_branch, &short).expect("create backup");
-        let backup_again =
-            create_backup_tag(false, "restack", &cur_branch, &short).expect("overwrite backup");
+        let backup = create_backup_tag(ExecutionMode::Apply, "restack", &cur_branch, &short)
+            .expect("create backup");
+        let backup_again = create_backup_tag(ExecutionMode::Apply, "restack", &cur_branch, &short)
+            .expect("overwrite backup");
 
         assert_eq!(backup, backup_again, "backup name should be stable");
 
@@ -782,8 +815,9 @@ mod tests {
         let merge_base = git(&repo, ["rev-parse", "HEAD"].as_slice());
         let merge_base = merge_base.trim().to_string();
 
-        let (tmp_path, tmp_branch) = create_temp_worktree(false, "restack", &merge_base, &short)
-            .expect("create initial temp worktree");
+        let (tmp_path, tmp_branch) =
+            create_temp_worktree(ExecutionMode::Apply, "restack", &merge_base, &short)
+                .expect("create initial temp worktree");
 
         // Simulate a failed prior run that removed the worktree but left the
         // temp branch behind.
@@ -799,7 +833,7 @@ mod tests {
         );
 
         let (tmp_path_2, tmp_branch_2) =
-            create_temp_worktree(false, "restack", &merge_base, &short)
+            create_temp_worktree(ExecutionMode::Apply, "restack", &merge_base, &short)
                 .expect("recreate temp worktree after cleanup");
         assert_eq!(tmp_path, tmp_path_2, "temp path should be stable");
         assert_eq!(tmp_branch, tmp_branch_2, "temp branch should be stable");
@@ -808,7 +842,7 @@ mod tests {
             "temp worktree path should exist"
         );
 
-        cleanup_temp_worktree(false, &tmp_path_2, &tmp_branch_2)
+        cleanup_temp_worktree(ExecutionMode::Apply, &tmp_path_2, &tmp_branch_2)
             .expect("cleanup recreated temp worktree");
     }
 }

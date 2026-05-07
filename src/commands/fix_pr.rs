@@ -10,6 +10,7 @@ use crate::commands::rewrite_resume::{
     self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
 };
 use crate::config::DirtyWorktreePolicy;
+use crate::execution::ExecutionMode;
 use crate::git::git_rev_parse;
 use crate::git::git_ro;
 use crate::parsing::derive_local_groups_with_ignored;
@@ -51,7 +52,7 @@ pub fn fix_pr_tail(
     target: &GroupSelector,
     tail_count: usize,
     safe: bool,
-    dry: bool,
+    execution_mode: ExecutionMode,
     dirty_worktree_policy: DirtyWorktreePolicy,
 ) -> Result<RewriteCommandOutcome> {
     if tail_count == 0 {
@@ -146,7 +147,7 @@ pub fn fix_pr_tail(
         .ok_or_else(|| anyhow!("Could not locate last commit of PR {} in stream", target_n))?;
 
     common::with_dirty_worktree_policy(
-        dry,
+        execution_mode,
         "spr fix-pr",
         dirty_worktree_policy,
         |deferred_dirty_worktree_restore| {
@@ -154,14 +155,14 @@ pub fn fix_pr_tail(
             let original_head = git_rev_parse("HEAD")?;
             let original_worktree_root = rewrite_resume::current_repo_root()?;
             let resume_path = rewrite_resume::prepare_resume_path_for_new_session(
-                dry,
+                execution_mode,
                 RewriteCommandKind::FixPr,
                 &cur_branch,
                 &original_head,
             )?;
             let backup_tag = if safe {
                 Some(common::create_backup_tag(
-                    dry,
+                    execution_mode,
                     "fix-pr",
                     &cur_branch,
                     &short,
@@ -171,29 +172,29 @@ pub fn fix_pr_tail(
             };
 
             let (tmp_path, tmp_branch) =
-                common::create_temp_worktree(dry, "fix", &merge_base, &short)?;
+                common::create_temp_worktree(execution_mode, "fix", &merge_base, &short)?;
             let operations = build_fix_pr_operations(&all_commits, &top_commits, insert_pos);
             rewrite_resume::run_rewrite_session(
-            dry,
-            RewriteSession {
-                command_kind: RewriteCommandKind::FixPr,
-                conflict_policy: RewriteConflictPolicy::Suspend,
-                original_worktree_root,
-                original_branch: cur_branch,
-                original_head,
-                resume_path,
-                temp_branch: tmp_branch,
-                temp_worktree_path: tmp_path,
-                backup_tag,
-                operations,
-                deferred_dirty_worktree_restore,
-                post_success_hint: Some(
-                    "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
-                        .to_string(),
-                ),
-                metadata_refresh_context: Some(metadata_context.clone()),
-            },
-        )
+                execution_mode,
+                RewriteSession {
+                    command_kind: RewriteCommandKind::FixPr,
+                    conflict_policy: RewriteConflictPolicy::Suspend,
+                    original_worktree_root,
+                    original_branch: cur_branch,
+                    original_head,
+                    resume_path,
+                    temp_branch: tmp_branch,
+                    temp_worktree_path: tmp_path,
+                    backup_tag,
+                    operations,
+                    deferred_dirty_worktree_restore,
+                    post_success_hint: Some(
+                        "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
+                            .to_string(),
+                    ),
+                    metadata_refresh_context: Some(metadata_context.clone()),
+                },
+            )
         },
     )
 }
@@ -204,6 +205,7 @@ mod tests {
     use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
     use crate::commands::RewriteCommandOutcome;
     use crate::config::DirtyWorktreePolicy;
+    use crate::execution::ExecutionMode;
     use crate::parsing::Group;
     use crate::selectors::{GroupSelector, StableHandle};
     use crate::test_support::{lock_cwd, DirGuard};
@@ -352,7 +354,7 @@ mod tests {
             &GroupSelector::LocalPr(1),
             1,
             false,
-            false,
+            ExecutionMode::Apply,
             DirtyWorktreePolicy::Discard,
         )
         .expect("fix-pr should rewrite under discard policy");
@@ -391,7 +393,7 @@ mod tests {
             &GroupSelector::LocalPr(1),
             1,
             false,
-            false,
+            ExecutionMode::Apply,
             DirtyWorktreePolicy::Stash,
         )
         .expect("fix-pr should rewrite and restore stashed changes");
@@ -433,7 +435,7 @@ mod tests {
             &GroupSelector::LocalPr(1),
             1,
             false,
-            false,
+            ExecutionMode::Apply,
             DirtyWorktreePolicy::Stash,
         )
         .expect("fix-pr should suspend under stash policy");
@@ -482,7 +484,7 @@ mod tests {
                 Path::new(&resume_state.temp_worktree_path),
                 ["add", "story.txt"].as_slice(),
             );
-            current = resume_rewrite(false, &resume_path).expect("resume fix-pr");
+            current = resume_rewrite(&resume_path).expect("resume fix-pr");
         }
 
         assert_eq!(current, RewriteCommandOutcome::Completed);
@@ -517,7 +519,7 @@ mod tests {
             &GroupSelector::LocalPr(1),
             1,
             false,
-            false,
+            ExecutionMode::Apply,
             DirtyWorktreePolicy::Halt,
         )
         .expect_err("halt policy should refuse a dirty worktree");
@@ -557,7 +559,7 @@ mod tests {
             &GroupSelector::LocalPr(1),
             1,
             false,
-            false,
+            ExecutionMode::Apply,
             DirtyWorktreePolicy::Halt,
         )
         .expect("fix-pr should suspend");
@@ -594,7 +596,7 @@ mod tests {
                 ["add", "story.txt"].as_slice(),
             );
             last_resume_path = Some(resume_path.clone());
-            current = resume_rewrite(false, &resume_path).expect("resume fix-pr");
+            current = resume_rewrite(&resume_path).expect("resume fix-pr");
         }
 
         assert_eq!(current, RewriteCommandOutcome::Completed);

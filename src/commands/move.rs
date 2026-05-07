@@ -10,6 +10,7 @@ use crate::commands::rewrite_resume::{
     self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
 };
 use crate::config::DirtyWorktreePolicy;
+use crate::execution::ExecutionMode;
 use crate::git::git_rev_parse;
 use crate::github::get_open_pr_automerge_for_head;
 use crate::parsing::derive_local_groups_with_ignored;
@@ -21,7 +22,7 @@ use crate::selectors::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoveExecutionOptions {
     pub safe: bool,
-    pub dry: bool,
+    pub execution_mode: ExecutionMode,
     pub dirty_worktree_policy: DirtyWorktreePolicy,
 }
 
@@ -210,7 +211,7 @@ pub fn move_groups_after(
     }
 
     common::with_dirty_worktree_policy(
-        options.dry,
+        options.execution_mode,
         "spr move",
         options.dirty_worktree_policy,
         |deferred_dirty_worktree_restore| {
@@ -218,14 +219,14 @@ pub fn move_groups_after(
             let original_head = git_rev_parse("HEAD")?;
             let original_worktree_root = rewrite_resume::current_repo_root()?;
             let resume_path = rewrite_resume::prepare_resume_path_for_new_session(
-                options.dry,
+                options.execution_mode,
                 RewriteCommandKind::Move,
                 &cur_branch,
                 &original_head,
             )?;
             let backup_tag = if options.safe {
                 Some(common::create_backup_tag(
-                    options.dry,
+                    options.execution_mode,
                     "move",
                     &cur_branch,
                     &short,
@@ -235,10 +236,10 @@ pub fn move_groups_after(
             };
 
             let (tmp_path, tmp_branch) =
-                common::create_temp_worktree(options.dry, "move", &merge_base, &short)?;
+                common::create_temp_worktree(options.execution_mode, "move", &merge_base, &short)?;
             let operations = build_move_operations(&leading_ignored, &groups, &new_order);
             rewrite_resume::run_rewrite_session(
-                options.dry,
+                options.execution_mode,
                 RewriteSession {
                     command_kind: RewriteCommandKind::Move,
                     conflict_policy: RewriteConflictPolicy::Suspend,
@@ -277,6 +278,7 @@ mod tests {
     use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
     use crate::commands::{move_groups_after, MoveExecutionOptions, RewriteCommandOutcome};
     use crate::config::DirtyWorktreePolicy;
+    use crate::execution::ExecutionMode;
     use crate::parsing::Group;
     use crate::selectors::{AfterSelector, GroupRangeSelector, GroupSelector, StableHandle};
     use crate::test_support::{commit_file, git, lock_cwd, log_subjects, write_file, DirGuard};
@@ -426,7 +428,7 @@ mod tests {
             &AfterSelector::Group(GroupSelector::LocalPr(1)),
             MoveExecutionOptions {
                 safe: false,
-                dry: false,
+                execution_mode: ExecutionMode::Apply,
                 dirty_worktree_policy: DirtyWorktreePolicy::Halt,
             },
         )
@@ -464,7 +466,7 @@ mod tests {
                 ["add", "story.txt"].as_slice(),
             );
             last_resume_path = Some(resume_path.clone());
-            current = resume_rewrite(false, &resume_path).expect("resume move");
+            current = resume_rewrite(&resume_path).expect("resume move");
         }
 
         assert_eq!(current, RewriteCommandOutcome::Completed);
