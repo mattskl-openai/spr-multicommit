@@ -124,6 +124,10 @@ pub enum Cmd {
         #[arg(long)]
         safe: bool,
 
+        /// Print the resolved high-level restack plan and do not fetch, rewrite, or publish
+        #[arg(long)]
+        preview: bool,
+
         #[command(flatten)]
         output: OutputArgs,
     },
@@ -416,6 +420,35 @@ mod tests {
 
         let list = Cli::try_parse_from(["spr", "list", "--json", "pr"]).unwrap();
         assert_eq!(list.cmd.output_format(), OutputFormat::Json);
+    }
+
+    #[test]
+    fn restack_preview_flag_parses_with_json_and_safe() {
+        let cli = Cli::try_parse_from([
+            "spr",
+            "restack",
+            "--after",
+            "pr:alpha",
+            "--safe",
+            "--preview",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.cmd {
+            Cmd::Restack {
+                after,
+                safe,
+                preview,
+                output,
+            } => {
+                assert_eq!(after.to_string(), "pr:alpha");
+                assert!(safe);
+                assert!(preview);
+                assert_eq!(output.format(), OutputFormat::Json);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
     }
 
     #[test]

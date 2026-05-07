@@ -29,7 +29,7 @@ pub use prep::{prep_squash, print_prep_summary};
 pub use r#move::{move_groups_after, MoveExecutionOptions};
 pub use relink_prs::{print_relink_prs_summary, relink_prs};
 pub use resolve_stack::{looks_like_pr_url, resolve_stack, ResolveStackOutput};
-pub use restack::{restack_after, restack_after_count};
+pub use restack::{preview_restack_after, restack_after, restack_after_count};
 pub use rewrite_resume::{
     resume_rewrite, RewriteCommandKind, RewriteCommandOutcome, RewriteSuspendedState,
 };

@@ -57,6 +57,16 @@ pub enum AfterSelector {
     Group(GroupSelector),
 }
 
+impl Display for AfterSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bottom => write!(f, "bottom"),
+            Self::Top => write!(f, "top"),
+            Self::Group(selector) => write!(f, "{selector}"),
+        }
+    }
+}
+
 /// A selector for moving either one group or an inclusive range of groups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupRangeSelector {
