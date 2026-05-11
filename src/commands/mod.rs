@@ -13,7 +13,9 @@ pub mod restack;
 pub mod rewrite_resume;
 pub mod update;
 
-pub use absorb::{absorb_branch_tails, AbsorbOptions, CopiedLaterStackCommitPolicy};
+pub use absorb::{
+    absorb_branch_tails, query_absorb_changed_branches, AbsorbOptions, CopiedLaterStackCommitPolicy,
+};
 pub use cleanup::{cleanup_remote_branches, print_cleanup_summary};
 pub use drop_merged_prefix::drop_merged_prefix;
 pub use fix_pr::fix_pr_tail;

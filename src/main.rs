@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::execution::ExecutionMode;
 
+mod absorb_output;
 mod branch_names;
 mod cli;
 mod commands;
@@ -91,6 +92,7 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
 #[derive(Debug)]
 enum CommandOutput {
     None,
+    AbsorbQuery(crate::absorb_output::AbsorbChangedBranchesOutput),
     Machine(crate::machine_output::MachineOutput),
     ReadOnly(crate::read_only_output::ReadOnlyOutput),
     RestackPreview(crate::restack_output::RestackPreviewOutput),
@@ -572,11 +574,11 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             )?))
         }
         crate::cli::Cmd::Absorb {
+            from,
             allow_replayed_duplicates,
+            query_changed_branches,
             dry_run,
         } => {
-            let execution_mode = ExecutionMode::from(dry_run);
-            set_dry_run_env(execution_mode, false);
             let options = crate::commands::AbsorbOptions {
                 copied_later_stack_commit_policy: if allow_replayed_duplicates {
                     crate::commands::CopiedLaterStackCommitPolicy::AllowKeepNonSeedDuplicates
@@ -584,10 +586,25 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     crate::commands::CopiedLaterStackCommitPolicy::Block
                 },
             };
+            if query_changed_branches {
+                let changed_branches = crate::commands::query_absorb_changed_branches(
+                    &base,
+                    &prefix,
+                    &ignore_tag,
+                    from.as_ref(),
+                    options,
+                )?;
+                return Ok(CommandOutput::AbsorbQuery(
+                    crate::absorb_output::changed_branches(changed_branches),
+                ));
+            }
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
             let outcome = crate::commands::absorb_branch_tails(
                 &base,
                 &prefix,
                 &ignore_tag,
+                from.as_ref(),
                 execution_mode,
                 dirty_worktree_policy,
                 options,
@@ -970,6 +987,13 @@ fn main() {
     match run_cli(cli, output_format) {
         Ok(output) => match output {
             CommandOutput::None => {}
+            CommandOutput::AbsorbQuery(output) => {
+                if output_format == crate::cli::OutputFormat::Json {
+                    exit_with_json(&output, output.exit_code());
+                } else {
+                    println!("{}", output.render_human());
+                }
+            }
             CommandOutput::Machine(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
                     exit_with_json(&output, output.exit_code());
@@ -1188,7 +1212,9 @@ mod tests {
     #[test]
     fn absorb_is_local_only_for_tool_checks() {
         assert!(!command_requires_gh(&crate::cli::Cmd::Absorb {
+            from: None,
             allow_replayed_duplicates: false,
+            query_changed_branches: false,
             dry_run: DryRunArgs::default(),
         }));
     }

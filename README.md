@@ -287,6 +287,8 @@ Behavior:
 - On cherry-pick conflict, `spr absorb` suspends the rewrite, leaves the temp worktree in place, and prints `spr resume <path>`
 - Does not update GitHub; inspect the rewritten stack first, then run `spr update`
 - When `local_pr_branches` is enabled, synchronizes local synthetic PR branches to the absorbed stack's final group tips after the local rewrite succeeds. A branch checked out in any worktree is reported as blocked and is not moved.
+- `--from <N|label|pr:<label>>` constrains absorb to one explicit selected-and-higher suffix.
+- `--query-changed-branches --json` reports the stack branch plus every synthetic PR branch whose logical tip would change if the absorb rewrite ran, without creating backup tags, temp worktrees, or rewrite side effects. When paired with `--from`, it reports the full selected suffix even when only some branches currently have absorbable tails, so callers can query and apply one stable transaction boundary.
 
 Typical workflow:
 
@@ -306,6 +308,13 @@ Override example for intentionally keeping both an earlier copied follow-up comm
 
 ```bash
 spr absorb --allow-replayed-duplicates
+
+# Query the branch names that an absorb rewrite would change without rewriting anything.
+spr absorb --query-changed-branches --json
+
+# For a planned lower-group fix, query and apply the same explicit suffix.
+spr absorb --from pr:beta --query-changed-branches --json
+spr absorb --from pr:beta --json
 ```
 
 ### spr resolve-stack

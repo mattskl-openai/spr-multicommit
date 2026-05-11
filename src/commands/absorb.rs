@@ -22,11 +22,12 @@ use crate::commands::rewrite_resume::{
 use crate::config::DirtyWorktreePolicy;
 use crate::execution::ExecutionMode;
 use crate::git::{
-    git_commit_message, git_commit_parent_count, git_commit_tree, git_is_ancestor,
-    git_local_branch_tip, git_merge_base, git_patch_ids_for_commits, git_rev_list_range,
-    git_rev_parse,
+    git_commit_message, git_commit_parent_count, git_commit_tree, git_current_branch,
+    git_is_ancestor, git_local_branch_tip, git_merge_base, git_patch_ids_for_commits,
+    git_rev_list_range, git_rev_parse,
 };
 use crate::parsing::{derive_local_groups_with_ignored, Group};
+use crate::selectors::{resolve_group_index, GroupSelector};
 
 /// Rebuilds the current stack branch by folding append-only local per-PR branch
 /// tails back into their owning PR groups.
@@ -47,11 +48,13 @@ pub fn absorb_branch_tails(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
+    from: Option<&GroupSelector>,
     execution_mode: ExecutionMode,
     dirty_worktree_policy: DirtyWorktreePolicy,
     options: AbsorbOptions,
 ) -> Result<RewriteCommandOutcome> {
-    let (_stack_head, plan) = build_plan_for_current_stack(base, prefix, ignore_tag, options)?;
+    let (_stack_head, plan) =
+        build_plan_for_current_stack(base, prefix, ignore_tag, from, options)?;
     let validation = validate_absorb_plan(&plan);
     if !matches!(validation, AbsorbPlanValidation::NoGroups) {
         emit_absorb_summary(&plan);
@@ -78,6 +81,52 @@ pub fn absorb_branch_tails(
             dirty_worktree_policy,
         ),
     }
+}
+
+/// Returns the local branch names the current absorb transaction may move.
+///
+/// A tail inserted into an earlier group rewrites that group and every later
+/// group in the stack, even if optional local synthetic-branch synchronization
+/// is disabled for the actual command. Untargeted queries return the realized
+/// changed suffix. Targeted queries return the requested suffix so callers can
+/// protect the whole transaction boundary before running apply mode.
+pub fn query_absorb_changed_branches(
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+    from: Option<&GroupSelector>,
+    options: AbsorbOptions,
+) -> Result<Vec<String>> {
+    let (_stack_head, plan) =
+        build_plan_for_current_stack(base, prefix, ignore_tag, from, options)?;
+    match validate_absorb_plan(&plan) {
+        AbsorbPlanValidation::NoGroups => Ok(Vec::new()),
+        AbsorbPlanValidation::NoAbsorbableGroups if plan.requested_start_index.is_some() => {
+            changed_branches_for_plan(prefix, &plan)
+        }
+        AbsorbPlanValidation::NoAbsorbableGroups => Ok(Vec::new()),
+        AbsorbPlanValidation::Blocked { lines } => Err(anyhow!(
+            "Refusing to query changed branches until blocking branches are fixed:\n{}",
+            lines.join("\n")
+        )),
+        AbsorbPlanValidation::ReadyToRewrite => changed_branches_for_plan(prefix, &plan),
+    }
+}
+
+fn changed_branches_for_plan(prefix: &str, plan: &RewritePlan) -> Result<Vec<String>> {
+    let first_changed_group = plan.requested_start_index.unwrap_or_else(|| {
+        plan.groups
+            .iter()
+            .position(|group| group.source.is_absorbable())
+            .expect("ready-to-rewrite absorb plan should contain an absorbable group")
+    });
+    let mut changed_branches = vec![git_current_branch()?];
+    changed_branches.extend(
+        plan.groups[first_changed_group..]
+            .iter()
+            .map(|group| synthetic_branch_name(prefix, &group.group.tag)),
+    );
+    Ok(changed_branches)
 }
 
 /// CLI-configurable behavior switches for `spr absorb`.
@@ -109,6 +158,7 @@ struct RewritePlan {
     merge_base: String,
     leading_ignored: Vec<String>,
     groups: Vec<GroupRewritePlan>,
+    requested_start_index: Option<usize>,
     operations: Vec<CherryPickOp>,
 }
 
@@ -290,6 +340,7 @@ struct AbsorbTail {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AbsorbSkipReason {
+    BeforeRequestedSuffix,
     MissingBranch,
     Unchanged,
     RewrittenEquivalentPrefix,
@@ -299,6 +350,7 @@ enum AbsorbSkipReason {
 impl std::fmt::Display for AbsorbSkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BeforeRequestedSuffix => write!(f, "before requested suffix"),
             Self::MissingBranch => write!(f, "missing local branch"),
             Self::Unchanged => write!(f, "branch unchanged"),
             Self::RewrittenEquivalentPrefix => write!(f, "rewritten-equivalent prefix"),
@@ -403,9 +455,13 @@ fn build_plan_for_current_stack(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
+    from: Option<&GroupSelector>,
     options: AbsorbOptions,
 ) -> Result<(String, RewritePlan)> {
     let (merge_base, leading_ignored, groups) = derive_local_groups_with_ignored(base, ignore_tag)?;
+    let requested_start_index = from
+        .map(|selector| resolve_group_index(&groups, selector))
+        .transpose()?;
     if groups.is_empty() {
         Ok((
             git_rev_parse("HEAD")?,
@@ -413,6 +469,7 @@ fn build_plan_for_current_stack(
                 merge_base,
                 leading_ignored,
                 groups: Vec::new(),
+                requested_start_index: None,
                 operations: Vec::new(),
             },
         ))
@@ -421,8 +478,14 @@ fn build_plan_for_current_stack(
         let stack_head = git_rev_parse("HEAD")?;
         let preliminary_group_plans = groups
             .into_iter()
+            .enumerate()
             .map(|group| {
-                build_preliminary_group_rewrite_plan(group, prefix, &merge_base, &stack_head)
+                let (index, group) = group;
+                if requested_start_index.is_some_and(|start| index < start) {
+                    build_out_of_scope_group_rewrite_plan(group, prefix)
+                } else {
+                    build_preliminary_group_rewrite_plan(group, prefix, &merge_base, &stack_head)
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         let later_owned_patch_maps = build_later_owned_patch_maps(&preliminary_group_plans)?;
@@ -440,10 +503,36 @@ fn build_plan_for_current_stack(
                 merge_base,
                 leading_ignored,
                 groups: group_plans,
+                requested_start_index,
                 operations,
             },
         ))
     }
+}
+
+fn build_out_of_scope_group_rewrite_plan(
+    group: Group,
+    prefix: &str,
+) -> Result<PreliminaryGroupRewritePlan> {
+    let tag = group.tag.clone();
+    let branch_name = synthetic_branch_name(prefix, &group.tag);
+    let group_tip = group
+        .commits
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow!("Group {} has no commits", group.tag))?;
+    Ok(PreliminaryGroupRewritePlan {
+        group,
+        source: PreliminarySourceBranchRecord {
+            tag,
+            branch_name,
+            group_tip,
+            source_tip: None,
+            classification: PreliminaryAbsorbClassification::Resolved(AbsorbClassification::Skip(
+                AbsorbSkipReason::BeforeRequestedSuffix,
+            )),
+        },
+    })
 }
 
 fn build_preliminary_group_rewrite_plan(
@@ -1079,10 +1168,10 @@ fn short_sha(sha: &str) -> &str {
 mod tests {
     use super::{
         absorb_branch_tails, build_plan_for_current_stack, build_rewrite_operations,
-        validate_absorb_plan, AbsorbBlocker, AbsorbClassification, AbsorbOptions,
-        AbsorbPlanValidation, AbsorbSkipReason, AbsorbTail, CopiedLaterStackCommitPolicy,
-        GroupRewritePlan, LaterReplayedCommit, LaterReplayedCommitKind, RewritePlan,
-        SourceBranchRecord,
+        query_absorb_changed_branches, validate_absorb_plan, AbsorbBlocker, AbsorbClassification,
+        AbsorbOptions, AbsorbPlanValidation, AbsorbSkipReason, AbsorbTail,
+        CopiedLaterStackCommitPolicy, GroupRewritePlan, LaterReplayedCommit,
+        LaterReplayedCommitKind, RewritePlan, SourceBranchRecord,
     };
     use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp};
     use crate::commands::rewrite_resume::{resume_rewrite, RewriteResumeState};
@@ -1090,6 +1179,7 @@ mod tests {
     use crate::config::DirtyWorktreePolicy;
     use crate::execution::ExecutionMode;
     use crate::parsing::{derive_local_groups_with_ignored, Group};
+    use crate::selectors::{GroupSelector, StableHandle};
     use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
     use std::env;
     use std::fs;
@@ -1195,6 +1285,7 @@ mod tests {
             "main",
             "dank-spr/",
             "ignore",
+            None,
             ExecutionMode::DryRun,
             DirtyWorktreePolicy::Halt,
             AbsorbOptions::default(),
@@ -1540,6 +1631,7 @@ mod tests {
             &repo.base_branch,
             &repo.prefix,
             &repo.ignore_tag,
+            None,
             options,
         )
         .unwrap();
@@ -1841,6 +1933,7 @@ mod tests {
                 },
                 ..blocked_group
             }],
+            requested_start_index: None,
             operations: Vec::new(),
         };
 
@@ -1974,6 +2067,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
+                None,
                 ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
@@ -2006,6 +2100,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
+                None,
                 ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
@@ -2044,6 +2139,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
+                None,
                 ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
@@ -2084,6 +2180,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
+                None,
                 ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 absorb_override_options(),
@@ -2180,6 +2277,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
+                None,
                 ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
@@ -2282,6 +2380,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
+                None,
                 ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
@@ -2319,6 +2418,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
+                None,
                 ExecutionMode::Apply,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
@@ -2354,6 +2454,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
+                None,
                 ExecutionMode::DryRun,
                 crate::config::DirtyWorktreePolicy::Discard,
                 default_absorb_options(),
@@ -2396,6 +2497,7 @@ mod tests {
                 &repo.base_branch,
                 &repo.prefix,
                 &repo.ignore_tag,
+                None,
                 ExecutionMode::Apply,
                 DirtyWorktreePolicy::Halt,
                 default_absorb_options(),
@@ -2464,6 +2566,7 @@ mod tests {
             &repo.base_branch,
             &repo.prefix,
             &repo.ignore_tag,
+            None,
             default_absorb_options(),
         )
         .unwrap();
@@ -2472,6 +2575,168 @@ mod tests {
         assert!(
             plan.operations.len() >= 4,
             "rewrite plan should include leading replay plus group operations"
+        );
+    }
+
+    #[test]
+    fn changed_branch_query_reports_rewritten_suffix_without_side_effects() {
+        let _lock = lock_cwd();
+        let repo = setup_three_group_stack();
+        let _keep_dir_alive = repo.dir.path();
+        let original_head = rev_parse(&repo.repo, "HEAD");
+        let _alpha_branch_tip = append_commit_to_branch(
+            &repo.repo,
+            "dank-spr/alpha",
+            "alpha.txt",
+            "alpha-1\nalpha-2\nalpha-branch\n",
+            "feat: alpha branch tail",
+        );
+        git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
+
+        let _guard = DirGuard::change_to(&repo.repo);
+        let changed_branches = query_absorb_changed_branches(
+            &repo.base_branch,
+            &repo.prefix,
+            &repo.ignore_tag,
+            None,
+            default_absorb_options(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            changed_branches,
+            vec![
+                repo.stack_branch.clone(),
+                "dank-spr/alpha".to_string(),
+                "dank-spr/beta".to_string(),
+                "dank-spr/gamma".to_string(),
+            ]
+        );
+        assert_eq!(rev_parse(&repo.repo, "HEAD"), original_head);
+        assert!(tags_with_pattern(&repo.repo, "backup/absorb/*").is_empty());
+        assert!(branches_with_pattern(&repo.repo, "spr/tmp-absorb-*").is_empty());
+    }
+
+    #[test]
+    fn targeted_changed_branch_query_reports_requested_suffix() {
+        let _lock = lock_cwd();
+        let repo = setup_three_group_stack();
+        let _keep_dir_alive = repo.dir.path();
+        let _alpha_branch_tip = append_commit_to_branch(
+            &repo.repo,
+            "dank-spr/alpha",
+            "alpha.txt",
+            "alpha-1\nalpha-2\nalpha-branch\n",
+            "feat: alpha branch tail",
+        );
+        git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
+
+        let from = GroupSelector::Stable(StableHandle {
+            tag: "beta".to_string(),
+        });
+        let _guard = DirGuard::change_to(&repo.repo);
+        let changed_branches = query_absorb_changed_branches(
+            &repo.base_branch,
+            &repo.prefix,
+            &repo.ignore_tag,
+            Some(&from),
+            default_absorb_options(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            changed_branches,
+            vec![
+                repo.stack_branch.clone(),
+                "dank-spr/beta".to_string(),
+                "dank-spr/gamma".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn targeted_absorb_ignores_lower_tails_and_absorbs_suffix_tails() {
+        let _lock = lock_cwd();
+        let repo = setup_three_group_stack();
+        let _keep_dir_alive = repo.dir.path();
+        let _alpha_branch_tip = append_commit_to_branch(
+            &repo.repo,
+            "dank-spr/alpha",
+            "alpha.txt",
+            "alpha-1\nalpha-2\nalpha-branch\n",
+            "feat: alpha branch tail",
+        );
+        let _beta_branch_tip = append_commit_to_branch(
+            &repo.repo,
+            "dank-spr/beta",
+            "beta.txt",
+            "beta-1\nbeta-branch\n",
+            "feat: beta branch tail",
+        );
+        let _gamma_branch_tip = append_commit_to_branch(
+            &repo.repo,
+            "dank-spr/gamma",
+            "gamma.txt",
+            "gamma-1\ngamma-branch\n",
+            "feat: gamma branch tail",
+        );
+        git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
+
+        let from = GroupSelector::Stable(StableHandle {
+            tag: "beta".to_string(),
+        });
+        {
+            let _guard = DirGuard::change_to(&repo.repo);
+            absorb_branch_tails(
+                &repo.base_branch,
+                &repo.prefix,
+                &repo.ignore_tag,
+                Some(&from),
+                ExecutionMode::Apply,
+                crate::config::DirtyWorktreePolicy::Discard,
+                default_absorb_options(),
+            )
+            .unwrap();
+        }
+
+        let _guard = DirGuard::change_to(&repo.repo);
+        let (_merge_base, leading_ignored, groups) =
+            derive_local_groups_with_ignored(&repo.base_branch, &repo.ignore_tag).unwrap();
+        assert!(leading_ignored.is_empty());
+        assert_eq!(groups[0].commits.len(), 2, "alpha should remain unchanged");
+        assert_eq!(groups[1].commits.len(), 2, "beta should absorb its tail");
+        assert_eq!(groups[2].commits.len(), 2, "gamma should absorb its tail");
+        assert_ne!(
+            rev_parse(&repo.repo, "dank-spr/alpha"),
+            *groups[0].commits.last().unwrap(),
+            "the lower alpha tail should remain pending after targeted absorb"
+        );
+    }
+
+    #[test]
+    fn targeted_absorb_rejects_missing_selector() {
+        let _lock = lock_cwd();
+        let repo = setup_three_group_stack();
+        let _keep_dir_alive = repo.dir.path();
+        git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
+
+        let from = GroupSelector::Stable(StableHandle {
+            tag: "missing".to_string(),
+        });
+        let _guard = DirGuard::change_to(&repo.repo);
+        let err = query_absorb_changed_branches(
+            &repo.base_branch,
+            &repo.prefix,
+            &repo.ignore_tag,
+            Some(&from),
+            default_absorb_options(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("No outstanding PR group matches stable handle `pr:missing`."),
+            "unexpected error: {err}"
         );
     }
 
