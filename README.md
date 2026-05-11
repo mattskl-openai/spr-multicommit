@@ -251,7 +251,6 @@ Typical workflow:
 
 ```bash
 # After GitHub auto-merges the bottom PR:
-git fetch origin
 spr drop-merged-prefix --safe
 spr status
 spr update
@@ -261,7 +260,7 @@ Behavior:
 
 - Reads open/merged GitHub PR state for the local stack's synthetic PR branches
 - Selects only the contiguous bottom prefix whose PRs are `MERGED`; if the bottom PR is still open, nothing is rewritten
-- Fetches each dropped PR's GitHub merge commit OID and verifies that commit is already an ancestor of the configured SPR base, such as `origin/main`
+- Refreshes `origin`, then fetches each dropped PR's GitHub merge commit OID and verifies that commit is already an ancestor of the configured SPR base, such as `origin/main`
 - Uses a fast native Git rewrite for the common case, so the checked-out stack branch starts at the first still-open PR group on top of the updated base
 - Falls back to the existing `spr restack` replay when it must preserve ignored local commits from the dropped prefix, or when native rebase cannot complete cleanly
 - With `--safe`, creates a local backup tag named like `backup/drop-merged-prefix/<current-branch>-<short-sha>` before moving the branch
