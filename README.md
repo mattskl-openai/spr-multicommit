@@ -199,7 +199,7 @@ Behavior:
   by case, because those names are unsafe on case-insensitive filesystems
 - Updates PR bodies with a visualized stack block and correct `baseRefName`
   - When `pr_description_mode` is `stack_only`, only the stack block (between markers) is updated; the rest of the body is preserved
-  - May temporarily set existing PR bases to the repo base while pushing, then re-chain them to match the local stack
+  - After publishing branch heads, reconciles each PR base directly to the local stack chain
 - When `local_pr_branches` is enabled, synchronizes local branches named exactly like each group's resolved concrete branch after the update succeeds. `update-existing` only moves existing local branches; `create-or-update` also creates missing ones.
 
 ### spr restack
