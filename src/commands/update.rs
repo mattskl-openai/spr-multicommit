@@ -116,6 +116,40 @@ fn pr_number_for_head(
     prs_by_head.get(&head_key(head)).copied()
 }
 
+fn open_pr_state_for_heads(
+    heads: &[String],
+) -> Result<(
+    HashMap<CanonicalBranchConflictKey, u64>,
+    HashMap<u64, String>,
+)> {
+    let mut prs_by_head = HashMap::new();
+    let mut current_base_by_number = HashMap::new();
+    for pr in list_open_prs_for_heads(heads)? {
+        prs_by_head.insert(head_key(&pr.head), pr.number);
+        current_base_by_number.insert(pr.number, pr.base);
+    }
+    Ok((prs_by_head, current_base_by_number))
+}
+
+fn planned_base_updates(
+    current_base_by_number: &HashMap<u64, String>,
+    desired_base_by_number: &HashMap<u64, String>,
+) -> Vec<u64> {
+    let mut numbers = desired_base_by_number
+        .iter()
+        .filter_map(|(number, desired_base)| {
+            let desired_base_ref = sanitize_gh_base_ref(desired_base);
+            current_base_by_number
+                .get(number)
+                .map(|base_ref| sanitize_gh_base_ref(base_ref) != desired_base_ref)
+                .unwrap_or(true)
+                .then_some(*number)
+        })
+        .collect::<Vec<_>>();
+    numbers.sort_unstable();
+    numbers
+}
+
 /// Fail `spr update` early when branch-name reuse matches a recently closed or merged PR.
 ///
 /// The guard only runs when PR creation is enabled, the CLI override is not set, and the
@@ -449,14 +483,11 @@ fn build_from_groups_internal(
         .iter()
         .map(|identity| identity.exact.clone())
         .collect();
-    let mut prs_by_head: HashMap<CanonicalBranchConflictKey, u64> = HashMap::new();
-    let mut current_base_by_number: HashMap<u64, String> = HashMap::new();
-    if !no_pr {
-        for pr in list_open_prs_for_heads(&heads)? {
-            prs_by_head.insert(head_key(&pr.head), pr.number);
-            current_base_by_number.insert(pr.number, pr.base);
-        }
-    }
+    let (mut prs_by_head, mut current_base_by_number) = if no_pr {
+        (HashMap::new(), HashMap::new())
+    } else {
+        open_pr_state_for_heads(&heads)?
+    };
     enforce_branch_reuse_guard(
         no_pr,
         allow_branch_reuse,
@@ -509,82 +540,6 @@ fn build_from_groups_internal(
             remote_exists: remote_head.is_some(),
             kind,
         });
-    }
-
-    if !no_pr {
-        let mut numbers_full_pre: Vec<u64> = vec![];
-        let mut head_by_number_pre: HashMap<u64, String> = HashMap::new();
-        for identity in &branch_identities {
-            if let Some(number) = pr_number_for_head(&prs_by_head, &identity.exact) {
-                numbers_full_pre.push(number);
-                head_by_number_pre.insert(number, identity.exact.clone());
-            }
-        }
-        if !numbers_full_pre.is_empty() {
-            let mut desired_base_by_number_pre: HashMap<u64, String> = HashMap::new();
-            for (head, want_base) in &desired_base_by_head {
-                if let Some(number) = pr_number_for_head(&prs_by_head, head) {
-                    desired_base_by_number_pre.insert(number, want_base.clone());
-                }
-            }
-
-            let mut all_correct = true;
-            for (number, want_base) in &desired_base_by_number_pre {
-                let want_base_ref = sanitize_gh_base_ref(want_base);
-                if current_base_by_number
-                    .get(number)
-                    .map(|base_ref| sanitize_gh_base_ref(base_ref) != want_base_ref)
-                    .unwrap_or(true)
-                {
-                    all_correct = false;
-                    break;
-                }
-            }
-
-            if !all_correct {
-                let bodies_by_number_pre = fetch_pr_bodies_graphql(&numbers_full_pre)?;
-                let mut base_updates_pre: Vec<String> = Vec::new();
-                for (number, info) in bodies_by_number_pre.iter() {
-                    let base_target = sanitize_gh_base_ref(base);
-                    if current_base_by_number
-                        .get(number)
-                        .map(|base_ref| sanitize_gh_base_ref(base_ref) == base_target)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let mut shas_equal = false;
-                    if let Some(head_branch) = head_by_number_pre.get(number) {
-                        if let (Some(head_sha), Some(base_sha)) =
-                            (remote_map.get(head_branch), remote_map.get(&base_target))
-                        {
-                            if head_sha == base_sha {
-                                shas_equal = true;
-                            }
-                        }
-                    }
-                    if shas_equal {
-                        continue;
-                    }
-                    let fields = [
-                        format!("pullRequestId:\"{}\"", info.id),
-                        format!("baseRefName:\"{}\"", graphql_escape(&base_target)),
-                    ];
-                    base_updates_pre.push(fields.join(", "));
-                }
-                if !base_updates_pre.is_empty() {
-                    run_update_mutations(
-                        execution_mode,
-                        base_updates_pre,
-                        "Updating PR bases",
-                        MAX_BASE_UPDATES_PER_MUTATION,
-                        MAX_BASE_MUTATION_CHARS,
-                        true,
-                        render_progress,
-                    )?;
-                }
-            }
-        }
     }
 
     let ff_refspecs: Vec<String> = planned
@@ -717,6 +672,13 @@ fn build_from_groups_internal(
         parent_branch = branch;
     }
 
+    if !no_pr && !dry_run {
+        let (refreshed_prs_by_head, refreshed_current_base_by_number) =
+            open_pr_state_for_heads(&heads)?;
+        prs_by_head.extend(refreshed_prs_by_head);
+        current_base_by_number.extend(refreshed_current_base_by_number);
+    }
+
     if !no_pr {
         let numbers_full: Vec<u64> = pr_numbers_by_group.iter().flatten().copied().collect();
         let mut desired_stack_by_number: HashMap<u64, String> = HashMap::new();
@@ -803,13 +765,14 @@ fn build_from_groups_internal(
                 }
             }
         }
+        let base_update_numbers =
+            planned_base_updates(&current_base_by_number, &desired_base_by_number)
+                .into_iter()
+                .collect::<HashSet<_>>();
         for (&number, want_base) in &desired_base_by_number {
             if let Some(info) = bodies_by_number.get(&number) {
                 let desired_base_ref = sanitize_gh_base_ref(want_base);
-                let needs_update = current_base_by_number
-                    .get(&number)
-                    .map(|base_ref| sanitize_gh_base_ref(base_ref) != desired_base_ref.as_str())
-                    .unwrap_or(true);
+                let needs_update = base_update_numbers.contains(&number);
                 if needs_update {
                     if let Some(&group_idx) = group_index_by_number.get(&number) {
                         base_actions_by_group[group_idx] = UpdateEditAction::Updated;
@@ -1034,7 +997,8 @@ mod tests {
     use super::{
         branch_reuse_guard_window, build_from_groups, build_from_tags, head_key,
         heads_without_open_prs, ignored_boundary_warning, parse_github_timestamp_rfc3339,
-        pr_number_for_head, recent_pr_age, recent_pr_age_blocks_recreation, terminal_pr_action,
+        planned_base_updates, pr_number_for_head, recent_pr_age, recent_pr_age_blocks_recreation,
+        terminal_pr_action,
     };
     use crate::branch_names::group_branch_identities;
     use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
@@ -1121,6 +1085,29 @@ mod tests {
 
         assert!(missing.is_empty());
         assert_eq!(pr_number_for_head(&prs_by_head, "dank-spr/alpha"), Some(17));
+    }
+
+    #[test]
+    fn planned_base_updates_only_retargets_the_post_land_bottom_pr() {
+        let current = HashMap::from([
+            (2, "dank-spr/alpha".to_string()),
+            (3, "dank-spr/beta".to_string()),
+        ]);
+        let desired = HashMap::from([(2, "main".to_string()), (3, "dank-spr/beta".to_string())]);
+
+        assert_eq!(planned_base_updates(&current, &desired), vec![2]);
+    }
+
+    #[test]
+    fn planned_base_updates_leave_a_correct_rewritten_chain_untouched() {
+        let current = HashMap::from([
+            (1, "main".to_string()),
+            (2, "dank-spr/alpha".to_string()),
+            (3, "dank-spr/beta".to_string()),
+        ]);
+        let desired = current.clone();
+
+        assert!(planned_base_updates(&current, &desired).is_empty());
     }
 
     #[test]
