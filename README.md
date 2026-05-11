@@ -638,7 +638,8 @@ Default follow-up behavior:
 
 Prepare PRs for landing per-PR - squashes each PR's commits into a single commit.
 
-- Uses global `--until <N|0|label|pr:<label>>` / `--exact <I|label|pr:<label>>`
+- Uses global `--until <N|0|label|pr:<label>>`, global `--exact <I|label|pr:<label>>`,
+  or local `--from <N|label|pr:<label>>`; these selectors are mutually exclusive
 - Before rewriting or pushing, `spr prep` validates that no two live PR groups
   derive synthetic branch names that collide under case-insensitive
   comparison. If they do, it halts before the local squash or follow-on
@@ -647,6 +648,11 @@ Prepare PRs for landing per-PR - squashes each PR's commits into a single commit
 Behavior:
 
 - Rewrites local history to ensure selected PRs become single-commit groups
+- Squashes each selected PR group independently; it does not combine commits
+  across PR-group boundaries. For ordinary non-empty groups, that preserves the
+  selected PRs' net diffs relative to their parent groups.
+- Empty selected groups keep the existing `skipped_empty` behavior when their
+  tip tree already matches the parent tree.
 - Pushes branches (respects `--dry-run`)
 - Adds a warning to the next PR not included in the push
 - When `local_pr_branches` is enabled, the nested update path also synchronizes local synthetic PR
@@ -759,6 +765,9 @@ spr prep --until beta
 
 # Prep exactly the stable gamma group
 spr prep --exact gamma
+
+# Prep the stable gamma group and every group above it
+spr prep --from gamma
 
 # Prep the first 3 PRs from the bottom
 spr prep --until 3

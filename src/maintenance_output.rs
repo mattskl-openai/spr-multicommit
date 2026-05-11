@@ -66,6 +66,10 @@ pub enum ResolvedPrepSelection {
         selector: String,
         local_pr_number: usize,
     },
+    From {
+        selector: String,
+        first_local_pr_number: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
