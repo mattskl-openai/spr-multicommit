@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::config::PrDescriptionMode;
+use crate::config::{LocalPrBranchSyncPolicy, PrDescriptionMode};
 use crate::json_output::JsonCommand;
 use crate::summary_output::SummaryOutput;
 use crate::update_output::UpdateSummaryData;
@@ -21,6 +21,10 @@ pub enum MaintenancePayload {
     Cleanup {
         #[serde(flatten)]
         data: Box<CleanupSummaryData>,
+    },
+    LocalPrBranchSync {
+        #[serde(flatten)]
+        data: Box<LocalPrBranchSyncSummaryData>,
     },
 }
 
@@ -157,6 +161,20 @@ pub struct CleanupSummaryData {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalPrBranchSyncSummaryData {
+    pub repo: LocalPrBranchSyncRepoContext,
+    pub policy: LocalPrBranchSyncPolicy,
+    pub local_pr_branch_actions: Vec<crate::local_pr_branches::LocalPrBranchAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalPrBranchSyncRepoContext {
+    pub base: String,
+    pub prefix: String,
+    pub ignore_tag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CleanupRepoContext {
     pub prefix: String,
 }
@@ -197,6 +215,15 @@ pub fn cleanup_summary(data: CleanupSummaryData) -> MaintenanceOutput {
     SummaryOutput::new(
         JsonCommand::Cleanup,
         MaintenancePayload::Cleanup {
+            data: Box::new(data),
+        },
+    )
+}
+
+pub fn local_pr_branch_sync_summary(data: LocalPrBranchSyncSummaryData) -> MaintenanceOutput {
+    SummaryOutput::new(
+        JsonCommand::SyncLocalBranches,
+        MaintenancePayload::LocalPrBranchSync {
             data: Box::new(data),
         },
     )

@@ -27,7 +27,7 @@ pub use list::{
     CommitGroupData, CommitListData, PrGroupData, PrListData, ReadOnlyQueryError, RemotePrMetadata,
     RemotePrState,
 };
-pub use prep::{prep_squash, print_prep_summary};
+pub use prep::{prep_squash, print_prep_summary, PrepExecutionOptions};
 pub use r#move::{move_groups_after, MoveExecutionOptions};
 pub use relink_prs::{print_relink_prs_summary, relink_prs};
 pub use resolve_stack::{looks_like_pr_url, resolve_stack, ResolveStackOutput};

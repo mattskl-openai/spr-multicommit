@@ -112,6 +112,7 @@ list_order: recent_on_bottom
 # - `off` (default): do not create or move local per-PR branches
 # - `update-existing`: move matching local branches that already exist
 # - `create-or-update`: create missing matching local branches and move existing ones
+# Read-only `list` / `status` commands surface any drift this policy would reconcile.
 local_pr_branches: off
 
 # How `spr restack` behaves on cherry-pick conflicts
@@ -350,6 +351,22 @@ spr resolve-stack
 spr resolve-stack --json https://github.com/org/repo/pull/123
 ```
 
+### spr sync-local-branches
+
+Reconcile local synthetic PR branches with the checked-out stack without publishing or rewriting
+the stack itself.
+
+Behavior:
+
+- Uses the same `local_pr_branches` policy as automatic post-command sync
+- `off` is a no-op unless you override it with `--local-pr-branches`
+- `update-existing` moves only already-present local branches
+- `create-or-update` also creates missing local branches
+- Refuses to move a branch that is checked out in any worktree
+- Useful after manual Git surgery outside `spr`, such as an interactive rebase or manual commit
+  reorder, when the next read-only `spr list` / `spr status` output reports local branch drift
+- Does not touch GitHub or rewrite the checked-out stack branch
+
 ### spr resume
 
 Resume a suspended local rewrite from the exact path printed by `spr restack`,
@@ -373,14 +390,15 @@ Machine-readable `--json` mode:
   equivalent. A `--json` token after `--` is preserved as payload and does not change `spr`
   output mode.
 - Supported on operational commands including `spr list pr`, `spr list commit`, `spr status`,
-  `spr update`, `spr prep`, `spr relink-prs`, `spr cleanup`, `spr restack`, `spr absorb`,
-  `spr move`, `spr fix-pr`, `spr land`, `spr resume`, and `spr resolve-stack`
+  `spr sync-local-branches`, `spr update`, `spr prep`, `spr relink-prs`, `spr cleanup`,
+  `spr restack`, `spr absorb`, `spr move`, `spr fix-pr`, `spr land`, `spr resume`, and
+  `spr resolve-stack`
 - Also supported for display output: `spr --json --help`, `spr --help --json`,
   `spr --json help list commit`, `spr list commit --help --json`, `spr --json --version`, and
   `spr --version --json` each emit one structured JSON object
 - In `--json` mode, stdout is exactly one JSON object and stderr is normally empty
-- Summary-style commands (`list pr`, `list commit`, `status`, `update`, `prep`, `relink-prs`,
-  and `cleanup`) share the same top-level shape: `schema_version`, `command`,
+- Summary-style commands (`list pr`, `list commit`, `status`, `sync-local-branches`, `update`,
+  `prep`, `relink-prs`, and `cleanup`) share the same top-level shape: `schema_version`, `command`,
   `result: "summary"`, and `data`
 - JSON help uses `result: "help"` and includes the resolved command path, usage, options,
   positionals, subcommands, aliases, and `rendered_text` containing Clap's normal human help
@@ -388,7 +406,11 @@ Machine-readable `--json` mode:
 - `spr list --json pr`, `spr list --json commit`, and `spr status --json` always emit canonical
   bottom-up stack order, even when `list_order: recent_on_top` changes the human display order.
   Each group's `remote.kind` encodes whether there is no matching PR, a PR without CI/review
-  data, or a PR with typed CI/review status.
+  data, or a PR with typed CI/review status. When `local_pr_branches` is enabled, those read-only
+  payloads also include `local_pr_branch_drift`, which lists the local branch actions a
+  follow-on `spr sync-local-branches` would need to perform.
+- `spr sync-local-branches --json` writes the effective local branch sync policy plus
+  `local_pr_branch_actions` for the reconciliation it just performed.
 - `spr update --json` writes repo context, resolved extent metadata, warnings, skipped groups,
   per-group branch or PR actions, and `local_pr_branch_actions`
 - `spr prep --json` writes the resolved selection, selected-group rewrite actions, replay counts,
@@ -627,6 +649,8 @@ Behavior:
 - Rewrites local history to ensure selected PRs become single-commit groups
 - Pushes branches (respects `--dry-run`)
 - Adds a warning to the next PR not included in the push
+- When `local_pr_branches` is enabled, the nested update path also synchronizes local synthetic PR
+  branches after the prepared rewrite succeeds.
 - `--json` writes the typed prep summary instead of human log lines
 - In `--dry-run`, prep still computes the hypothetical rewritten commit chain so the JSON summary
   reflects the rewritten stack instead of the current branch tip

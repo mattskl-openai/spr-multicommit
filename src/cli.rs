@@ -202,6 +202,9 @@ pub enum Cmd {
     #[command(alias = "stat")]
     Status,
 
+    /// Reconcile local per-PR branches with the current stack using the configured sync policy
+    SyncLocalBranches,
+
     /// Find the owning stack branch for a PR branch or report that the target is already a stack branch
     #[command(
         long_about = "Find the owning stack branch for a PR branch using repo-local stack metadata.\n\nTargets may be omitted (use the current branch), a local branch name, a remote-qualified branch name such as `origin/dank-spr/alpha`, or a GitHub PR URL. This command is strict and metadata-backed: it does not scan unrelated branches or guess a likely owner."

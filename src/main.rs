@@ -72,6 +72,7 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
         crate::cli::Cmd::Restack { .. }
         | crate::cli::Cmd::Absorb { .. }
         | crate::cli::Cmd::Resume { .. }
+        | crate::cli::Cmd::SyncLocalBranches
         | crate::cli::Cmd::FixPr { .. } => false,
         crate::cli::Cmd::ResolveStack { target } => target
             .as_deref()
@@ -271,8 +272,14 @@ fn read_only_pr_list_output(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
+    local_pr_branch_policy: crate::config::LocalPrBranchSyncPolicy,
 ) -> std::result::Result<crate::read_only_output::ReadOnlyOutput, crate::json_output::ErrorOutput> {
-    match crate::commands::collect_pr_list_data_for_json(base, prefix, ignore_tag) {
+    match crate::commands::collect_pr_list_data_for_json(
+        base,
+        prefix,
+        ignore_tag,
+        local_pr_branch_policy,
+    ) {
         Ok(data) => Ok(crate::read_only_output::pr_list(command, data)),
         Err(crate::commands::ReadOnlyQueryError::SyntheticBranchNameCollision(collision)) => Err(
             crate::json_output::ErrorOutput::synthetic_branch_name_collision(command, &collision),
@@ -288,8 +295,14 @@ fn read_only_commit_list_output(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
+    local_pr_branch_policy: crate::config::LocalPrBranchSyncPolicy,
 ) -> std::result::Result<crate::read_only_output::ReadOnlyOutput, crate::json_output::ErrorOutput> {
-    match crate::commands::collect_commit_list_data_for_json(base, prefix, ignore_tag) {
+    match crate::commands::collect_commit_list_data_for_json(
+        base,
+        prefix,
+        ignore_tag,
+        local_pr_branch_policy,
+    ) {
         Ok(data) => Ok(crate::read_only_output::commit_list(command, data)),
         Err(crate::commands::ReadOnlyQueryError::SyntheticBranchNameCollision(collision)) => Err(
             crate::json_output::ErrorOutput::synthetic_branch_name_collision(command, &collision),
@@ -646,10 +659,13 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 &base,
                 &prefix,
                 &ignore_tag,
-                pr_description_mode,
-                list_order,
-                selection,
-                execution_mode,
+                crate::commands::PrepExecutionOptions {
+                    pr_description_mode,
+                    list_order,
+                    local_pr_branch_policy,
+                    selection,
+                    execution_mode,
+                },
             )?;
             if output_format == crate::cli::OutputFormat::Json {
                 Ok(CommandOutput::Maintenance(Box::new(
@@ -668,6 +684,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         &base,
                         &prefix,
                         &ignore_tag,
+                        local_pr_branch_policy,
                     ) {
                         Ok(output) => Ok(CommandOutput::ReadOnly(output)),
                         Err(output) => Ok(CommandOutput::Error(output)),
@@ -677,6 +694,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         &base,
                         &prefix,
                         &ignore_tag,
+                        local_pr_branch_policy,
                     ) {
                         Ok(output) => Ok(CommandOutput::ReadOnly(output)),
                         Err(output) => Ok(CommandOutput::Error(output)),
@@ -684,14 +702,19 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 }
             } else {
                 match what {
-                    crate::cli::ListWhat::Pr => {
-                        crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?
-                    }
+                    crate::cli::ListWhat::Pr => crate::commands::list_prs_display(
+                        &base,
+                        &prefix,
+                        &ignore_tag,
+                        list_order,
+                        local_pr_branch_policy,
+                    )?,
                     crate::cli::ListWhat::Commit => crate::commands::list_commits_display(
                         &base,
                         &prefix,
                         &ignore_tag,
                         list_order,
+                        local_pr_branch_policy,
                     )?,
                 }
                 Ok(CommandOutput::None)
@@ -704,12 +727,45 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     &base,
                     &prefix,
                     &ignore_tag,
+                    local_pr_branch_policy,
                 ) {
                     Ok(output) => Ok(CommandOutput::ReadOnly(output)),
                     Err(output) => Ok(CommandOutput::Error(output)),
                 }
             } else {
-                crate::commands::list_prs_display(&base, &prefix, &ignore_tag, list_order)?;
+                crate::commands::list_prs_display(
+                    &base,
+                    &prefix,
+                    &ignore_tag,
+                    list_order,
+                    local_pr_branch_policy,
+                )?;
+                Ok(CommandOutput::None)
+            }
+        }
+        crate::cli::Cmd::SyncLocalBranches => {
+            let local_pr_branch_actions = sync_local_pr_branches_for_current_stack(
+                local_pr_branch_policy,
+                ExecutionMode::Apply,
+                &base,
+                &prefix,
+                &ignore_tag,
+            )?;
+            if output_format == crate::cli::OutputFormat::Json {
+                Ok(CommandOutput::Maintenance(Box::new(
+                    crate::maintenance_output::local_pr_branch_sync_summary(
+                        crate::maintenance_output::LocalPrBranchSyncSummaryData {
+                            repo: crate::maintenance_output::LocalPrBranchSyncRepoContext {
+                                base,
+                                prefix,
+                                ignore_tag,
+                            },
+                            policy: local_pr_branch_policy,
+                            local_pr_branch_actions,
+                        },
+                    ),
+                )))
+            } else {
                 Ok(CommandOutput::None)
             }
         }
@@ -1065,6 +1121,9 @@ fn json_command_for_cli(cmd: &crate::cli::Cmd) -> crate::json_output::JsonComman
             crate::cli::ListWhat::Commit => crate::machine_output::MachineCommand::ListCommit,
         },
         crate::cli::Cmd::Status => crate::machine_output::MachineCommand::Status,
+        crate::cli::Cmd::SyncLocalBranches => {
+            crate::machine_output::MachineCommand::SyncLocalBranches
+        }
         crate::cli::Cmd::RelinkPrs { .. } => crate::machine_output::MachineCommand::RelinkPrs,
         crate::cli::Cmd::Cleanup { .. } => crate::machine_output::MachineCommand::Cleanup,
     }
@@ -1237,6 +1296,11 @@ mod tests {
     #[test]
     fn status_requires_github_cli() {
         assert!(command_requires_gh(&crate::cli::Cmd::Status));
+    }
+
+    #[test]
+    fn sync_local_branches_stays_local_only_for_tool_checks() {
+        assert!(!command_requires_gh(&crate::cli::Cmd::SyncLocalBranches));
     }
 
     #[test]
@@ -1414,6 +1478,20 @@ mod tests {
         ];
 
         assert_eq!(json_command_for_raw_args(&args), JsonCommand::Status);
+    }
+
+    #[test]
+    fn json_command_for_raw_args_detects_sync_local_branches() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("sync-local-branches"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(
+            json_command_for_raw_args(&args),
+            JsonCommand::SyncLocalBranches
+        );
     }
 
     #[test]
@@ -1686,6 +1764,63 @@ mod tests {
     }
 
     #[test]
+    fn run_cli_prep_json_propagates_local_branch_sync_policy() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let origin_url = format!("file://{}", dir.path().join("origin.git").display());
+        git(
+            &repo,
+            ["remote", "set-url", "origin", origin_url.as_str()].as_slice(),
+        );
+        let log_path = repo.join("gh.log");
+        let script = prep_json_gh_script(&log_path);
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--local-pr-branches",
+            "create-or-update",
+            "--until",
+            "1",
+            "prep",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::Maintenance(output) => match output.data {
+                MaintenancePayload::Prep { data } => {
+                    let update = data
+                        .update
+                        .expect("prep should include nested update summary");
+                    assert_eq!(
+                        update.options.local_pr_branches,
+                        crate::config::LocalPrBranchSyncPolicy::CreateOrUpdate
+                    );
+                    assert_eq!(update.local_pr_branch_actions.len(), 1);
+                    assert_eq!(
+                        update.local_pr_branch_actions[0].action,
+                        crate::local_pr_branches::LocalPrBranchActionKind::Created
+                    );
+                }
+                other => panic!("unexpected maintenance payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
     fn run_cli_restack_preview_json_returns_preview_payload() {
         let _lock = lock_cwd();
         let _restore = CurrentDirGuard::capture();
@@ -1854,6 +1989,131 @@ mod tests {
             }
             other => panic!("unexpected command output: {:?}", other),
         }
+    }
+
+    #[test]
+    fn run_cli_list_pr_json_reports_local_branch_drift_without_mutating_refs() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_local_stack_repo();
+        let alpha_tip = rev_parse(repo.path(), "HEAD~2");
+        git(
+            repo.path(),
+            ["branch", "dank-spr/alpha", &alpha_tip].as_slice(),
+        );
+        let log_path = repo.path().join("gh.log");
+        let open_json_path = repo.path().join("gh-open.json");
+        let status_json_path = repo.path().join("gh-status.json");
+        fs::write(
+            &open_json_path,
+            "{\"data\":{\"repository\":{\"pr0\":{\"nodes\":[]},\"pr1\":{\"nodes\":[]}}}}",
+        )
+        .unwrap();
+        fs::write(&status_json_path, "{\"data\":{\"repository\":{}}}").unwrap();
+        let script = list_json_gh_script(&log_path, &open_json_path, &status_json_path);
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.path().to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--local-pr-branches",
+            "create-or-update",
+            "list",
+            "--json",
+            "pr",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::ReadOnly(output) => match output.data {
+                ReadOnlyPayload::PrList { data } => {
+                    assert_eq!(data.local_pr_branch_drift.len(), 2);
+                    assert_eq!(data.local_pr_branch_drift[0].branch, "dank-spr/alpha");
+                    assert_eq!(
+                        data.local_pr_branch_drift[0].action,
+                        crate::local_pr_branches::LocalPrBranchActionKind::Updated
+                    );
+                    assert_eq!(data.local_pr_branch_drift[1].branch, "dank-spr/beta");
+                    assert_eq!(
+                        data.local_pr_branch_drift[1].action,
+                        crate::local_pr_branches::LocalPrBranchActionKind::Created
+                    );
+                }
+                other => panic!("unexpected read-only payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+
+        assert_eq!(rev_parse(repo.path(), "dank-spr/alpha"), alpha_tip);
+        assert!(!local_branch_exists(repo.path(), "dank-spr/beta"));
+    }
+
+    #[test]
+    fn run_cli_sync_local_branches_json_reconciles_current_stack() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_local_stack_repo();
+        let alpha_tip = rev_parse(repo.path(), "HEAD~2");
+        git(
+            repo.path(),
+            ["branch", "dank-spr/alpha", &alpha_tip].as_slice(),
+        );
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.path().to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--local-pr-branches",
+            "create-or-update",
+            "sync-local-branches",
+            "--json",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::Maintenance(output) => {
+                assert_eq!(output.command, JsonCommand::SyncLocalBranches);
+                match output.data {
+                    MaintenancePayload::LocalPrBranchSync { data } => {
+                        assert_eq!(
+                            data.policy,
+                            crate::config::LocalPrBranchSyncPolicy::CreateOrUpdate
+                        );
+                        assert_eq!(data.local_pr_branch_actions.len(), 2);
+                        assert_eq!(
+                            data.local_pr_branch_actions[0].action,
+                            crate::local_pr_branches::LocalPrBranchActionKind::Updated
+                        );
+                        assert_eq!(
+                            data.local_pr_branch_actions[1].action,
+                            crate::local_pr_branches::LocalPrBranchActionKind::Created
+                        );
+                    }
+                    other => panic!("unexpected maintenance payload: {:?}", other),
+                }
+            }
+            other => panic!("unexpected command output: {:?}", other),
+        }
+
+        assert_eq!(
+            rev_parse(repo.path(), "dank-spr/alpha"),
+            rev_parse(repo.path(), "HEAD~1")
+        );
+        assert_eq!(
+            rev_parse(repo.path(), "dank-spr/beta"),
+            rev_parse(repo.path(), "HEAD")
+        );
     }
 
     #[test]

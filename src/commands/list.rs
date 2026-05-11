@@ -18,7 +18,7 @@ use crate::branch_names::{
     canonical_branch_conflict_key, find_synthetic_branch_name_collision, group_branch_identities,
     CanonicalBranchConflictKey, SyntheticBranchIdentity, SyntheticBranchNameCollision,
 };
-use crate::config::ListOrder;
+use crate::config::{ListOrder, LocalPrBranchSyncPolicy};
 use crate::github::{
     fetch_pr_ci_review_status, list_open_or_merged_prs_for_heads, PrCiReviewStatus, PrCiState,
     PrInfoWithState, PrReviewDecision, PrState,
@@ -87,6 +87,7 @@ pub struct PrGroupData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrListData {
     pub groups: Vec<PrGroupData>,
+    pub local_pr_branch_drift: Vec<crate::local_pr_branches::LocalPrBranchAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -108,6 +109,7 @@ pub struct CommitGroupData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommitListData {
     pub groups: Vec<CommitGroupData>,
+    pub local_pr_branch_drift: Vec<crate::local_pr_branches::LocalPrBranchAction>,
 }
 
 /// Maps remote PR state into the two-character status slot used by `spr list pr`.
@@ -290,6 +292,7 @@ fn build_pr_list_data(
     groups: &[Group],
     branch_identities: &[SyntheticBranchIdentity],
     remote_by_head: &HashMap<CanonicalBranchConflictKey, RemotePrMetadata>,
+    local_pr_branch_drift: Vec<crate::local_pr_branches::LocalPrBranchAction>,
 ) -> PrListData {
     let groups = groups
         .iter()
@@ -313,13 +316,17 @@ fn build_pr_list_data(
         })
         .collect();
 
-    PrListData { groups }
+    PrListData {
+        groups,
+        local_pr_branch_drift,
+    }
 }
 
 fn build_commit_list_data(
     groups: &[Group],
     branch_identities: &[SyntheticBranchIdentity],
     remote_by_head: &HashMap<CanonicalBranchConflictKey, RemotePrMetadata>,
+    local_pr_branch_drift: Vec<crate::local_pr_branches::LocalPrBranchAction>,
 ) -> CommitListData {
     let group_start_indices: Vec<usize> = groups
         .iter()
@@ -361,40 +368,63 @@ fn build_commit_list_data(
         })
         .collect();
 
-    CommitListData { groups }
+    CommitListData {
+        groups,
+        local_pr_branch_drift,
+    }
 }
 
 pub fn collect_pr_list_data_for_json(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
 ) -> std::result::Result<PrListData, ReadOnlyQueryError> {
     let (groups, branch_identities) = derive_groups_and_identities(base, prefix, ignore_tag)?;
     let remote_by_head =
         fetch_remote_pr_metadata(&branch_identities).map_err(ReadOnlyQueryError::Internal)?;
+    let targets = crate::local_pr_branches::targets_from_groups(prefix, &groups)
+        .map_err(ReadOnlyQueryError::Internal)?;
+    let local_pr_branch_drift =
+        crate::local_pr_branches::plan_local_pr_branch_drift(local_pr_branch_policy, &targets)
+            .map_err(ReadOnlyQueryError::Internal)?;
     Ok(build_pr_list_data(
         &groups,
         &branch_identities,
         &remote_by_head,
+        local_pr_branch_drift,
     ))
 }
 
-pub fn collect_pr_list_data(base: &str, prefix: &str, ignore_tag: &str) -> Result<PrListData> {
-    collect_pr_list_data_for_json(base, prefix, ignore_tag).map_err(anyhow::Error::from)
+pub fn collect_pr_list_data(
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
+) -> Result<PrListData> {
+    collect_pr_list_data_for_json(base, prefix, ignore_tag, local_pr_branch_policy)
+        .map_err(anyhow::Error::from)
 }
 
 pub fn collect_commit_list_data_for_json(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
 ) -> std::result::Result<CommitListData, ReadOnlyQueryError> {
     let (groups, branch_identities) = derive_groups_and_identities(base, prefix, ignore_tag)?;
     let remote_by_head =
         fetch_remote_pr_metadata(&branch_identities).map_err(ReadOnlyQueryError::Internal)?;
+    let targets = crate::local_pr_branches::targets_from_groups(prefix, &groups)
+        .map_err(ReadOnlyQueryError::Internal)?;
+    let local_pr_branch_drift =
+        crate::local_pr_branches::plan_local_pr_branch_drift(local_pr_branch_policy, &targets)
+            .map_err(ReadOnlyQueryError::Internal)?;
     Ok(build_commit_list_data(
         &groups,
         &branch_identities,
         &remote_by_head,
+        local_pr_branch_drift,
     ))
 }
 
@@ -402,8 +432,10 @@ pub fn collect_commit_list_data(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
 ) -> Result<CommitListData> {
-    collect_commit_list_data_for_json(base, prefix, ignore_tag).map_err(anyhow::Error::from)
+    collect_commit_list_data_for_json(base, prefix, ignore_tag, local_pr_branch_policy)
+        .map_err(anyhow::Error::from)
 }
 
 fn render_pr_list(data: &PrListData, list_order: ListOrder) -> Vec<String> {
@@ -488,6 +520,31 @@ fn render_commit_list(data: &CommitListData, list_order: ListOrder) -> Vec<Strin
     }
 }
 
+fn render_local_pr_branch_drift(
+    drift: &[crate::local_pr_branches::LocalPrBranchAction],
+) -> Vec<String> {
+    drift
+        .iter()
+        .map(|action| match action.action {
+            crate::local_pr_branches::LocalPrBranchActionKind::Created => format!(
+                "local branch {} is missing; run `spr sync-local-branches`",
+                action.branch
+            ),
+            crate::local_pr_branches::LocalPrBranchActionKind::Updated => format!(
+                "local branch {} is stale; run `spr sync-local-branches`",
+                action.branch
+            ),
+            crate::local_pr_branches::LocalPrBranchActionKind::Blocked => format!(
+                "local branch {} is stale but checked out in a worktree; run `spr sync-local-branches` after freeing it",
+                action.branch
+            ),
+            crate::local_pr_branches::LocalPrBranchActionKind::Skipped => {
+                unreachable!("drift output excludes skipped local PR branch actions")
+            }
+        })
+        .collect()
+}
+
 /// Print a per-PR summary for the current local stack.
 ///
 /// The local stack order is derived bottom-up from commits, so local PR numbers are based
@@ -499,9 +556,13 @@ pub fn list_prs_display(
     prefix: &str,
     ignore_tag: &str,
     list_order: ListOrder,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
 ) -> Result<()> {
-    let data = collect_pr_list_data(base, prefix, ignore_tag)?;
+    let data = collect_pr_list_data(base, prefix, ignore_tag, local_pr_branch_policy)?;
     for line in render_pr_list(&data, list_order) {
+        info!("{line}");
+    }
+    for line in render_local_pr_branch_drift(&data.local_pr_branch_drift) {
         info!("{line}");
     }
     Ok(())
@@ -518,9 +579,13 @@ pub fn list_commits_display(
     prefix: &str,
     ignore_tag: &str,
     list_order: ListOrder,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
 ) -> Result<()> {
-    let data = collect_commit_list_data(base, prefix, ignore_tag)?;
+    let data = collect_commit_list_data(base, prefix, ignore_tag, local_pr_branch_policy)?;
     for line in render_commit_list(&data, list_order) {
+        info!("{line}");
+    }
+    for line in render_local_pr_branch_drift(&data.local_pr_branch_drift) {
         info!("{line}");
     }
     Ok(())
@@ -651,7 +716,7 @@ mod tests {
             ),
         )]);
 
-        let data = build_pr_list_data(&groups, &branch_identities, &remote_by_head);
+        let data = build_pr_list_data(&groups, &branch_identities, &remote_by_head, Vec::new());
         assert_eq!(data.groups[0].local_pr_number, 1);
         assert_eq!(data.groups[0].stable_handle, "pr:alpha");
         assert_eq!(data.groups[1].local_pr_number, 2);
@@ -739,7 +804,7 @@ mod tests {
             ),
         )]);
 
-        let data = build_commit_list_data(&groups, &branch_identities, &remote_by_head);
+        let data = build_commit_list_data(&groups, &branch_identities, &remote_by_head, Vec::new());
 
         assert_eq!(data.groups[0].stable_handle, "pr:alpha");
         assert_eq!(
@@ -781,6 +846,7 @@ mod tests {
                     },
                 },
             ],
+            local_pr_branch_drift: Vec::new(),
         };
 
         let lines = render_pr_list(&data, ListOrder::RecentOnTop);
@@ -837,6 +903,7 @@ mod tests {
                     }],
                 },
             ],
+            local_pr_branch_drift: Vec::new(),
         };
 
         let lines = render_commit_list(&data, ListOrder::RecentOnTop);
@@ -855,13 +922,50 @@ mod tests {
     }
 
     #[test]
+    fn render_local_pr_branch_drift_suggests_explicit_reconciliation() {
+        let lines = render_local_pr_branch_drift(&[
+            crate::local_pr_branches::LocalPrBranchAction {
+                stable_handle: "pr:alpha".to_string(),
+                branch: "dank-spr/alpha".to_string(),
+                old_tip: Some("aaaaaaaa1".to_string()),
+                new_tip: "bbbbbbbb1".to_string(),
+                action: crate::local_pr_branches::LocalPrBranchActionKind::Updated,
+                reason: "move existing local branch to target".to_string(),
+                backup_tag: None,
+            },
+            crate::local_pr_branches::LocalPrBranchAction {
+                stable_handle: "pr:beta".to_string(),
+                branch: "dank-spr/beta".to_string(),
+                old_tip: None,
+                new_tip: "cccccccc1".to_string(),
+                action: crate::local_pr_branches::LocalPrBranchActionKind::Created,
+                reason: "create missing local branch at target".to_string(),
+                backup_tag: None,
+            },
+        ]);
+
+        assert_eq!(
+            lines,
+            vec![
+                "local branch dank-spr/alpha is stale; run `spr sync-local-branches`",
+                "local branch dank-spr/beta is missing; run `spr sync-local-branches`",
+            ]
+        );
+    }
+
+    #[test]
     fn collect_pr_list_data_for_json_returns_typed_collision_error() {
         let _lock = lock_cwd();
         let repo = init_case_conflicting_stack_repo();
         let _guard = DirGuard::change_to(repo.path());
 
-        let err =
-            collect_pr_list_data_for_json("main", "dank-spr/", "ignore").expect_err("collision");
+        let err = collect_pr_list_data_for_json(
+            "main",
+            "dank-spr/",
+            "ignore",
+            LocalPrBranchSyncPolicy::Off,
+        )
+        .expect_err("collision");
 
         match err {
             ReadOnlyQueryError::SyntheticBranchNameCollision(collision) => {
