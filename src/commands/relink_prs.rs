@@ -1,17 +1,17 @@
 use anyhow::Result;
-use std::collections::HashMap;
 use tracing::info;
 
-use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
-use crate::commands::common;
 use crate::execution::ExecutionMode;
 use crate::git::{gh_rw, normalize_branch_name, sanitize_gh_base_ref};
-use crate::github::list_open_prs_for_heads;
 use crate::maintenance_output::{
     MaintenanceOptions, MaintenanceRepoContext, RelinkExpectedBaseData, RelinkPrAction,
     RelinkPrDecisionData, RelinkPrsSummaryData,
 };
 use crate::parsing::derive_local_groups;
+use crate::pr_base_chain::{
+    build_desired_pr_base_chain, plan_base_reconciliation, verify_base_edits_converged,
+    BaseReconciliationAction, ObservedPrBaseChain,
+};
 
 fn render_relink_action(action: RelinkPrAction) -> &'static str {
     match action {
@@ -57,77 +57,71 @@ pub fn relink_prs(
             decisions: Vec::new(),
         });
     }
-    let branch_identities = group_branch_identities(&groups, prefix)?;
-
-    let heads: Vec<String> = branch_identities
+    let desired_chain = build_desired_pr_base_chain(&normalized_base, &groups, prefix)?;
+    let heads: Vec<String> = desired_chain
         .iter()
-        .map(|identity| identity.exact.clone())
+        .map(|desired| desired.head_branch.clone())
         .collect();
-    let prs = list_open_prs_for_heads(&heads)?;
-    let prs_by_head: HashMap<_, _> = prs
+    let observed_chain = ObservedPrBaseChain::observe_for_heads(&heads)?;
+    let expected_chain: Vec<RelinkExpectedBaseData> = desired_chain
         .iter()
-        .map(|pr| (canonical_branch_conflict_key(&pr.head), pr))
-        .collect();
-    let expected = common::build_head_base_chain(&normalized_base, &groups, prefix)?;
-    let expected_chain: Vec<RelinkExpectedBaseData> = expected
-        .iter()
-        .enumerate()
-        .map(
-            |(group_idx, (head_branch, expected_base_ref))| RelinkExpectedBaseData {
-                local_pr_number: group_idx + 1,
-                stable_handle: common::group_selector_text(&groups[group_idx]),
-                head_branch: head_branch.clone(),
-                expected_base_ref: expected_base_ref.clone(),
-            },
-        )
+        .map(|desired| RelinkExpectedBaseData {
+            local_pr_number: desired.local_pr_number,
+            stable_handle: desired.stable_handle.clone(),
+            head_branch: desired.head_branch.clone(),
+            expected_base_ref: desired.expected_base_ref.clone(),
+        })
         .collect();
 
-    let mut decisions: Vec<RelinkPrDecisionData> = Vec::with_capacity(expected_chain.len());
-    for expected in &expected_chain {
-        if let Some(pr) = prs_by_head
-            .get(&canonical_branch_conflict_key(&expected.head_branch))
-            .copied()
-        {
-            let action = if pr.base == expected.expected_base_ref {
-                RelinkPrAction::AlreadyCorrect
-            } else {
-                gh_rw(
-                    execution_mode,
-                    [
-                        "pr",
-                        "edit",
-                        &format!("#{}", pr.number),
-                        "--base",
-                        &sanitize_gh_base_ref(&expected.expected_base_ref),
-                    ]
-                    .as_slice(),
-                )?;
-                if dry_run {
-                    RelinkPrAction::DryRunEdit
-                } else {
-                    RelinkPrAction::Edited
+    let reconciliation = plan_base_reconciliation(&desired_chain, &observed_chain);
+    let edited_head_branches = reconciliation
+        .iter()
+        .filter(|decision| decision.action == BaseReconciliationAction::NeedsEdit)
+        .map(|decision| decision.desired.head_branch.clone())
+        .collect::<Vec<_>>();
+    let decisions = reconciliation
+        .into_iter()
+        .map(|decision| {
+            let action = match decision.action {
+                BaseReconciliationAction::AlreadyCorrect => RelinkPrAction::AlreadyCorrect,
+                BaseReconciliationAction::NeedsEdit => {
+                    let remote_pr_number = decision
+                        .remote_pr_number
+                        .expect("editable decisions must have an open PR");
+                    gh_rw(
+                        execution_mode,
+                        [
+                            "pr",
+                            "edit",
+                            &format!("#{}", remote_pr_number),
+                            "--base",
+                            &sanitize_gh_base_ref(&decision.desired.expected_base_ref),
+                        ]
+                        .as_slice(),
+                    )?;
+                    if dry_run {
+                        RelinkPrAction::DryRunEdit
+                    } else {
+                        RelinkPrAction::Edited
+                    }
                 }
+                BaseReconciliationAction::MissingOpenPr => RelinkPrAction::MissingOpenPr,
             };
-            decisions.push(RelinkPrDecisionData {
-                local_pr_number: expected.local_pr_number,
-                stable_handle: expected.stable_handle.clone(),
-                head_branch: expected.head_branch.clone(),
-                expected_base_ref: expected.expected_base_ref.clone(),
-                current_base_ref: Some(pr.base.clone()),
-                remote_pr_number: Some(pr.number),
+            Ok(RelinkPrDecisionData {
+                local_pr_number: decision.desired.local_pr_number,
+                stable_handle: decision.desired.stable_handle,
+                head_branch: decision.desired.head_branch,
+                expected_base_ref: decision.desired.expected_base_ref,
+                current_base_ref: decision.current_base_ref,
+                remote_pr_number: decision.remote_pr_number,
                 action,
-            });
-        } else {
-            decisions.push(RelinkPrDecisionData {
-                local_pr_number: expected.local_pr_number,
-                stable_handle: expected.stable_handle.clone(),
-                head_branch: expected.head_branch.clone(),
-                expected_base_ref: expected.expected_base_ref.clone(),
-                current_base_ref: None,
-                remote_pr_number: None,
-                action: RelinkPrAction::MissingOpenPr,
-            });
-        }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !edited_head_branches.is_empty() && execution_mode == ExecutionMode::Apply {
+        let refreshed_chain = ObservedPrBaseChain::observe_for_heads(&heads)?;
+        let refreshed_decisions = plan_base_reconciliation(&desired_chain, &refreshed_chain);
+        verify_base_edits_converged(&edited_head_branches, &refreshed_decisions)?;
     }
 
     Ok(RelinkPrsSummaryData {
@@ -224,10 +218,16 @@ mod tests {
         let _guard = DirGuard::change_to(&repo);
         let log_path = repo.join("gh.log");
         let exact_open_path = repo.join("exact-open.json");
+        let exact_open_after_edit_path = repo.join("exact-open-after-edit.json");
         let search_open_path = repo.join("search-open.json");
         fs::write(
             &exact_open_path,
             "{\"data\":{\"repository\":{\"pr0\":{\"nodes\":[{\"number\":17,\"headRefName\":\"skilltest/alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}]},\"pr1\":{\"nodes\":[{\"number\":22,\"headRefName\":\"skilltest/beta\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/22\",\"autoMergeRequest\":null}]}}}}",
+        )
+        .unwrap();
+        fs::write(
+            &exact_open_after_edit_path,
+            "{\"data\":{\"repository\":{\"pr0\":{\"nodes\":[{\"number\":17,\"headRefName\":\"skilltest/alpha\",\"baseRefName\":\"main\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/17\",\"autoMergeRequest\":null}]},\"pr1\":{\"nodes\":[{\"number\":22,\"headRefName\":\"skilltest/beta\",\"baseRefName\":\"skilltest/alpha\",\"state\":\"OPEN\",\"mergedAt\":null,\"closedAt\":null,\"url\":\"https://github.com/o/r/pull/22\",\"autoMergeRequest\":null}]}}}}",
         )
         .unwrap();
         fs::write(
@@ -236,10 +236,12 @@ mod tests {
         )
         .unwrap();
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*) cat \"{}\" ;;\n    *\"is:pr is:open head:skilltest/alpha\"*) cat \"{}\" ;;\n    *) echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"edit\" ]; then\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*) cat \"{}\" ;;\n    *\"is:pr is:open head:skilltest/alpha\"*) cat \"{}\" ;;\n    *) echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"edit\" ]; then\n  cp \"{}\" \"{}\"\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
             exact_open_path.display(),
             search_open_path.display(),
+            exact_open_after_edit_path.display(),
+            exact_open_path.display(),
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
 
