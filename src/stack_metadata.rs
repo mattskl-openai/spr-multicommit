@@ -51,7 +51,7 @@ pub struct PrBranchName(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct PrTag(pub String);
+pub struct GroupSelectorText(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,7 +74,8 @@ pub struct StackRecord {
 pub enum PrBranchRecord {
     Live {
         stack_id: StackId,
-        tag: PrTag,
+        #[serde(rename = "tag")]
+        selector: GroupSelectorText,
         last_group_seed: String,
         last_group_tip: String,
         last_stack_head: String,
@@ -82,7 +83,8 @@ pub enum PrBranchRecord {
     },
     Tombstoned {
         stack_id: StackId,
-        tag: PrTag,
+        #[serde(rename = "tag")]
+        selector: GroupSelectorText,
         last_group_seed: String,
         last_group_tip: String,
         last_stack_head: String,
@@ -98,9 +100,9 @@ impl PrBranchRecord {
         }
     }
 
-    pub fn tag(&self) -> &PrTag {
+    pub fn selector(&self) -> &GroupSelectorText {
         match self {
-            Self::Live { tag, .. } | Self::Tombstoned { tag, .. } => tag,
+            Self::Live { selector, .. } | Self::Tombstoned { selector, .. } => selector,
         }
     }
 
@@ -138,14 +140,14 @@ impl PrBranchRecord {
         match self {
             Self::Live {
                 stack_id,
-                tag,
+                selector,
                 last_group_seed,
                 last_group_tip,
                 last_stack_head,
                 updated_at,
             } => Some(LivePrBranchRecord {
                 stack_id,
-                tag,
+                selector,
                 last_group_seed,
                 last_group_tip,
                 last_stack_head,
@@ -159,7 +161,7 @@ impl PrBranchRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LivePrBranchRecord<'a> {
     pub stack_id: &'a StackId,
-    pub tag: &'a PrTag,
+    pub selector: &'a GroupSelectorText,
     pub last_group_seed: &'a str,
     pub last_group_tip: &'a str,
     pub last_stack_head: &'a str,
@@ -195,7 +197,7 @@ pub struct StackSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackSnapshotGroup {
     pub pr_branch: PrBranchName,
-    pub tag: PrTag,
+    pub selector: GroupSelectorText,
     pub last_group_seed: String,
     pub last_group_tip: String,
 }
@@ -295,12 +297,22 @@ fn resolve_stack_id_for_snapshot(
         return resolve_stack_id_for_empty_snapshot(metadata, &snapshot.stack_branch);
     }
 
-    let matching_stack_ids = snapshot
+    let branch_match_ids = metadata
+        .stacks
+        .iter()
+        .filter(|(_, record)| {
+            record.preferred_branch == snapshot.stack_branch
+                || record.known_branches.contains(&snapshot.stack_branch)
+        })
+        .map(|(stack_id, _)| stack_id.clone());
+    let group_match_ids = snapshot
         .groups
         .iter()
         .filter_map(|group| metadata.pr_branches.get(&group.pr_branch))
         .filter_map(PrBranchRecord::as_live)
-        .map(|record| record.stack_id.clone())
+        .map(|record| record.stack_id.clone());
+    let matching_stack_ids = branch_match_ids
+        .chain(group_match_ids)
         .collect::<BTreeSet<_>>();
     if matching_stack_ids.len() > 1 {
         bail!(
@@ -317,7 +329,7 @@ fn resolve_stack_id_for_snapshot(
 fn tombstone_record(record: &PrBranchRecord, updated_at: &str) -> PrBranchRecord {
     PrBranchRecord::Tombstoned {
         stack_id: record.stack_id().clone(),
-        tag: record.tag().clone(),
+        selector: record.selector().clone(),
         last_group_seed: record.last_group_seed().to_string(),
         last_group_tip: record.last_group_tip().to_string(),
         last_stack_head: record.last_stack_head().to_string(),
@@ -387,11 +399,24 @@ fn apply_snapshot(
     }
 
     for group in &snapshot.groups {
+        if let Some(PrBranchRecord::Live {
+            stack_id: owner, ..
+        }) = metadata.pr_branches.get(&group.pr_branch)
+        {
+            if *owner != stack_id {
+                bail!(
+                    "branch {} is already owned by verified live stack {} and cannot also belong to stack {}",
+                    group.pr_branch.0,
+                    owner.0,
+                    stack_id.0
+                );
+            }
+        }
         metadata.pr_branches.insert(
             group.pr_branch.clone(),
             PrBranchRecord::Live {
                 stack_id: stack_id.clone(),
-                tag: group.tag.clone(),
+                selector: group.selector.clone(),
                 last_group_seed: group.last_group_seed.clone(),
                 last_group_tip: group.last_group_tip.clone(),
                 last_stack_head: snapshot.stack_head.clone(),
@@ -529,28 +554,27 @@ pub fn build_snapshot_for_branch(
     let (leading_ignored, parsed_groups) = parse_groups_with_ignored(&lines, ignore_tag)?;
     let (groups, _skipped_handles) = split_groups_for_update(&leading_ignored, parsed_groups);
     let branch_identities = group_branch_identities(&groups, prefix)?;
-    let groups = groups
-        .iter()
-        .zip(branch_identities.iter())
-        .map(|(group, identity)| {
-            let last_group_seed = group
-                .commits
-                .first()
-                .cloned()
-                .ok_or_else(|| anyhow!("group pr:{} has no seed commit", group.tag))?;
-            let last_group_tip = group
-                .commits
-                .last()
-                .cloned()
-                .ok_or_else(|| anyhow!("group pr:{} has no tip commit", group.tag))?;
-            Ok(StackSnapshotGroup {
-                pr_branch: PrBranchName(identity.exact.clone()),
-                tag: PrTag(group.tag.clone()),
-                last_group_seed,
-                last_group_tip,
+    let groups =
+        groups
+            .iter()
+            .zip(branch_identities.iter())
+            .map(|(group, identity)| {
+                let last_group_seed =
+                    group.commits.first().cloned().ok_or_else(|| {
+                        anyhow!("group {} has no seed commit", group.selector_text())
+                    })?;
+                let last_group_tip =
+                    group.commits.last().cloned().ok_or_else(|| {
+                        anyhow!("group {} has no tip commit", group.selector_text())
+                    })?;
+                Ok(StackSnapshotGroup {
+                    pr_branch: PrBranchName(identity.exact.clone()),
+                    selector: GroupSelectorText(group.selector_text()),
+                    last_group_seed,
+                    last_group_tip,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
     Ok(StackSnapshot {
         stack_branch: StackBranchName(stack_branch.to_string()),
@@ -727,8 +751,8 @@ pub fn current_branch_or_none(repo_path: &str) -> Result<Option<String>> {
 mod tests {
     use super::{
         acquire_lock, apply_snapshot, load_metadata_from_path, metadata_lock_path,
-        ordered_known_branches, write_metadata_atomically, PrBranchName, PrBranchRecord, PrTag,
-        StackBranchName, StackId, StackMetadataFile, StackRecord, StackSnapshot,
+        ordered_known_branches, write_metadata_atomically, GroupSelectorText, PrBranchName,
+        PrBranchRecord, StackBranchName, StackId, StackMetadataFile, StackRecord, StackSnapshot,
         StackSnapshotGroup, TombstoneReason, STACK_METADATA_SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
@@ -745,7 +769,10 @@ mod tests {
                 .iter()
                 .map(|(branch_name, seed, tip)| StackSnapshotGroup {
                     pr_branch: PrBranchName((*branch_name).to_string()),
-                    tag: PrTag(branch_name.rsplit('/').next().unwrap().to_string()),
+                    selector: GroupSelectorText(format!(
+                        "pr:{}",
+                        branch_name.rsplit('/').next().unwrap()
+                    )),
                     last_group_seed: (*seed).to_string(),
                     last_group_tip: (*tip).to_string(),
                 })
@@ -789,7 +816,7 @@ mod tests {
                     PrBranchName("dank-spr/alpha".to_string()),
                     PrBranchRecord::Live {
                         stack_id: StackId("stack-1".to_string()),
-                        tag: PrTag("alpha".to_string()),
+                        selector: GroupSelectorText("pr:alpha".to_string()),
                         last_group_seed: "a1".to_string(),
                         last_group_tip: "a2".to_string(),
                         last_stack_head: "old-head".to_string(),
@@ -800,7 +827,7 @@ mod tests {
                     PrBranchName("dank-spr/beta".to_string()),
                     PrBranchRecord::Live {
                         stack_id: StackId("stack-1".to_string()),
-                        tag: PrTag("beta".to_string()),
+                        selector: GroupSelectorText("pr:beta".to_string()),
                         last_group_seed: "b1".to_string(),
                         last_group_tip: "b2".to_string(),
                         last_stack_head: "old-head".to_string(),
@@ -849,7 +876,7 @@ mod tests {
                 PrBranchName("dank-spr/alpha".to_string()),
                 PrBranchRecord::Live {
                     stack_id: StackId("stack-1".to_string()),
-                    tag: PrTag("alpha".to_string()),
+                    selector: GroupSelectorText("pr:alpha".to_string()),
                     last_group_seed: "a1".to_string(),
                     last_group_tip: "a2".to_string(),
                     last_stack_head: "old-head".to_string(),
@@ -870,6 +897,67 @@ mod tests {
             }
             other => panic!("expected tombstone, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_snapshot_rejects_branch_owned_by_different_known_live_stack() {
+        let existing = StackMetadataFile {
+            schema_version: STACK_METADATA_SCHEMA_VERSION,
+            stacks: BTreeMap::from([
+                (
+                    StackId("stack-1".to_string()),
+                    StackRecord {
+                        preferred_branch: StackBranchName("dank/stack-one".to_string()),
+                        known_branches: vec![StackBranchName("dank/stack-one".to_string())],
+                        base: "origin/main".to_string(),
+                        prefix: "dank-spr/".to_string(),
+                        last_seen_head: "head-one".to_string(),
+                        updated_at: "2026-03-05T00:00:00Z".to_string(),
+                    },
+                ),
+                (
+                    StackId("stack-2".to_string()),
+                    StackRecord {
+                        preferred_branch: StackBranchName("dank/stack-two".to_string()),
+                        known_branches: vec![StackBranchName("dank/stack-two".to_string())],
+                        base: "origin/main".to_string(),
+                        prefix: "dank-spr/".to_string(),
+                        last_seen_head: "head-two".to_string(),
+                        updated_at: "2026-03-05T00:00:00Z".to_string(),
+                    },
+                ),
+            ]),
+            pr_branches: BTreeMap::from([(
+                PrBranchName("feature/login".to_string()),
+                PrBranchRecord::Live {
+                    stack_id: StackId("stack-2".to_string()),
+                    selector: GroupSelectorText("branch:feature/login".to_string()),
+                    last_group_seed: "a1".to_string(),
+                    last_group_tip: "a2".to_string(),
+                    last_stack_head: "head-two".to_string(),
+                    updated_at: "2026-03-05T00:00:00Z".to_string(),
+                },
+            )]),
+        };
+        let snapshot = StackSnapshot {
+            stack_branch: StackBranchName("dank/stack-one".to_string()),
+            stack_head: "head-one-new".to_string(),
+            base: "origin/main".to_string(),
+            prefix: "dank-spr/".to_string(),
+            groups: vec![StackSnapshotGroup {
+                pr_branch: PrBranchName("feature/login".to_string()),
+                selector: GroupSelectorText("branch:feature/login".to_string()),
+                last_group_seed: "b1".to_string(),
+                last_group_tip: "b2".to_string(),
+            }],
+        };
+
+        let err = apply_snapshot(existing, &snapshot, "2026-03-05T03:00:00Z").unwrap_err();
+
+        assert!(
+            err.to_string().contains("disagree on stack ownership"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

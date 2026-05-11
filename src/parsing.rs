@@ -1,68 +1,85 @@
-//! Parse `pr:<tag>` commit markers into PR groups and attach ignore blocks.
+//! Parse group markers into PR groups and attach ignore blocks.
 //!
 //! The parser treats `pr:ignore` (or a configured ignore tag) as a local-only block:
 //! ignored commits are preserved in local history, but they are not part of any PR
 //! grouping and are attached to the preceding group for rewrite operations.
 
 use crate::git::git_ro;
+use crate::group_markers::{candidate_group_markers, first_valid_group_marker, GroupMarker};
 use anyhow::{bail, Result};
 use std::collections::HashSet;
 use tracing::warn;
 
-/// A PR group derived from `pr:<tag>` markers in commit messages.
+/// A PR group derived from seed markers in commit messages.
 ///
 /// Groups are ordered oldest→newest, and each group owns the commits that will
 /// become its branch tip. Ignore blocks are preserved and attached to the group
 /// they follow so rewrite operations can keep local-only work.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Group {
-    /// The tag value from `pr:<tag>`.
-    pub tag: String,
+    /// The exact one-of marker from the group's seed commit.
+    pub marker: GroupMarker,
     /// Subjects for commits in this group, oldest→newest.
     pub subjects: Vec<String>,
     /// Commit SHAs for the group, oldest→newest.
     pub commits: Vec<String>, // SHAs oldest→newest
     /// Full commit message for the first commit in the group.
     pub first_message: Option<String>,
-    /// Commits that follow this group in an ignore block (pr:ignore_tag .. next pr:<tag>).
+    /// Commits that follow this group in an ignore block (pr:ignore_tag .. next group marker).
     pub ignored_after: Vec<String>,
 }
 
 impl Group {
+    pub fn selector_text(&self) -> String {
+        self.marker.explicit_selector_text()
+    }
+
+    pub fn bare_selector_text(&self) -> &str {
+        self.marker.bare_selector_text()
+    }
+
+    pub fn concrete_branch_name(&self, prefix: &str) -> String {
+        self.marker.concrete_branch_name(prefix)
+    }
+
     pub fn pr_title(&self) -> Result<String> {
         if let Some(s) = self.subjects.first() {
-            let t = crate::pr_labels::strip_valid_markers(s).trim().to_string();
+            let t = crate::group_markers::strip_valid_group_markers(s)
+                .trim()
+                .to_string();
             if !t.is_empty() {
                 return Ok(t);
             }
         }
-        Ok(self.tag.clone())
+        Ok(self.bare_selector_text().to_string())
     }
     pub fn squash_commit_message(&self) -> Result<String> {
         if let Some(full) = &self.first_message {
-            // Validate the first commit contains the expected pr:<tag> marker
-            if let Some(found) = crate::pr_labels::first_valid_marker_label(full) {
-                if !found.eq_ignore_ascii_case(&self.tag) {
+            if let Some(found) = first_valid_group_marker(full) {
+                if found != self.marker {
                     bail!(
-                        "First commit tag mismatch for group `{}`: expected `pr:{}`, found `pr:{}`",
-                        self.tag,
-                        self.tag,
+                        "First commit marker mismatch for group `{}`: expected `{}`, found `{}`",
+                        self.selector_text(),
+                        self.selector_text(),
                         found
                     );
                 }
             } else {
                 bail!(
-                    "First commit is missing required `pr:{}` tag for group `{}`.",
-                    self.tag,
-                    self.tag
+                    "First commit is missing required `{}` marker for group `{}`.",
+                    self.selector_text(),
+                    self.selector_text()
                 );
             }
             return Ok(full.trim_end().to_string());
         }
-        bail!("First commit message missing for group `{}`", self.tag)
+        bail!(
+            "First commit message missing for group `{}`",
+            self.selector_text()
+        )
     }
     pub fn pr_body(&self) -> Result<String> {
-        // Use only the body (drop the subject/title line); remove pr:<tag> markers
+        // Use only the body (drop the subject/title line); remove group markers.
         let base_body = if let Some(full) = &self.first_message {
             let mut it = full.lines();
             let _ = it.next();
@@ -70,7 +87,7 @@ impl Group {
         } else {
             String::new()
         };
-        let cleaned = crate::pr_labels::strip_valid_markers(&base_body)
+        let cleaned = crate::group_markers::strip_valid_group_markers(&base_body)
             .trim()
             .to_string();
         let sep = if cleaned.is_empty() { "" } else { "\n\n" };
@@ -80,7 +97,7 @@ impl Group {
         ))
     }
 
-    /// Body derived from the first commit message (without the title line) and with pr:<tag> markers removed.
+    /// Body derived from the first commit message (without the title line) and with group markers removed.
     /// Does not include any stack markers. Trimmed.
     pub fn pr_body_base(&self) -> Result<String> {
         let base_body = if let Some(full) = &self.first_message {
@@ -90,35 +107,36 @@ impl Group {
         } else {
             String::new()
         };
-        Ok(crate::pr_labels::strip_valid_markers(&base_body)
+        Ok(crate::group_markers::strip_valid_group_markers(&base_body)
             .trim()
             .to_string())
     }
 }
 
 #[derive(Debug)]
-struct DuplicateGroupTagError {
-    tag: String,
+struct DuplicateGroupMarkerError {
+    marker: String,
 }
 
-impl std::fmt::Display for DuplicateGroupTagError {
+impl std::fmt::Display for DuplicateGroupMarkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Duplicate outstanding PR group tag `pr:{}`. `pr:<label>` starts a PR group, must remain unique within the outstanding stack, and is now used as a stable handle.",
-            self.tag
+            "Duplicate outstanding PR group marker `{}`. Each live group marker must remain unique within the outstanding stack.",
+            self.marker
         )
     }
 }
 
-impl std::error::Error for DuplicateGroupTagError {}
+impl std::error::Error for DuplicateGroupMarkerError {}
 
-fn ensure_unique_group_tags(groups: &[Group]) -> Result<()> {
-    let mut seen: HashSet<&str> = HashSet::new();
+fn ensure_unique_group_markers(groups: &[Group]) -> Result<()> {
+    let mut seen: HashSet<String> = HashSet::new();
     for group in groups {
-        if !seen.insert(group.tag.as_str()) {
-            return Err(DuplicateGroupTagError {
-                tag: group.tag.clone(),
+        let selector_text = group.selector_text();
+        if !seen.insert(selector_text.clone()) {
+            return Err(DuplicateGroupMarkerError {
+                marker: selector_text,
             }
             .into());
         }
@@ -129,16 +147,16 @@ fn ensure_unique_group_tags(groups: &[Group]) -> Result<()> {
 /// Parse a reversed git log stream into PR groups, honoring an ignore tag.
 ///
 /// The input must be the raw output of `git log --format=%H%x00%B%x1e --reverse <range>`.
-/// Commits with a single `pr:<tag>` marker start a new group, and untagged commits
+/// Commits with a single group marker start a new group, and untagged commits
 /// are appended to the current group once one exists.
 ///
 /// If a commit's tag matches `ignore_tag` (case-sensitive), the current group is
 /// finalized and the parser enters ignore mode; commits are skipped until the next
-/// non-ignore `pr:<tag>` marker is seen.
+/// non-ignore group marker is seen.
 ///
 /// # Errors
 ///
-/// Returns an error if any commit message contains more than one `pr:<tag>` marker.
+/// Returns an error if any commit message contains more than one group marker.
 pub fn parse_groups(raw: &str, ignore_tag: &str) -> Result<Vec<Group>> {
     let (_leading_ignored, groups) = parse_groups_with_ignored(raw, ignore_tag)?;
     Ok(groups)
@@ -152,7 +170,7 @@ pub fn parse_groups(raw: &str, ignore_tag: &str) -> Result<Vec<Group>> {
 ///
 /// # Errors
 ///
-/// Returns an error if any commit message contains more than one `pr:<tag>` marker.
+/// Returns an error if any commit message contains more than one group marker.
 pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<String>, Vec<Group>)> {
     let mut groups: Vec<Group> = vec![];
     let mut current: Option<Group> = None;
@@ -190,16 +208,19 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
         let message = parts.next().unwrap_or_default().to_string();
         let subj = message.lines().next().unwrap_or_default().to_string();
 
-        let tags = crate::pr_labels::candidate_marker_labels(&message);
-        if tags.len() > 1 {
-            bail!("Multiple pr:<tag> markers found in commit {sha}");
+        let markers = candidate_group_markers(&message);
+        if markers.len() > 1 {
+            bail!("Multiple group markers found in commit {sha}");
         }
 
-        if let Some(tag) = tags.first() {
-            if let Err(err) = crate::pr_labels::validate_label(tag) {
-                bail!("Commit {sha} has invalid PR tag `pr:{tag}`: {err}");
-            }
-            if tag == ignore_tag {
+        if let Some(candidate_marker) = markers.into_iter().next() {
+            let marker = candidate_marker.clone().validate().map_err(|err| {
+                anyhow::anyhow!(
+                    "Commit {sha} has invalid group marker `{}`: {err:#}",
+                    candidate_marker.display_text()
+                )
+            })?;
+            if marker.is_ignore_pr_label(ignore_tag) {
                 flush_current(&mut current, &mut groups);
                 ignoring = true;
                 ignored_block.push(sha);
@@ -211,7 +232,7 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
             }
             flush_current(&mut current, &mut groups);
             current = Some(Group {
-                tag: tag.clone(),
+                marker,
                 subjects: vec![subj.clone()],
                 commits: vec![sha],
                 first_message: Some(message.clone()),
@@ -223,20 +244,20 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
             g.subjects.push(subj);
             g.commits.push(sha);
         } else {
-            warn!("Untagged commit before first pr:<tag>; ignored");
+            warn!("Untagged commit before first group marker; ignored");
         }
     }
     flush_current(&mut current, &mut groups);
     if ignoring {
         flush_ignored(&mut ignored_block, &mut groups, &mut leading_ignored);
     }
-    ensure_unique_group_tags(&groups)?;
+    ensure_unique_group_markers(&groups)?;
     Ok((leading_ignored, groups))
 }
 
 /// Split parsed groups into the publishable update prefix and the local-only suffix.
 ///
-/// Once an ignored block appears, later `pr:<tag>` groups stay local-only because
+/// Once an ignored block appears, later groups stay local-only because
 /// publishing them would include the ignored commits in GitHub diffs. The returned
 /// handle list is already formatted for user-facing warnings.
 pub fn split_groups_for_update(
@@ -257,7 +278,7 @@ pub fn split_groups_for_update(
     let skipped_handles: Vec<String> = groups
         .iter()
         .skip(first_local_only_group_idx)
-        .map(|group| format!("pr:{}", group.tag))
+        .map(Group::selector_text)
         .collect();
     let pushable_groups: Vec<Group> = groups
         .into_iter()
@@ -299,7 +320,7 @@ pub fn derive_local_groups(base: &str, ignore_tag: &str) -> Result<(String, Vec<
 /// Derive PR groups and leading ignored commits from `merge-base(base, to)..to`.
 ///
 /// Leading ignored commits come from an ignore block that appears before the first
-/// `pr:<tag>` marker and are preserved ahead of the stack during rewrite operations.
+/// group marker and are preserved ahead of the stack during rewrite operations.
 ///
 /// # Errors
 ///
@@ -365,12 +386,35 @@ mod tests {
         ]);
         let groups = parse_groups(&raw, "skip").expect("parse_groups ok");
         assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0].tag, "alpha");
+        assert_eq!(groups[0].bare_selector_text(), "alpha");
         assert_eq!(groups[0].commits, vec!["a1", "a2"]);
-        assert_eq!(groups[1].tag, "ignore");
+        assert_eq!(groups[1].bare_selector_text(), "ignore");
         assert_eq!(groups[1].commits, vec!["i1", "i2"]);
-        assert_eq!(groups[2].tag, "beta");
+        assert_eq!(groups[2].bare_selector_text(), "beta");
         assert_eq!(groups[2].commits, vec!["b1"]);
+    }
+
+    #[test]
+    fn parse_groups_accepts_mixed_pr_and_branch_markers() {
+        let raw = make_log(&[
+            ("a1", "feat: login start branch:feature/login"),
+            ("b1", "feat: beta start pr:beta"),
+            ("c1", "feat: docs start branch:release/docs"),
+        ]);
+
+        let groups = parse_groups(&raw, "ignore").expect("parse_groups ok");
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.selector_text())
+                .collect::<Vec<_>>(),
+            vec![
+                "branch:feature/login".to_string(),
+                "pr:beta".to_string(),
+                "branch:release/docs".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -387,19 +431,19 @@ mod tests {
             parse_groups_with_ignored(&raw, "ignore").expect("parse_groups_with_ignored ok");
         assert!(leading.is_empty());
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].tag, "alpha");
+        assert_eq!(groups[0].bare_selector_text(), "alpha");
         assert_eq!(groups[0].commits, vec!["a1", "a2"]);
         assert_eq!(groups[0].ignored_after, vec!["i1", "i2"]);
-        assert_eq!(groups[1].tag, "beta");
+        assert_eq!(groups[1].bare_selector_text(), "beta");
         assert_eq!(groups[1].commits, vec!["b1", "b2"]);
         assert!(groups[1].ignored_after.is_empty());
 
         // Superset check: the wrapper should drop ignored commits but preserve grouping.
         let groups_via_wrapper = parse_groups(&raw, "ignore").expect("parse_groups ok");
         assert_eq!(groups_via_wrapper.len(), 2);
-        assert_eq!(groups_via_wrapper[0].tag, "alpha");
+        assert_eq!(groups_via_wrapper[0].bare_selector_text(), "alpha");
         assert_eq!(groups_via_wrapper[0].commits, vec!["a1", "a2"]);
-        assert_eq!(groups_via_wrapper[1].tag, "beta");
+        assert_eq!(groups_via_wrapper[1].bare_selector_text(), "beta");
         assert_eq!(groups_via_wrapper[1].commits, vec!["b1", "b2"]);
     }
 
@@ -414,7 +458,7 @@ mod tests {
             parse_groups_with_ignored(&raw, "ignore").expect("parse_groups_with_ignored ok");
         assert_eq!(leading, vec!["i1", "i2"]);
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].tag, "alpha");
+        assert_eq!(groups[0].bare_selector_text(), "alpha");
         assert!(groups[0].ignored_after.is_empty());
     }
 
@@ -434,7 +478,7 @@ mod tests {
         assert_eq!(
             pushable
                 .iter()
-                .map(|group| group.tag.as_str())
+                .map(|group| group.bare_selector_text())
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta"]
         );
@@ -460,7 +504,7 @@ mod tests {
         assert_eq!(
             pushable
                 .iter()
-                .map(|group| group.tag.as_str())
+                .map(|group| group.bare_selector_text())
                 .collect::<Vec<_>>(),
             vec!["alpha"]
         );
@@ -493,9 +537,9 @@ mod tests {
         ]);
         let groups = parse_groups(&raw, "ignore").expect("parse_groups ok");
         assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0].tag, "alpha");
-        assert_eq!(groups[1].tag, "IGNORE");
-        assert_eq!(groups[2].tag, "beta");
+        assert_eq!(groups[0].bare_selector_text(), "alpha");
+        assert_eq!(groups[1].bare_selector_text(), "IGNORE");
+        assert_eq!(groups[2].bare_selector_text(), "beta");
     }
 
     #[test]
@@ -509,8 +553,21 @@ mod tests {
         let err = parse_groups(&raw, "ignore").unwrap_err();
         let message = format!("{err:#}");
         assert!(
-            message.contains("Duplicate outstanding PR group tag `pr:alpha`"),
+            message.contains("Duplicate outstanding PR group marker `pr:alpha`"),
             "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_groups_rejects_multiple_marker_kinds_on_one_seed() {
+        let raw = make_log(&[("a1", "feat: invalid pr:alpha branch:feature/login")]);
+
+        let err = parse_groups(&raw, "ignore").unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Multiple group markers found in commit a1"),
+            "unexpected error: {err:#}"
         );
     }
 
@@ -521,7 +578,7 @@ mod tests {
         let err = parse_groups(&raw, "ignore").unwrap_err();
         let message = format!("{err:#}");
         assert!(
-            message.contains("Commit a1 has invalid PR tag `pr:1alpha`"),
+            message.contains("Commit a1 has invalid group marker `pr:1alpha`"),
             "unexpected error: {message}"
         );
         assert!(
@@ -539,13 +596,13 @@ mod tests {
 
         let groups = parse_groups(&raw, "ignore").unwrap();
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].tag, "alpha-");
+        assert_eq!(groups[0].bare_selector_text(), "alpha-");
         assert_eq!(groups[0].pr_title().unwrap(), "feat: alpha start");
         assert_eq!(
             groups[0].squash_commit_message().unwrap(),
             "feat: alpha start pr:alpha-"
         );
-        assert_eq!(groups[1].tag, "beta.");
+        assert_eq!(groups[1].bare_selector_text(), "beta.");
         assert_eq!(groups[1].pr_title().unwrap(), "feat: beta start");
     }
 
@@ -556,7 +613,7 @@ mod tests {
         let err = parse_groups(&raw, "ignore").unwrap_err();
         let message = format!("{err:#}");
         assert!(
-            message.contains("Commit a1 has invalid PR tag `pr:alpha!oops`"),
+            message.contains("Commit a1 has invalid group marker `pr:alpha!oops`"),
             "unexpected error: {message}"
         );
         assert!(
@@ -574,7 +631,7 @@ mod tests {
         let err = parse_groups(&raw, "ignore").unwrap_err();
         let message = format!("{err:#}");
         assert!(
-            message.contains("Commit a1 has invalid PR tag `pr:`"),
+            message.contains("Commit a1 has invalid group marker `pr:`"),
             "unexpected error: {message}"
         );
         assert!(

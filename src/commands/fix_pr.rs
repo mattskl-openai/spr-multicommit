@@ -85,17 +85,17 @@ pub fn fix_pr_tail(
     let m = tail_count.min(all_commits.len());
     let top_commits: Vec<String> = all_commits.split_off(all_commits.len() - m);
 
-    // Validate: moved commits must NOT contain pr:<tag> markers
+    // Validate: moved commits must NOT contain group markers.
     let mut offenders: Vec<String> = vec![];
     for sha in &top_commits {
         let msg = git_ro(["log", "-n", "1", "--format=%B", sha].as_slice())?;
-        if crate::pr_labels::contains_candidate_marker(&msg) {
+        if !crate::group_markers::candidate_group_markers(&msg).is_empty() {
             offenders.push(sha.clone());
         }
     }
     if !offenders.is_empty() {
         bail!(
-            "Selected tail commit(s) contain pr:<tag> markers; cannot move commits that start or belong to PR groups: {}",
+            "Selected tail commit(s) contain group markers; cannot move commits that start or belong to PR groups: {}",
             offenders
                 .iter()
                 .map(|s| s.chars().take(8).collect::<String>())
@@ -207,7 +207,7 @@ mod tests {
     use crate::config::DirtyWorktreePolicy;
     use crate::execution::ExecutionMode;
     use crate::parsing::Group;
-    use crate::selectors::{GroupSelector, StableHandle};
+    use crate::selectors::{ExplicitGroupSelector, GroupSelector};
     use crate::test_support::{lock_cwd, DirGuard};
     use std::fs;
     use std::path::Path;
@@ -225,7 +225,7 @@ mod tests {
     fn groups(tags: &[&str]) -> Vec<Group> {
         tags.iter()
             .map(|tag| Group {
-                tag: tag.to_string(),
+                marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
                 subjects: vec![format!("feat: {tag}")],
                 commits: vec![format!("{tag}1")],
                 first_message: Some(format!("feat: {tag} pr:{tag}")),
@@ -237,9 +237,7 @@ mod tests {
     #[test]
     fn fix_pr_resolves_stable_handle_to_current_local_ordinal() {
         let groups = groups(&["alpha", "beta", "gamma"]);
-        let target = GroupSelector::Stable(StableHandle {
-            tag: "beta".to_string(),
-        });
+        let target = GroupSelector::Explicit(ExplicitGroupSelector::PrLabel("beta".to_string()));
 
         assert_eq!(resolve_fix_pr_target(&groups, &target).unwrap(), 2);
     }

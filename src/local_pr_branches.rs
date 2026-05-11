@@ -1,15 +1,15 @@
 //! Optional synchronization for local per-PR branches.
 //!
-//! The synthetic branch name for a PR group is `prefix + tag`. Remote updates
-//! already use those names, and this module optionally keeps matching local
-//! branches pointed at the same group tips.
+//! Each group's canonical branch name is resolved from its seed marker. Remote
+//! updates already use those names, and this module optionally keeps matching
+//! local branches pointed at the same group tips.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashSet;
 use tracing::info;
 
-use crate::branch_names::synthetic_branch_name;
+use crate::branch_names::group_branch_name;
 use crate::config::LocalPrBranchSyncPolicy;
 use crate::execution::ExecutionMode;
 use crate::git::{git_is_ancestor, git_local_branch_tip, git_ro, git_rw};
@@ -53,14 +53,13 @@ pub fn targets_from_groups(prefix: &str, groups: &[Group]) -> Result<Vec<LocalPr
     groups
         .iter()
         .map(|group| {
-            let tip = group
-                .commits
-                .last()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Group {} has no commits", group.tag))?;
+            let tip =
+                group.commits.last().cloned().ok_or_else(|| {
+                    anyhow::anyhow!("Group {} has no commits", group.selector_text())
+                })?;
             Ok(LocalPrBranchTarget {
-                stable_handle: crate::commands::common::stable_handle_text(&group.tag),
-                branch_name: synthetic_branch_name(prefix, &group.tag),
+                stable_handle: crate::commands::common::group_selector_text(group),
+                branch_name: group_branch_name(prefix, group),
                 tip,
             })
         })
@@ -310,11 +309,13 @@ fn short_sha(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        plan_local_pr_branch_drift, sync_local_pr_branches, LocalPrBranchActionKind,
-        LocalPrBranchTarget,
+        plan_local_pr_branch_drift, sync_local_pr_branches, targets_from_groups,
+        LocalPrBranchActionKind, LocalPrBranchTarget,
     };
     use crate::config::LocalPrBranchSyncPolicy;
     use crate::execution::ExecutionMode;
+    use crate::group_markers::GroupMarker;
+    use crate::parsing::Group;
     use crate::test_support::{commit_file, git, init_repo, lock_cwd, DirGuard};
     use std::path::Path;
 
@@ -348,6 +349,33 @@ mod tests {
             branch_name: branch_name.to_string(),
             tip: tip.to_string(),
         }
+    }
+
+    #[test]
+    fn targets_from_groups_manage_resolved_branch_names_for_both_marker_kinds() {
+        let groups = vec![
+            Group {
+                marker: GroupMarker::BranchName("feature/login".to_string()),
+                subjects: Vec::new(),
+                commits: vec!["a1".to_string()],
+                first_message: None,
+                ignored_after: Vec::new(),
+            },
+            Group {
+                marker: GroupMarker::PrLabel("beta".to_string()),
+                subjects: Vec::new(),
+                commits: vec!["b1".to_string()],
+                first_message: None,
+                ignored_after: Vec::new(),
+            },
+        ];
+
+        let targets = targets_from_groups("dank-spr/", &groups).unwrap();
+
+        assert_eq!(targets[0].stable_handle, "branch:feature/login");
+        assert_eq!(targets[0].branch_name, "feature/login");
+        assert_eq!(targets[1].stable_handle, "pr:beta");
+        assert_eq!(targets[1].branch_name, "dank-spr/beta");
     }
 
     #[test]

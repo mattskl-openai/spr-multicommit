@@ -1,28 +1,39 @@
 //! Typed parsing and resolution for PR-group selectors.
 //!
-//! These types separate user-facing selector syntax from the current local PR
-//! numbering. Command entrypoints parse into these enums once, then resolve
-//! them against the current `Vec<Group>` to recover the numeric boundary or
-//! local ordinal that existing command logic already understands. Stable-label
-//! selectors accept either bare labels or the explicit `pr:<label>` form, while
-//! digits-only inputs remain local PR ordinals.
+//! Explicit selectors use either `pr:<label>` or `branch:<branch-name>`.
+//! Bare selectors are convenience syntax only: they resolve when exactly one
+//! current-stack group has the matching bare marker payload.
 
 use std::fmt::{self, Display};
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Result};
 
+use crate::group_markers::GroupMarker;
 use crate::parsing::Group;
 
-/// An immutable `pr:<label>` handle that refers to one outstanding PR group.
+/// An explicit selector that refers to one outstanding PR group.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StableHandle {
-    pub tag: String,
+pub enum ExplicitGroupSelector {
+    PrLabel(String),
+    BranchName(String),
 }
 
-impl Display for StableHandle {
+impl ExplicitGroupSelector {
+    fn marker(&self) -> GroupMarker {
+        match self {
+            Self::PrLabel(label) => GroupMarker::PrLabel(label.clone()),
+            Self::BranchName(branch_name) => GroupMarker::BranchName(branch_name.clone()),
+        }
+    }
+}
+
+impl Display for ExplicitGroupSelector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pr:{}", self.tag)
+        match self {
+            Self::PrLabel(label) => write!(f, "pr:{label}"),
+            Self::BranchName(branch_name) => write!(f, "branch:{branch_name}"),
+        }
     }
 }
 
@@ -30,14 +41,16 @@ impl Display for StableHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupSelector {
     LocalPr(usize),
-    Stable(StableHandle),
+    Explicit(ExplicitGroupSelector),
+    Bare(String),
 }
 
 impl Display for GroupSelector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LocalPr(n) => write!(f, "LPR #{}", n),
-            Self::Stable(handle) => write!(f, "{handle}"),
+            Self::LocalPr(n) => write!(f, "LPR #{n}"),
+            Self::Explicit(selector) => write!(f, "{selector}"),
+            Self::Bare(value) => write!(f, "{value}"),
         }
     }
 }
@@ -77,11 +90,12 @@ pub enum GroupRangeSelector {
     },
 }
 
-fn has_pr_prefix(input: &str) -> bool {
-    if let Some(prefix) = input.get(..3) {
-        prefix.eq_ignore_ascii_case("pr:")
+fn strip_ascii_prefix<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = input.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        input.get(prefix.len()..)
     } else {
-        false
+        None
     }
 }
 
@@ -89,38 +103,39 @@ fn is_digits_only(input: &str) -> bool {
     !input.is_empty() && input.chars().all(|ch| ch.is_ascii_digit())
 }
 
-fn parse_handle(input: &str) -> std::result::Result<StableHandle, String> {
-    let trimmed = input.trim();
-    let tag = if has_pr_prefix(trimmed) {
-        if let Some(tag) = trimmed.get(3..) {
-            if tag.is_empty() {
-                return Err(format!(
-                    "stable selector `{trimmed}` is missing the label after `pr:`"
-                ));
-            } else {
-                tag
-            }
-        } else {
-            return Err(format!(
-                "stable selector `{trimmed}` is missing the label after `pr:`"
-            ));
-        }
-    } else {
-        trimmed
-    };
-
-    if let Err(err) = crate::pr_labels::validate_label(tag) {
+fn parse_pr_label(input: &str, whole: &str) -> std::result::Result<String, String> {
+    if input.is_empty() {
+        Err(format!(
+            "explicit selector `{whole}` is missing the label after `pr:`"
+        ))
+    } else if let Err(err) = crate::pr_labels::validate_label(input) {
         match err {
             crate::pr_labels::LabelValidationError::MustStartWithLetter => Err(format!(
-                "stable selector `{trimmed}` must start with an ASCII letter"
+                "explicit selector `{whole}` must start with an ASCII letter after `pr:`"
             )),
             crate::pr_labels::LabelValidationError::InvalidCharacters => Err(format!(
-                "stable selector `{trimmed}` must use only ASCII letters, digits, `.`, `_`, or `-` after the first letter"
+                "explicit selector `{whole}` must use only ASCII letters, digits, `.`, `_`, or `-` after the first letter"
             )),
         }
     } else {
-        Ok(StableHandle {
-            tag: tag.to_string(),
+        Ok(input.to_string())
+    }
+}
+
+fn parse_branch_name(input: &str, whole: &str) -> std::result::Result<String, String> {
+    crate::git::validate_branch_name(input)
+        .map(|()| input.to_string())
+        .map_err(|err| format!("explicit selector `{whole}` has invalid branch name: {err:#}"))
+}
+
+fn parse_explicit_selector(
+    input: &str,
+) -> Option<std::result::Result<ExplicitGroupSelector, String>> {
+    if let Some(label) = strip_ascii_prefix(input, "pr:") {
+        Some(parse_pr_label(label, input).map(ExplicitGroupSelector::PrLabel))
+    } else {
+        strip_ascii_prefix(input, "branch:").map(|branch_name| {
+            parse_branch_name(branch_name, input).map(ExplicitGroupSelector::BranchName)
         })
     }
 }
@@ -144,8 +159,10 @@ impl FromStr for GroupSelector {
         let trimmed = input.trim();
         if is_digits_only(trimmed) {
             parse_local_pr(trimmed).map(Self::LocalPr)
+        } else if let Some(selector) = parse_explicit_selector(trimmed) {
+            selector.map(Self::Explicit)
         } else {
-            parse_handle(trimmed).map(Self::Stable)
+            Ok(Self::Bare(trimmed.to_string()))
         }
     }
 }
@@ -157,7 +174,7 @@ impl FromStr for InclusiveSelector {
         let trimmed = input.trim();
         if is_digits_only(trimmed) {
             let parsed = trimmed.parse::<usize>().map_err(|_| {
-                format!("`{trimmed}` must be 0, a local PR number, a label, or `pr:<label>`")
+                format!("`{trimmed}` must be 0, a local PR number, or a group selector")
             })?;
             if parsed == 0 {
                 Ok(Self::All)
@@ -165,9 +182,7 @@ impl FromStr for InclusiveSelector {
                 Ok(Self::Group(GroupSelector::LocalPr(parsed)))
             }
         } else {
-            parse_handle(trimmed)
-                .map(GroupSelector::Stable)
-                .map(Self::Group)
+            trimmed.parse::<GroupSelector>().map(Self::Group)
         }
     }
 }
@@ -181,7 +196,7 @@ impl FromStr for AfterSelector {
         if is_digits_only(trimmed) {
             let parsed = trimmed.parse::<usize>().map_err(|_| {
                 format!(
-                    "`{trimmed}` must be 0, a local PR number, `bottom`, `top`, `last`, `all`, a label, or `pr:<label>`"
+                    "`{trimmed}` must be 0, a local PR number, `bottom`, `top`, `last`, `all`, or a group selector"
                 )
             })?;
             if parsed == 0 {
@@ -194,9 +209,7 @@ impl FromStr for AfterSelector {
         } else if lowered == "top" || lowered == "last" || lowered == "all" {
             Ok(Self::Top)
         } else {
-            parse_handle(trimmed)
-                .map(GroupSelector::Stable)
-                .map(Self::Group)
+            trimmed.parse::<GroupSelector>().map(Self::Group)
         }
     }
 }
@@ -216,6 +229,14 @@ impl FromStr for GroupRangeSelector {
     }
 }
 
+fn matching_bare_groups<'a>(groups: &'a [Group], bare: &str) -> Vec<(usize, &'a Group)> {
+    groups
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| group.bare_selector_text() == bare)
+        .collect()
+}
+
 /// Resolve a selector to a 0-based index into the current local stack.
 pub fn resolve_group_index(groups: &[Group], selector: &GroupSelector) -> Result<usize> {
     match selector {
@@ -232,10 +253,29 @@ pub fn resolve_group_index(groups: &[Group], selector: &GroupSelector) -> Result
                 )
             }
         }
-        GroupSelector::Stable(handle) => groups
-            .iter()
-            .position(|group| group.tag == handle.tag)
-            .ok_or_else(|| anyhow!("No outstanding PR group matches stable handle `{handle}`.")),
+        GroupSelector::Explicit(explicit) => {
+            let marker = explicit.marker();
+            groups
+                .iter()
+                .position(|group| group.marker == marker)
+                .ok_or_else(|| anyhow!("No outstanding PR group matches selector `{explicit}`."))
+        }
+        GroupSelector::Bare(bare) => match matching_bare_groups(groups, bare).as_slice() {
+            [] => Err(anyhow!(
+                "No outstanding PR group matches bare selector `{bare}`."
+            )),
+            [(index, _)] => Ok(*index),
+            matches => {
+                let explicit = matches
+                    .iter()
+                    .map(|(_, group)| format!("`{}`", group.selector_text()))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                Err(anyhow!(
+                    "Bare selector `{bare}` is ambiguous in the current stack: it matches {explicit}. Use an explicit selector."
+                ))
+            }
+        },
     }
 }
 
@@ -283,41 +323,54 @@ pub fn resolve_group_range(
 mod tests {
     use super::{
         resolve_after_count, resolve_group_index, resolve_group_range, resolve_inclusive_count,
-        AfterSelector, GroupRangeSelector, GroupSelector, InclusiveSelector, StableHandle,
+        AfterSelector, ExplicitGroupSelector, GroupRangeSelector, GroupSelector, InclusiveSelector,
     };
+    use crate::group_markers::GroupMarker;
     use crate::parsing::Group;
 
-    fn group(tag: &str) -> Group {
+    fn pr_group(label: &str) -> Group {
         Group {
-            tag: tag.to_string(),
-            subjects: vec![format!("feat: {tag}")],
-            commits: vec![format!("{tag}1")],
-            first_message: Some(format!("feat: {tag} pr:{tag}")),
+            marker: GroupMarker::PrLabel(label.to_string()),
+            subjects: vec![format!("feat: {label}")],
+            commits: vec![format!("{label}1")],
+            first_message: Some(format!("feat: {label} pr:{label}")),
             ignored_after: Vec::new(),
         }
     }
 
-    fn groups(tags: &[&str]) -> Vec<Group> {
-        tags.iter().map(|tag| group(tag)).collect()
+    fn branch_group(branch_name: &str) -> Group {
+        Group {
+            marker: GroupMarker::BranchName(branch_name.to_string()),
+            subjects: vec![format!("feat: {branch_name}")],
+            commits: vec![format!("{branch_name}1")],
+            first_message: Some(format!("feat: {branch_name} branch:{branch_name}")),
+            ignored_after: Vec::new(),
+        }
+    }
+
+    fn pr_groups(labels: &[&str]) -> Vec<Group> {
+        labels.iter().map(|label| pr_group(label)).collect()
     }
 
     #[test]
-    fn group_selector_parses_numeric_and_stable_forms() {
+    fn group_selector_parses_numeric_explicit_and_bare_forms() {
         assert_eq!(
             "2".parse::<GroupSelector>().unwrap(),
             GroupSelector::LocalPr(2)
         );
         assert_eq!(
             "PR:Beta".parse::<GroupSelector>().unwrap(),
-            GroupSelector::Stable(StableHandle {
-                tag: "Beta".to_string()
-            })
+            GroupSelector::Explicit(ExplicitGroupSelector::PrLabel("Beta".to_string()))
+        );
+        assert_eq!(
+            "branch:feature/login".parse::<GroupSelector>().unwrap(),
+            GroupSelector::Explicit(ExplicitGroupSelector::BranchName(
+                "feature/login".to_string()
+            ))
         );
         assert_eq!(
             "beta".parse::<GroupSelector>().unwrap(),
-            GroupSelector::Stable(StableHandle {
-                tag: "beta".to_string()
-            })
+            GroupSelector::Bare("beta".to_string())
         );
     }
 
@@ -329,14 +382,12 @@ mod tests {
         );
         assert_eq!(
             "beta".parse::<InclusiveSelector>().unwrap(),
-            InclusiveSelector::Group(GroupSelector::Stable(StableHandle {
-                tag: "beta".to_string()
-            }))
+            InclusiveSelector::Group(GroupSelector::Bare("beta".to_string()))
         );
     }
 
     #[test]
-    fn after_selector_parses_keywords_and_stable_handle() {
+    fn after_selector_parses_keywords_and_explicit_selector() {
         assert_eq!(
             "bottom".parse::<AfterSelector>().unwrap(),
             AfterSelector::Bottom
@@ -344,15 +395,9 @@ mod tests {
         assert_eq!("last".parse::<AfterSelector>().unwrap(), AfterSelector::Top);
         assert_eq!(
             "pr:beta".parse::<AfterSelector>().unwrap(),
-            AfterSelector::Group(GroupSelector::Stable(StableHandle {
-                tag: "beta".to_string()
-            }))
-        );
-        assert_eq!(
-            "beta".parse::<AfterSelector>().unwrap(),
-            AfterSelector::Group(GroupSelector::Stable(StableHandle {
-                tag: "beta".to_string()
-            }))
+            AfterSelector::Group(GroupSelector::Explicit(ExplicitGroupSelector::PrLabel(
+                "beta".to_string()
+            )))
         );
     }
 
@@ -361,9 +406,7 @@ mod tests {
         assert_eq!(
             "beta..3".parse::<GroupRangeSelector>().unwrap(),
             GroupRangeSelector::Inclusive {
-                start: GroupSelector::Stable(StableHandle {
-                    tag: "beta".to_string()
-                }),
+                start: GroupSelector::Bare("beta".to_string()),
                 end: GroupSelector::LocalPr(3)
             }
         );
@@ -371,49 +414,21 @@ mod tests {
             "2".parse::<GroupRangeSelector>().unwrap(),
             GroupRangeSelector::Single(GroupSelector::LocalPr(2))
         );
-        assert_eq!(
-            "beta..gamma".parse::<GroupRangeSelector>().unwrap(),
-            GroupRangeSelector::Inclusive {
-                start: GroupSelector::Stable(StableHandle {
-                    tag: "beta".to_string()
-                }),
-                end: GroupSelector::Stable(StableHandle {
-                    tag: "gamma".to_string()
-                })
-            }
-        );
     }
 
     #[test]
-    fn malformed_stable_handle_is_rejected() {
-        let err = "beta!oops".parse::<GroupSelector>().unwrap_err();
-        assert!(
-            err.contains("ASCII letters, digits"),
-            "unexpected error: {err}"
-        );
+    fn malformed_explicit_selectors_are_rejected() {
+        assert!("pr:1beta".parse::<GroupSelector>().is_err());
+        assert!("branch:bad..name".parse::<GroupSelector>().is_err());
     }
 
     #[test]
-    fn digit_prefixed_stable_handle_is_rejected() {
-        let err = "1beta".parse::<GroupSelector>().unwrap_err();
-        assert!(
-            err.contains("must start with an ASCII letter"),
-            "unexpected error: {err}"
-        );
-        let prefixed = "pr:1beta".parse::<GroupSelector>().unwrap_err();
-        assert!(
-            prefixed.contains("must start with an ASCII letter"),
-            "unexpected error: {prefixed}"
-        );
-    }
-
-    #[test]
-    fn prefixed_keyword_can_still_target_a_stable_handle() {
+    fn prefixed_keyword_can_still_target_an_explicit_selector() {
         assert_eq!(
             "pr:all".parse::<AfterSelector>().unwrap(),
-            AfterSelector::Group(GroupSelector::Stable(StableHandle {
-                tag: "all".to_string()
-            }))
+            AfterSelector::Group(GroupSelector::Explicit(ExplicitGroupSelector::PrLabel(
+                "all".to_string()
+            )))
         );
     }
 
@@ -430,48 +445,55 @@ mod tests {
     }
 
     #[test]
-    fn stable_handle_resolution_survives_local_pr_renumbering() {
-        let before = groups(&["alpha", "beta", "gamma"]);
-        let after = groups(&["beta", "gamma"]);
-        let selector = GroupSelector::Stable(StableHandle {
-            tag: "beta".to_string(),
-        });
+    fn bare_selector_resolution_survives_local_pr_renumbering() {
+        let before = pr_groups(&["alpha", "beta", "gamma"]);
+        let after = pr_groups(&["beta", "gamma"]);
+        let selector = GroupSelector::Bare("beta".to_string());
 
         let before_index = resolve_group_index(&before, &selector).unwrap();
         let after_index = resolve_group_index(&after, &selector).unwrap();
 
-        assert_eq!(before[before_index].tag, "beta");
-        assert_eq!(after[after_index].tag, "beta");
+        assert_eq!(before[before_index].bare_selector_text(), "beta");
+        assert_eq!(after[after_index].bare_selector_text(), "beta");
         assert_eq!(before_index + 1, 2);
         assert_eq!(after_index + 1, 1);
     }
 
     #[test]
-    fn stable_handle_resolution_remains_exact_case() {
-        let groups = groups(&["Alpha"]);
-        let selector = GroupSelector::Stable(StableHandle {
-            tag: "alpha".to_string(),
-        });
+    fn bare_selector_rejects_ambiguity_between_marker_kinds() {
+        let groups = vec![pr_group("beta"), branch_group("beta")];
+        let selector = GroupSelector::Bare("beta".to_string());
+
+        let err = resolve_group_index(&groups, &selector).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Bare selector `beta` is ambiguous"));
+        assert!(err.to_string().contains("`pr:beta` and `branch:beta`"));
+    }
+
+    #[test]
+    fn explicit_selector_resolution_remains_exact_case() {
+        let groups = pr_groups(&["Alpha"]);
+        let selector = GroupSelector::Explicit(ExplicitGroupSelector::PrLabel("alpha".to_string()));
 
         let err = resolve_group_index(&groups, &selector).unwrap_err();
 
         assert!(
             err.to_string()
-                .contains("No outstanding PR group matches stable handle `pr:alpha`"),
+                .contains("No outstanding PR group matches selector `pr:alpha`"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
     fn resolution_helpers_map_boundaries_to_counts() {
-        let groups = groups(&["alpha", "beta", "gamma"]);
+        let groups = pr_groups(&["alpha", "beta", "gamma"]);
 
         assert_eq!(
             resolve_inclusive_count(
                 &groups,
-                &InclusiveSelector::Group(GroupSelector::Stable(StableHandle {
-                    tag: "beta".to_string()
-                }))
+                &InclusiveSelector::Group(GroupSelector::Bare("beta".to_string()))
             )
             .unwrap(),
             2
@@ -479,9 +501,7 @@ mod tests {
         assert_eq!(
             resolve_after_count(
                 &groups,
-                &AfterSelector::Group(GroupSelector::Stable(StableHandle {
-                    tag: "beta".to_string()
-                }))
+                &AfterSelector::Group(GroupSelector::Bare("beta".to_string()))
             )
             .unwrap(),
             2
@@ -490,9 +510,7 @@ mod tests {
             resolve_group_range(
                 &groups,
                 &GroupRangeSelector::Inclusive {
-                    start: GroupSelector::Stable(StableHandle {
-                        tag: "beta".to_string()
-                    }),
+                    start: GroupSelector::Bare("beta".to_string()),
                     end: GroupSelector::LocalPr(3)
                 }
             )

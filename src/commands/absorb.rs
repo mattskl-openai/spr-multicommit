@@ -1,7 +1,7 @@
 //! Absorb append-only local per-PR branch tails back into the current stack.
 //!
-//! `spr absorb` inspects the current local stack, looks for exact local source
-//! branches named `prefix + tag`, and classifies each one as absorbable,
+//! `spr absorb` inspects the current local stack, looks for each group's exact
+//! canonical local branch, and classifies it as absorbable,
 //! skippable, or blocking. When one or more groups have append-only local
 //! branch tails, the command rebuilds the checked-out stack branch from its
 //! current merge-base and inserts those tails immediately after their owning
@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
-use crate::branch_names::{group_branch_identities, synthetic_branch_name};
+use crate::branch_names::{group_branch_identities, group_branch_name};
 use crate::commands::common::{self, CherryPickEmptyPolicy, CherryPickOp};
 use crate::commands::rewrite_resume::{
     self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
@@ -32,11 +32,11 @@ use crate::selectors::{resolve_group_index, GroupSelector};
 /// Rebuilds the current stack branch by folding append-only local per-PR branch
 /// tails back into their owning PR groups.
 ///
-/// The exact source branch rule is intentional: only the local branch named
-/// `prefix + tag` is considered for each group. Missing branches and branches
+/// The exact source branch rule is intentional: only the local branch resolved
+/// from the group's seed marker is considered for each group. Missing branches and branches
 /// that are unchanged or behind the stack are no-op states. Divergence, source
 /// branches that incorporated later stack commits, merge commits, and embedded
-/// `pr:<tag>` markers in absorbed tails are blocking errors. A local branch
+/// group markers in absorbed tails are blocking errors. A local branch
 /// whose canonical stack prefix was rewritten to patch-equivalent commits is
 /// still acceptable when that rewritten prefix descends from the same stack
 /// merge-base and reaches the same tree at the matched pre-tail endpoint.
@@ -86,7 +86,7 @@ pub fn absorb_branch_tails(
 /// Returns the local branch names the current absorb transaction may move.
 ///
 /// A tail inserted into an earlier group rewrites that group and every later
-/// group in the stack, even if optional local synthetic-branch synchronization
+/// group in the stack, even if optional local resolved-branch synchronization
 /// is disabled for the actual command. Untargeted queries return the realized
 /// changed suffix. Targeted queries return the requested suffix so callers can
 /// protect the whole transaction boundary before running apply mode.
@@ -124,7 +124,7 @@ fn changed_branches_for_plan(prefix: &str, plan: &RewritePlan) -> Result<Vec<Str
     changed_branches.extend(
         plan.groups[first_changed_group..]
             .iter()
-            .map(|group| synthetic_branch_name(prefix, &group.group.tag)),
+            .map(|group| group_branch_name(prefix, &group.group)),
     );
     Ok(changed_branches)
 }
@@ -265,10 +265,7 @@ impl SourceBranchRecord {
     fn summary_line(&self) -> String {
         match &self.classification {
             AbsorbClassification::Skip(reason) => {
-                format!(
-                    "pr:{} <- {} : skip ({})",
-                    self.tag, self.branch_name, reason
-                )
+                format!("{} <- {} : skip ({})", self.tag, self.branch_name, reason)
             }
             AbsorbClassification::Absorbable(tail) => {
                 let kept_text = if tail.kept_later_duplicate_replays.is_empty() {
@@ -280,7 +277,7 @@ impl SourceBranchRecord {
                     )
                 };
                 format!(
-                    "pr:{} <- {} : absorb {}{}",
+                    "{} <- {} : absorb {}{}",
                     self.tag,
                     self.branch_name,
                     commit_count_text(tail.commits.len()),
@@ -288,10 +285,7 @@ impl SourceBranchRecord {
                 )
             }
             AbsorbClassification::Blocked(reason) => {
-                format!(
-                    "pr:{} <- {} : block ({})",
-                    self.tag, self.branch_name, reason
-                )
+                format!("{} <- {} : block ({})", self.tag, self.branch_name, reason)
             }
         }
     }
@@ -431,7 +425,7 @@ impl std::fmt::Display for AbsorbBlocker {
                 owner_commit,
             } => write!(
                 f,
-                "absorbed tail commit {} duplicates later replayed pr:{} commit {}",
+                "absorbed tail commit {} duplicates later replayed {} commit {}",
                 short_sha(commit),
                 owner_tag,
                 short_sha(owner_commit)
@@ -442,7 +436,7 @@ impl std::fmt::Display for AbsorbBlocker {
                 owner_commit,
             } => write!(
                 f,
-                "absorbed tail commit {} duplicates later pr:{} seed commit {}; --allow-replayed-duplicates only applies to later non-seed commits, so this still blocks",
+                "absorbed tail commit {} duplicates later {} seed commit {}; --allow-replayed-duplicates only applies to later non-seed commits, so this still blocks",
                 short_sha(commit),
                 owner_tag,
                 short_sha(owner_commit)
@@ -514,13 +508,13 @@ fn build_out_of_scope_group_rewrite_plan(
     group: Group,
     prefix: &str,
 ) -> Result<PreliminaryGroupRewritePlan> {
-    let tag = group.tag.clone();
-    let branch_name = synthetic_branch_name(prefix, &group.tag);
+    let tag = group.selector_text();
+    let branch_name = group_branch_name(prefix, &group);
     let group_tip = group
         .commits
         .last()
         .cloned()
-        .ok_or_else(|| anyhow!("Group {} has no commits", group.tag))?;
+        .ok_or_else(|| anyhow!("Group {} has no commits", group.selector_text()))?;
     Ok(PreliminaryGroupRewritePlan {
         group,
         source: PreliminarySourceBranchRecord {
@@ -579,13 +573,13 @@ fn classify_source_branch_preliminary(
     stack_merge_base: &str,
     stack_head: &str,
 ) -> Result<PreliminarySourceBranchRecord> {
-    let branch_name = synthetic_branch_name(prefix, &group.tag);
+    let branch_name = group_branch_name(prefix, group);
     let stack_prefix = build_stack_prefix(group, stack_merge_base)?;
     let group_tip = stack_prefix
         .commits
         .last()
         .cloned()
-        .ok_or_else(|| anyhow!("Group {} has no commits", group.tag))?;
+        .ok_or_else(|| anyhow!("Group {} has no commits", group.selector_text()))?;
     let source_tip = git_local_branch_tip(&branch_name)?;
     let classification = if let Some(source_tip) = source_tip.as_deref() {
         if source_tip == group_tip {
@@ -620,7 +614,7 @@ fn classify_source_branch_preliminary(
         ))
     };
     Ok(PreliminarySourceBranchRecord {
-        tag: group.tag.clone(),
+        tag: group.selector_text(),
         branch_name,
         group_tip,
         source_tip,
@@ -638,7 +632,7 @@ fn finalize_source_branch_record(
         PreliminaryAbsorbClassification::NeedsTailValidation { commits } => {
             let later_owned_patches = later_owned_patches.ok_or_else(|| {
                 anyhow!(
-                    "Missing later-owned patch map for absorb candidate pr:{}",
+                    "Missing later-owned patch map for absorb candidate {}",
                     source.tag
                 )
             })?;
@@ -659,12 +653,17 @@ fn build_stack_prefix(group: &Group, stack_merge_base: &str) -> Result<StackPref
         .commits
         .last()
         .cloned()
-        .ok_or_else(|| anyhow!("Group {} has no commits", group.tag))?;
+        .ok_or_else(|| anyhow!("Group {} has no commits", group.selector_text()))?;
     let commits = git_rev_list_range(stack_merge_base, &group_tip)?;
     let group_start_index = commits
         .len()
         .checked_sub(group.commits.len())
-        .ok_or_else(|| anyhow!("Group {} stack prefix is shorter than the group", group.tag))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "Group {} stack prefix is shorter than the group",
+                group.selector_text()
+            )
+        })?;
     Ok(StackPrefix {
         commits,
         group_start_index,
@@ -794,7 +793,7 @@ fn classify_absorbed_tail(
             ));
         }
         let message = git_commit_message(sha)?;
-        if crate::pr_labels::contains_candidate_marker(&message) {
+        if !crate::group_markers::candidate_group_markers(&message).is_empty() {
             return Ok(AbsorbClassification::Blocked(
                 AbsorbBlocker::TailHasStackMarker {
                     commit: sha.clone(),
@@ -901,7 +900,7 @@ fn build_later_owned_patch_maps(
             record_later_replayed_commits(
                 &mut later_owned_patches,
                 &group.group.ignored_after,
-                &group.group.tag,
+                &group.group.selector_text(),
                 &patch_ids_by_commit,
                 LaterReplayedCommitKind::IgnoredAfter,
             );
@@ -915,7 +914,7 @@ fn build_later_owned_patch_maps(
             record_later_replayed_commits(
                 &mut later_owned_patches,
                 &group.group.commits,
-                &group.group.tag,
+                &group.group.selector_text(),
                 &patch_ids_by_commit,
                 LaterReplayedCommitKind::GroupFollowUp,
             );
@@ -1138,8 +1137,8 @@ fn emit_rewrite_plan(plan: &RewritePlan) {
             format!(" + keep {}", commit_count_text(kept_replays))
         };
         info!(
-            "  pr:{}: replay {}{}{}{}",
-            group.group.tag,
+            "  {}: replay {}{}{}{}",
+            group.group.selector_text(),
             commit_count_text(group.group.commits.len()),
             absorbed_text,
             ignored_text,
@@ -1179,7 +1178,7 @@ mod tests {
     use crate::config::DirtyWorktreePolicy;
     use crate::execution::ExecutionMode;
     use crate::parsing::{derive_local_groups_with_ignored, Group};
-    use crate::selectors::{GroupSelector, StableHandle};
+    use crate::selectors::{ExplicitGroupSelector, GroupSelector};
     use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
     use std::env;
     use std::fs;
@@ -1294,7 +1293,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("pr:alpha and pr:Alpha derive conflicting synthetic branch names"),
+                .contains("pr:alpha and pr:Alpha derive conflicting branch names"),
             "unexpected error: {err}"
         );
     }
@@ -1801,7 +1800,7 @@ mod tests {
                 owner_commit,
                 ..
             }) => {
-                assert_eq!(owner_tag, "beta");
+                assert_eq!(owner_tag, "pr:beta");
                 assert_eq!(owner_commit, repo.beta_tip.unwrap());
             }
             other => panic!("unexpected classification: {:?}", other),
@@ -1824,7 +1823,7 @@ mod tests {
             AbsorbClassification::Absorbable(tail) => {
                 assert_eq!(tail.commits.len(), 1);
                 assert_eq!(tail.kept_later_duplicate_replays.len(), 1);
-                assert_eq!(tail.kept_later_duplicate_replays[0].tag, "beta");
+                assert_eq!(tail.kept_later_duplicate_replays[0].tag, "pr:beta");
                 assert_eq!(
                     tail.kept_later_duplicate_replays[0].sha,
                     repo.beta_tip.unwrap()
@@ -1891,14 +1890,14 @@ mod tests {
     ) -> GroupRewritePlan {
         GroupRewritePlan {
             group: Group {
-                tag: tag.to_string(),
+                marker: crate::group_markers::GroupMarker::PrLabel(tag.to_string()),
                 subjects: Vec::new(),
                 commits: commits.iter().map(|sha| sha.to_string()).collect(),
                 first_message: None,
                 ignored_after: ignored_after.iter().map(|sha| sha.to_string()).collect(),
             },
             source: SourceBranchRecord {
-                tag: tag.to_string(),
+                tag: format!("pr:{tag}"),
                 branch_name: format!("dank-spr/{tag}"),
                 group_tip: commits.last().unwrap().to_string(),
                 source_tip: Some(
@@ -1951,7 +1950,7 @@ mod tests {
     #[test]
     fn rewritten_equivalent_prefix_skip_reason_has_distinct_summary_text() {
         let record = SourceBranchRecord {
-            tag: "alpha".to_string(),
+            tag: "pr:alpha".to_string(),
             branch_name: "dank-spr/alpha".to_string(),
             group_tip: "alpha-2".to_string(),
             source_tip: Some("alpha-rewrite-2".to_string()),
@@ -2207,7 +2206,7 @@ mod tests {
         assert_eq!(
             groups
                 .iter()
-                .map(|group| group.tag.as_str())
+                .map(Group::bare_selector_text)
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta", "gamma"]
         );
@@ -2316,7 +2315,7 @@ mod tests {
         assert_eq!(
             groups
                 .iter()
-                .map(|group| group.tag.as_str())
+                .map(Group::bare_selector_text)
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta", "gamma"]
         );
@@ -2631,9 +2630,7 @@ mod tests {
         );
         git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
 
-        let from = GroupSelector::Stable(StableHandle {
-            tag: "beta".to_string(),
-        });
+        let from = GroupSelector::Explicit(ExplicitGroupSelector::PrLabel("beta".to_string()));
         let _guard = DirGuard::change_to(&repo.repo);
         let changed_branches = query_absorb_changed_branches(
             &repo.base_branch,
@@ -2682,9 +2679,7 @@ mod tests {
         );
         git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
 
-        let from = GroupSelector::Stable(StableHandle {
-            tag: "beta".to_string(),
-        });
+        let from = GroupSelector::Explicit(ExplicitGroupSelector::PrLabel("beta".to_string()));
         {
             let _guard = DirGuard::change_to(&repo.repo);
             absorb_branch_tails(
@@ -2720,9 +2715,7 @@ mod tests {
         let _keep_dir_alive = repo.dir.path();
         git(&repo.repo, ["checkout", &repo.stack_branch].as_slice());
 
-        let from = GroupSelector::Stable(StableHandle {
-            tag: "missing".to_string(),
-        });
+        let from = GroupSelector::Explicit(ExplicitGroupSelector::PrLabel("missing".to_string()));
         let _guard = DirGuard::change_to(&repo.repo);
         let err = query_absorb_changed_branches(
             &repo.base_branch,
@@ -2735,7 +2728,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("No outstanding PR group matches stable handle `pr:missing`."),
+                .contains("No outstanding PR group matches selector `pr:missing`."),
             "unexpected error: {err}"
         );
     }
