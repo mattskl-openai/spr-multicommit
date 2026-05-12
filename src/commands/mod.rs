@@ -6,6 +6,7 @@ pub mod fix_pr;
 pub mod land;
 pub mod list;
 pub mod r#move;
+pub mod owning_stack;
 pub mod prep;
 pub mod relink_prs;
 pub mod resolve_stack;
@@ -34,6 +35,6 @@ pub use resolve_stack::{looks_like_pr_url, resolve_stack, ResolveStackOutput};
 pub use restack::{preview_restack_after, restack_after, restack_after_count};
 pub use rewrite_resume::{
     resume_context, resume_rewrite, RewriteCommandKind, RewriteCommandOutcome,
-    RewriteSuspendedState,
+    RewriteDestinationKind, RewriteSuspendedState,
 };
 pub use update::{build_from_groups, build_from_groups_with_summary};

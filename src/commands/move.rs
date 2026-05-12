@@ -7,7 +7,8 @@ use crate::branch_names::{group_branch_identities, group_branch_name};
 use crate::commands::common;
 use crate::commands::common::CherryPickOp;
 use crate::commands::rewrite_resume::{
-    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
+    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteDestinationKind,
+    RewriteSession,
 };
 use crate::config::DirtyWorktreePolicy;
 use crate::execution::ExecutionMode;
@@ -246,6 +247,7 @@ pub fn move_groups_after(
                     original_worktree_root,
                     original_branch: cur_branch,
                     original_head,
+                    destination_kind: RewriteDestinationKind::CheckedOutBranch,
                     resume_path,
                     temp_branch: tmp_branch,
                     temp_worktree_path: tmp_path,
