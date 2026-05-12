@@ -324,6 +324,8 @@ Resolve a canonical PR branch back to its owning stack branch using repo-local
 metadata stored under the repository common Git directory:
 
 - Metadata path: `<git-common-dir>/spr/stack_metadata_v1.json`
+- The filename is a stable historical path; the JSON `schema_version` inside the file is the
+  authoritative format version
 - Metadata is refreshed after successful `spr update`, `spr restack`,
   `spr absorb`, `spr move`, `spr fix-pr`, `spr resume`, and `spr land` when it
   also finishes the local follow-on restack

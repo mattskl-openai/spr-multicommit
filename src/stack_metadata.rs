@@ -25,7 +25,11 @@ use crate::git::{
 };
 use crate::parsing::{parse_groups_with_ignored, split_groups_for_update};
 
-pub const STACK_METADATA_SCHEMA_VERSION: u32 = 1;
+// TODO(2026-11-07): Drop schema v1 read compatibility after the six-month
+// migration window. Remove the `tag` serde aliases, legacy selector
+// canonicalization, and v1-only tests when this goes away.
+const LEGACY_STACK_METADATA_SCHEMA_VERSION: u32 = 1;
+pub const STACK_METADATA_SCHEMA_VERSION: u32 = 2;
 const LOCK_RETRY_ATTEMPTS: usize = 100;
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const STACK_METADATA_FILE_NAME: &str = "stack_metadata_v1.json";
@@ -74,7 +78,7 @@ pub struct StackRecord {
 pub enum PrBranchRecord {
     Live {
         stack_id: StackId,
-        #[serde(rename = "tag")]
+        #[serde(alias = "tag")]
         selector: GroupSelectorText,
         last_group_seed: String,
         last_group_tip: String,
@@ -83,7 +87,7 @@ pub enum PrBranchRecord {
     },
     Tombstoned {
         stack_id: StackId,
-        #[serde(rename = "tag")]
+        #[serde(alias = "tag")]
         selector: GroupSelectorText,
         last_group_seed: String,
         last_group_tip: String,
@@ -185,6 +189,63 @@ impl Default for StackMetadataFile {
     }
 }
 
+fn canonical_selector_text(selector: GroupSelectorText) -> GroupSelectorText {
+    if selector.0.starts_with("pr:") || selector.0.starts_with("branch:") {
+        selector
+    } else {
+        GroupSelectorText(format!("pr:{}", selector.0))
+    }
+}
+
+fn canonicalize_record(record: PrBranchRecord) -> PrBranchRecord {
+    match record {
+        PrBranchRecord::Live {
+            stack_id,
+            selector,
+            last_group_seed,
+            last_group_tip,
+            last_stack_head,
+            updated_at,
+        } => PrBranchRecord::Live {
+            stack_id,
+            selector: canonical_selector_text(selector),
+            last_group_seed,
+            last_group_tip,
+            last_stack_head,
+            updated_at,
+        },
+        PrBranchRecord::Tombstoned {
+            stack_id,
+            selector,
+            last_group_seed,
+            last_group_tip,
+            last_stack_head,
+            updated_at,
+            tombstone_reason,
+        } => PrBranchRecord::Tombstoned {
+            stack_id,
+            selector: canonical_selector_text(selector),
+            last_group_seed,
+            last_group_tip,
+            last_stack_head,
+            updated_at,
+            tombstone_reason,
+        },
+    }
+}
+
+fn canonicalize_metadata(metadata: StackMetadataFile) -> StackMetadataFile {
+    StackMetadataFile {
+        schema_version: STACK_METADATA_SCHEMA_VERSION,
+        stacks: metadata.stacks,
+        pr_branches: metadata
+            .pr_branches
+            .into_iter()
+            .map(|(branch_name, record)| (branch_name, canonicalize_record(record)))
+            .collect(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackSnapshot {
     pub stack_branch: StackBranchName,
@@ -236,15 +297,18 @@ fn load_metadata_from_path(path: &Path) -> Result<Option<StackMetadataFile>> {
         .with_context(|| format!("failed to read stack metadata {}", path.display()))?;
     let metadata: StackMetadataFile = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse stack metadata {}", path.display()))?;
-    if metadata.schema_version != STACK_METADATA_SCHEMA_VERSION {
+    if metadata.schema_version != LEGACY_STACK_METADATA_SCHEMA_VERSION
+        && metadata.schema_version != STACK_METADATA_SCHEMA_VERSION
+    {
         bail!(
-            "stack metadata {} uses schema version {}, but this spr expects {}",
+            "stack metadata {} uses schema version {}, but this spr supports {} and {}",
             path.display(),
             metadata.schema_version,
+            LEGACY_STACK_METADATA_SCHEMA_VERSION,
             STACK_METADATA_SCHEMA_VERSION
         );
     }
-    Ok(Some(metadata))
+    Ok(Some(canonicalize_metadata(metadata)))
 }
 
 pub fn load_metadata_for_repo_path(repo_path: &str) -> Result<Option<StackMetadataFile>> {
@@ -490,7 +554,8 @@ fn write_metadata_atomically(path: &Path, metadata: &StackMetadataFile) -> Resul
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create metadata directory {}", parent.display()))?;
 
-    let json = serde_json::to_string_pretty(metadata).context("failed to encode stack metadata")?;
+    let json = serde_json::to_string_pretty(&canonicalize_metadata(metadata.clone()))
+        .context("failed to encode stack metadata")?;
     let temp_path = parent.join(format!(
         ".{}.{}.tmp",
         STACK_METADATA_FILE_NAME,
@@ -753,7 +818,8 @@ mod tests {
         acquire_lock, apply_snapshot, load_metadata_from_path, metadata_lock_path,
         ordered_known_branches, write_metadata_atomically, GroupSelectorText, PrBranchName,
         PrBranchRecord, StackBranchName, StackId, StackMetadataFile, StackRecord, StackSnapshot,
-        StackSnapshotGroup, TombstoneReason, STACK_METADATA_SCHEMA_VERSION,
+        StackSnapshotGroup, TombstoneReason, LEGACY_STACK_METADATA_SCHEMA_VERSION,
+        STACK_METADATA_SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -966,25 +1032,157 @@ mod tests {
         let path = dir.path().join("stack_metadata_v1.json");
         fs::write(
             &path,
-            r#"{"schema_version":2,"stacks":{},"pr_branches":{}}"#,
+            r#"{"schema_version":3,"stacks":{},"pr_branches":{}}"#,
         )
         .unwrap();
 
         let err = load_metadata_from_path(&path).unwrap_err();
-        assert!(err.to_string().contains("schema version 2"));
+        assert!(err.to_string().contains("schema version 3"));
     }
 
     #[test]
-    fn write_metadata_atomically_replaces_file_and_cleans_temp_state() {
+    fn load_metadata_migrates_legacy_bare_tag_to_explicit_selector() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stack_metadata_v1.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 1,
+  "stacks": {},
+  "pr_branches": {
+    "dank-spr/alpha": {
+      "state": "live",
+      "stack_id": "stack-1",
+      "tag": "alpha",
+      "last_group_seed": "a1",
+      "last_group_tip": "a2",
+      "last_stack_head": "head",
+      "updated_at": "2026-03-05T00:00:00Z"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let metadata = load_metadata_from_path(&path).unwrap().unwrap();
+
+        assert_eq!(metadata.schema_version, STACK_METADATA_SCHEMA_VERSION);
+        assert_eq!(
+            metadata
+                .pr_branches
+                .get(&PrBranchName("dank-spr/alpha".to_string()))
+                .unwrap()
+                .selector()
+                .0
+                .as_str(),
+            "pr:alpha"
+        );
+    }
+
+    #[test]
+    fn load_metadata_preserves_legacy_explicit_tag_selector() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stack_metadata_v1.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 1,
+  "stacks": {},
+  "pr_branches": {
+    "feature/login": {
+      "state": "live",
+      "stack_id": "stack-1",
+      "tag": "branch:feature/login",
+      "last_group_seed": "a1",
+      "last_group_tip": "a2",
+      "last_stack_head": "head",
+      "updated_at": "2026-03-05T00:00:00Z"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let metadata = load_metadata_from_path(&path).unwrap().unwrap();
+
+        assert_eq!(
+            metadata
+                .pr_branches
+                .get(&PrBranchName("feature/login".to_string()))
+                .unwrap()
+                .selector()
+                .0
+                .as_str(),
+            "branch:feature/login"
+        );
+    }
+
+    #[test]
+    fn load_metadata_accepts_current_selector_shape() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stack_metadata_v1.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 2,
+  "stacks": {},
+  "pr_branches": {
+    "feature/login": {
+      "state": "live",
+      "stack_id": "stack-1",
+      "selector": "branch:feature/login",
+      "last_group_seed": "a1",
+      "last_group_tip": "a2",
+      "last_stack_head": "head",
+      "updated_at": "2026-03-05T00:00:00Z"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let metadata = load_metadata_from_path(&path).unwrap().unwrap();
+
+        assert_eq!(metadata.schema_version, STACK_METADATA_SCHEMA_VERSION);
+        assert_eq!(
+            metadata
+                .pr_branches
+                .get(&PrBranchName("feature/login".to_string()))
+                .unwrap()
+                .selector()
+                .0
+                .as_str(),
+            "branch:feature/login"
+        );
+    }
+
+    #[test]
+    fn write_metadata_atomically_emits_current_selector_shape_and_cleans_temp_state() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("stack_metadata_v1.json");
         fs::write(&path, "old").unwrap();
-        let metadata = StackMetadataFile::default();
+        let metadata = StackMetadataFile {
+            schema_version: LEGACY_STACK_METADATA_SCHEMA_VERSION,
+            stacks: BTreeMap::new(),
+            pr_branches: BTreeMap::from([(
+                PrBranchName("dank-spr/alpha".to_string()),
+                PrBranchRecord::Live {
+                    stack_id: StackId("stack-1".to_string()),
+                    selector: GroupSelectorText("alpha".to_string()),
+                    last_group_seed: "a1".to_string(),
+                    last_group_tip: "a2".to_string(),
+                    last_stack_head: "head".to_string(),
+                    updated_at: "2026-03-05T00:00:00Z".to_string(),
+                },
+            )]),
+        };
 
         write_metadata_atomically(&path, &metadata).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
-        assert!(written.contains("\"schema_version\": 1"));
+        assert!(written.contains("\"schema_version\": 2"));
+        assert!(written.contains("\"selector\": \"pr:alpha\""));
+        assert!(!written.contains("\"tag\""));
         assert!(fs::read_dir(dir.path()).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()
