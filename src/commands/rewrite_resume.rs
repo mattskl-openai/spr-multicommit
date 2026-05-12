@@ -62,6 +62,7 @@ pub enum RewriteCommandKind {
     Absorb,
     Move,
     FixPr,
+    AdoptPrefix,
 }
 
 impl RewriteCommandKind {
@@ -71,6 +72,7 @@ impl RewriteCommandKind {
             Self::Absorb => "absorb",
             Self::Move => "move",
             Self::FixPr => "fix-pr",
+            Self::AdoptPrefix => "adopt-prefix",
         }
     }
 
@@ -80,6 +82,7 @@ impl RewriteCommandKind {
             Self::Absorb => "spr absorb",
             Self::Move => "spr move",
             Self::FixPr => "spr fix-pr",
+            Self::AdoptPrefix => "spr adopt-prefix",
         }
     }
 }

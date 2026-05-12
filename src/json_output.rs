@@ -15,6 +15,7 @@ pub enum JsonCommand {
     Help,
     Version,
     Restack,
+    AdoptPrefix,
     DropMergedPrefix,
     Absorb,
     Move,
@@ -303,6 +304,8 @@ pub fn command_for_raw_args(args: &[OsString]) -> JsonCommand {
                 return JsonCommand::ListCommit;
             } else if arg == "restack" {
                 return JsonCommand::Restack;
+            } else if arg == "adopt-prefix" {
+                return JsonCommand::AdoptPrefix;
             } else if arg == "drop-merged-prefix" {
                 return JsonCommand::DropMergedPrefix;
             } else if arg == "absorb" {
@@ -599,6 +602,17 @@ mod tests {
         ];
 
         assert_eq!(command_for_raw_args(&args), JsonCommand::DropMergedPrefix);
+    }
+
+    #[test]
+    fn raw_args_detect_adopt_prefix_command() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("adopt-prefix"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(command_for_raw_args(&args), JsonCommand::AdoptPrefix);
     }
 
     #[test]

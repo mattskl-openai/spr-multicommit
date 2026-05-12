@@ -242,6 +242,20 @@ Behavior:
 - `rollback` preserves the historical cleanup-on-conflict behavior and attempts to remove the temp restack worktree and branch (cleanup failures may require manual cleanup).
 - When restack suspends, resolve conflicts inside the printed temp worktree path, stage the resolution, and run the printed `spr resume <path>` command. Resolving in your original worktree does not advance the suspended cherry-pick.
 
+### spr adopt-prefix
+
+Use `spr adopt-prefix` after rewriting an already-live bottom prefix locally while keeping its explicit `pr:` and `branch:` selectors intact. Run it from the rewritten candidate checkout. SPR resolves the owning live stack from those selectors, verifies that the candidate is still the exact live bottom sequence, preserves the existing stack merge base, and rebuilds the remaining raw history above the adopted prefix.
+
+- The current checkout is the prefix source. The verified owning full-stack branch is the destination branch that gets moved.
+- The candidate checkout may be detached. The owning full-stack branch must not be checked out in another worktree while SPR moves it.
+- The selector sequence through `HEAD` must match an existing live bottom sequence exactly. This command does not also drop merged groups, reorder groups, or change the stack base.
+- Ignored blocks are allowed only when adoption leaves the publishable selector sequence unchanged.
+- `--preview` resolves and prints the plan without rewriting, creating backup tags, or touching GitHub.
+- With `--safe`, SPR creates a backup tag named like `backup/adopt-prefix/<owning-stack-branch>-<short-sha>` at the old owning stack tip first.
+- Before rewriting, `spr adopt-prefix` follows the shared `dirty_worktree` policy.
+- On cherry-pick conflict, `spr adopt-prefix` suspends the rewrite, leaves the temp worktree in place, and prints `spr resume <path>`.
+- This command is local-only. Inspect the rebuilt stack and run `spr update` when you are ready to publish the rewritten stack.
+
 ### spr drop-merged-prefix
 
 Drop the bottom local PR groups whose GitHub PRs already merged, without landing or updating any
@@ -329,7 +343,7 @@ metadata stored under the repository common Git directory:
 - The filename is a stable historical path; the JSON `schema_version` inside the file is the
   authoritative format version
 - Metadata is refreshed after successful `spr update`, `spr restack`,
-  `spr absorb`, `spr move`, `spr fix-pr`, `spr resume`, and `spr land` when it
+  `spr adopt-prefix`, `spr absorb`, `spr move`, `spr fix-pr`, `spr resume`, and `spr land` when it
   also finishes the local follow-on restack
 - Supported targets:
   - no argument: current branch
@@ -374,7 +388,7 @@ Behavior:
 ### spr resume
 
 Resume a suspended local rewrite from the exact path printed by `spr restack`,
-`spr absorb`, `spr move`, or `spr fix-pr`.
+`spr adopt-prefix`, `spr absorb`, `spr move`, or `spr fix-pr`.
 
 Behavior:
 
@@ -395,7 +409,7 @@ Machine-readable `--json` mode:
   output mode.
 - Supported on operational commands including `spr list pr`, `spr list commit`, `spr status`,
   `spr sync-local-branches`, `spr update`, `spr prep`, `spr relink-prs`, `spr cleanup`,
-  `spr restack`, `spr absorb`, `spr move`, `spr fix-pr`, `spr land`, `spr resume`, and
+  `spr restack`, `spr adopt-prefix`, `spr absorb`, `spr move`, `spr fix-pr`, `spr land`, `spr resume`, and
   `spr resolve-stack`
 - Also supported for display output: `spr --json --help`, `spr --help --json`,
   `spr --json help list commit`, `spr list commit --help --json`, `spr --json --version`, and
@@ -426,9 +440,16 @@ Machine-readable `--json` mode:
   a `data` object containing the local base ref/SHA, current branch/HEAD, selected dropped groups,
   remaining groups, ignored-segment count, planned cherry-pick operation count, operations that a
   real run would perform, and the checks not validated by preview
+- `spr adopt-prefix --preview --json` writes one preview object with `result: "preview"` and
+  a `data` object containing candidate HEAD/groups, owning stack ID/branch/old head, shared merge
+  base, replaced raw boundary, replay suffix groups, planned cherry-pick operation count,
+  publishable selectors before/after, execution side-effect booleans, and the checks not validated
+  by preview
 - `spr restack --json` without `--preview` keeps the rewrite lifecycle contract:
   it writes one completed or suspended object, not a preview object. Completed rewrite JSON includes
   `local_pr_branch_actions`, which is empty unless local per-PR branch sync is enabled.
+- `spr adopt-prefix --json` uses the same completed rewrite envelope and also includes
+  `destination_branch` on successful apply, naming the owning stack branch that was moved.
 - JSON errors across commands use one typed error envelope with `result: "error"` plus
   `error_kind` values such as `synthetic_branch_name_collision`, `invalid_arguments`, and
   `internal`
@@ -486,18 +507,21 @@ Fallback rewrite mental model:
 
 Suspend/resume flow:
 
-1. The original command (`spr restack`, `spr absorb`, `spr move`, or `spr fix-pr`) computes a replay plan for the rewritten stack.
+1. The original command (`spr restack`, `spr adopt-prefix`, `spr absorb`, `spr move`, or `spr fix-pr`) computes a replay plan for the rewritten stack.
 2. If that command uses the temp rewrite executor, `spr` creates a temp branch and temp worktree at the right base commit.
 3. `spr` starts replaying the plan as individual cherry-picks in that temp worktree.
 4. If Git reports a cherry-pick conflict, `spr` records the paused rewrite state in the resume file, including the temp worktree path, the original branch identity, the paused temp-worktree `HEAD`, and the index of the failed replay step.
-5. `spr` prints the temp worktree path, temp branch, original branch, and `spr resume <path>`, then leaves the temp worktree in place. The original branch has still not moved.
+5. `spr` prints the temp worktree path, temp branch, original branch, and `spr resume <path>`, then leaves the temp worktree in place. The recorded rewrite destination has still not moved.
 6. The user resolves only the current conflict in the printed temp worktree and stages the resolution with `git add`.
 7. The user runs `spr resume <path>` from any worktree in the same repository.
 8. `spr resume` reloads the checkpoint, validates that it still belongs to the current repository, validates that the temp worktree still exists, and then reconciles the paused step:
    - If `CHERRY_PICK_HEAD` is still present, `spr` continues that paused cherry-pick itself.
    - If `CHERRY_PICK_HEAD` is gone and the temp worktree advanced by exactly one commit, `spr` treats that as one accidental manual `git cherry-pick --continue` and resumes the remaining replay.
 9. `spr` then continues the remaining replay steps under `spr` control. If another conflict happens, it rewrites the same resume file with the new paused step and suspends again.
-10. Only after all replay steps succeed does `spr` reset the original branch to the rebuilt temp tip, remove the temp worktree and temp branch, and delete the resume file.
+10. Only after all replay steps succeed does `spr` finalize the recorded rewrite destination:
+   - Checked-out-branch rewrites reset the original branch to the rebuilt temp tip.
+   - Unchecked-out branch-ref rewrites such as `spr adopt-prefix` move that destination ref to the rebuilt temp tip while leaving the candidate checkout where it started.
+   In both cases, `spr` then removes the temp worktree and temp branch and deletes the resume file.
 
 Operator rules:
 

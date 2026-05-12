@@ -29,6 +29,17 @@ pub struct Group {
     pub ignored_after: Vec<String>,
 }
 
+/// Parsed PR groups plus any commits that appeared before the first group marker.
+#[derive(Debug, Clone)]
+pub struct ParsedGroups {
+    /// Ordinary commits before the first explicit selector.
+    pub leading_ungrouped: Vec<String>,
+    /// Explicit ignore-block commits before the first explicit selector.
+    pub leading_ignored: Vec<String>,
+    /// Parsed PR groups, oldest -> newest.
+    pub groups: Vec<Group>,
+}
+
 impl Group {
     pub fn selector_text(&self) -> String {
         self.marker.explicit_selector_text()
@@ -158,8 +169,7 @@ fn ensure_unique_group_markers(groups: &[Group]) -> Result<()> {
 ///
 /// Returns an error if any commit message contains more than one group marker.
 pub fn parse_groups(raw: &str, ignore_tag: &str) -> Result<Vec<Group>> {
-    let (_leading_ignored, groups) = parse_groups_with_ignored(raw, ignore_tag)?;
-    Ok(groups)
+    Ok(parse_groups_with_leading_commits(raw, ignore_tag)?.groups)
 }
 
 /// Parse a reversed git log stream into PR groups while retaining ignored commits.
@@ -172,10 +182,24 @@ pub fn parse_groups(raw: &str, ignore_tag: &str) -> Result<Vec<Group>> {
 ///
 /// Returns an error if any commit message contains more than one group marker.
 pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<String>, Vec<Group>)> {
+    let parsed = parse_groups_with_leading_commits(raw, ignore_tag)?;
+    Ok((parsed.leading_ignored, parsed.groups))
+}
+
+/// Parse a reversed git log stream into PR groups while retaining pre-group commits.
+///
+/// Ordinary ungrouped commits and explicit ignore-block commits that appear before the first group
+/// marker are kept separate so callers can decide whether each kind is valid for their workflow.
+///
+/// # Errors
+///
+/// Returns an error if any commit message contains more than one group marker.
+pub fn parse_groups_with_leading_commits(raw: &str, ignore_tag: &str) -> Result<ParsedGroups> {
     let mut groups: Vec<Group> = vec![];
     let mut current: Option<Group> = None;
     let mut ignoring = false;
     let mut ignored_block: Vec<String> = vec![];
+    let mut leading_ungrouped: Vec<String> = vec![];
     let mut leading_ignored: Vec<String> = vec![];
 
     let flush_current = |current: &mut Option<Group>, groups: &mut Vec<Group>| {
@@ -245,6 +269,7 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
             g.commits.push(sha);
         } else {
             warn!("Untagged commit before first group marker; ignored");
+            leading_ungrouped.push(sha);
         }
     }
     flush_current(&mut current, &mut groups);
@@ -252,7 +277,11 @@ pub fn parse_groups_with_ignored(raw: &str, ignore_tag: &str) -> Result<(Vec<Str
         flush_ignored(&mut ignored_block, &mut groups, &mut leading_ignored);
     }
     ensure_unique_group_markers(&groups)?;
-    Ok((leading_ignored, groups))
+    Ok(ParsedGroups {
+        leading_ungrouped,
+        leading_ignored,
+        groups,
+    })
 }
 
 /// Split parsed groups into the publishable update prefix and the local-only suffix.
@@ -330,6 +359,20 @@ pub fn derive_groups_between_with_ignored(
     to: &str,
     ignore_tag: &str,
 ) -> Result<(String, Vec<String>, Vec<Group>)> {
+    let (merge_base, parsed) = derive_groups_between_with_leading_commits(base, to, ignore_tag)?;
+    Ok((merge_base, parsed.leading_ignored, parsed.groups))
+}
+
+/// Derive PR groups plus pre-group commits from `merge-base(base, to)..to`.
+///
+/// # Errors
+///
+/// Returns errors from git commands or group parsing.
+pub fn derive_groups_between_with_leading_commits(
+    base: &str,
+    to: &str,
+    ignore_tag: &str,
+) -> Result<(String, ParsedGroups)> {
     let merge_base = git_ro(["merge-base", base, to].as_slice())?
         .trim()
         .to_string();
@@ -342,8 +385,8 @@ pub fn derive_groups_between_with_ignored(
         ]
         .as_slice(),
     )?;
-    let (leading_ignored, groups) = parse_groups_with_ignored(&lines, ignore_tag)?;
-    Ok((merge_base, leading_ignored, groups))
+    let parsed = parse_groups_with_leading_commits(&lines, ignore_tag)?;
+    Ok((merge_base, parsed))
 }
 
 /// Convenience: derive PR groups and leading ignored commits from merge-base(base, HEAD)..HEAD.
@@ -358,9 +401,24 @@ pub fn derive_local_groups_with_ignored(
     derive_groups_between_with_ignored(base, "HEAD", ignore_tag)
 }
 
+/// Convenience: derive PR groups plus pre-group commits from merge-base(base, HEAD)..HEAD.
+///
+/// # Errors
+///
+/// Returns errors from git commands or group parsing.
+pub fn derive_local_groups_with_leading_commits(
+    base: &str,
+    ignore_tag: &str,
+) -> Result<(String, ParsedGroups)> {
+    derive_groups_between_with_leading_commits(base, "HEAD", ignore_tag)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_groups, parse_groups_with_ignored, split_groups_for_update};
+    use super::{
+        parse_groups, parse_groups_with_ignored, parse_groups_with_leading_commits,
+        split_groups_for_update,
+    };
 
     fn make_log(entries: &[(&str, &str)]) -> String {
         let mut out = String::new();
@@ -460,6 +518,20 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].bare_selector_text(), "alpha");
         assert!(groups[0].ignored_after.is_empty());
+    }
+
+    #[test]
+    fn parse_groups_with_leading_commits_tracks_ungrouped_prefix() {
+        let raw = make_log(&[
+            ("u1", "wip: local scratch"),
+            ("a1", "feat: alpha start pr:alpha"),
+        ]);
+        let parsed = parse_groups_with_leading_commits(&raw, "ignore").expect("parse_groups ok");
+
+        assert_eq!(parsed.leading_ungrouped, vec!["u1"]);
+        assert!(parsed.leading_ignored.is_empty());
+        assert_eq!(parsed.groups.len(), 1);
+        assert_eq!(parsed.groups[0].bare_selector_text(), "alpha");
     }
 
     #[test]
