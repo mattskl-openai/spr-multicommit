@@ -23,7 +23,7 @@ use crate::git::{
     git_common_dir, git_common_dir_at, git_current_branch, git_current_branch_at,
     git_ref_exists_at, git_rev_parse_at, git_ro_in, repo_root,
 };
-use crate::parsing::{parse_groups_with_ignored, split_groups_for_update};
+use crate::parsing::{parse_groups_with_ignored, split_groups_for_update, Group};
 
 // TODO(2026-11-07): Drop schema v1 read compatibility after the six-month
 // migration window. Remove the `tag` serde aliases, legacy selector
@@ -618,7 +618,17 @@ pub fn build_snapshot_for_branch(
     )?;
     let (leading_ignored, parsed_groups) = parse_groups_with_ignored(&lines, ignore_tag)?;
     let (groups, _skipped_handles) = split_groups_for_update(&leading_ignored, parsed_groups);
-    let branch_identities = group_branch_identities(&groups, prefix)?;
+    build_snapshot_from_groups(stack_branch, &stack_head, base, prefix, &groups)
+}
+
+pub fn build_snapshot_from_groups(
+    stack_branch: &str,
+    stack_head: &str,
+    base: &str,
+    prefix: &str,
+    groups: &[Group],
+) -> Result<StackSnapshot> {
+    let branch_identities = group_branch_identities(groups, prefix)?;
     let groups =
         groups
             .iter()
@@ -643,11 +653,18 @@ pub fn build_snapshot_for_branch(
 
     Ok(StackSnapshot {
         stack_branch: StackBranchName(stack_branch.to_string()),
-        stack_head,
+        stack_head: stack_head.to_string(),
         base: base.to_string(),
         prefix: prefix.to_string(),
         groups,
     })
+}
+
+pub fn preflight_snapshot_update(
+    existing: &StackMetadataFile,
+    snapshot: &StackSnapshot,
+) -> Result<()> {
+    apply_snapshot(existing.clone(), snapshot, "preflight").map(|_| ())
 }
 
 pub fn build_snapshot_for_current_checkout(
