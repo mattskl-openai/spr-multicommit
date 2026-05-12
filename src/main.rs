@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::execution::ExecutionMode;
 
 mod absorb_output;
+mod adopt_prefix_output;
 mod branch_names;
 mod cli;
 mod commands;
@@ -72,6 +73,7 @@ fn resolve_update_pr_limit(
 fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
     match cmd {
         crate::cli::Cmd::Restack { .. }
+        | crate::cli::Cmd::AdoptPrefix { .. }
         | crate::cli::Cmd::Absorb { .. }
         | crate::cli::Cmd::Resume { .. }
         | crate::cli::Cmd::SyncLocalBranches
@@ -96,6 +98,7 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
 enum CommandOutput {
     None,
     AbsorbQuery(crate::absorb_output::AbsorbChangedBranchesOutput),
+    AdoptPrefixPreview(crate::adopt_prefix_output::AdoptPrefixPreviewOutput),
     Machine(crate::machine_output::MachineOutput),
     ReadOnly(crate::read_only_output::ReadOnlyOutput),
     RestackPreview(crate::restack_output::RestackPreviewOutput),
@@ -606,6 +609,57 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 )?))
             }
         }
+        crate::cli::Cmd::AdoptPrefix {
+            safe,
+            preview,
+            dry_run,
+        } => {
+            let execution_mode = ExecutionMode::from(dry_run);
+            set_dry_run_env(execution_mode, false);
+            if preview {
+                Ok(CommandOutput::AdoptPrefixPreview(
+                    crate::adopt_prefix_output::preview(crate::commands::preview_adopt_prefix(
+                        &metadata_refresh_context,
+                        safe,
+                    )?),
+                ))
+            } else {
+                let outcome = crate::commands::adopt_prefix(
+                    &metadata_refresh_context,
+                    safe,
+                    execution_mode,
+                    dirty_worktree_policy,
+                )?;
+                let (destination_branch, local_pr_branch_actions) = if outcome.rewrite_outcome
+                    == crate::commands::RewriteCommandOutcome::Completed
+                    && execution_mode == ExecutionMode::Apply
+                {
+                    let stack_ref = format!("refs/heads/{}", outcome.owning_stack_branch);
+                    let local_pr_branch_actions = sync_local_pr_branches_for_branch(
+                        local_pr_branch_policy,
+                        execution_mode,
+                        &base,
+                        &prefix,
+                        &ignore_tag,
+                        &stack_ref,
+                    )?;
+                    (
+                        Some(outcome.owning_stack_branch.clone()),
+                        local_pr_branch_actions,
+                    )
+                } else {
+                    (None, Vec::new())
+                };
+                Ok(CommandOutput::Machine(ensure_rewrite_completed(
+                    output_format,
+                    "spr adopt-prefix",
+                    crate::machine_output::MachineCommand::AdoptPrefix,
+                    outcome.rewrite_outcome,
+                    destination_branch,
+                    local_pr_branch_actions,
+                )?))
+            }
+        }
         crate::cli::Cmd::DropMergedPrefix { safe, dry_run } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, false);
@@ -1112,6 +1166,13 @@ fn main() {
                     println!("{}", output.render_human());
                 }
             }
+            CommandOutput::AdoptPrefixPreview(output) => {
+                if output_format == crate::cli::OutputFormat::Json {
+                    exit_with_json(&output, output.exit_code());
+                } else {
+                    println!("{}", output.render_human());
+                }
+            }
             CommandOutput::Machine(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
                     exit_with_json(&output, output.exit_code());
@@ -1167,6 +1228,7 @@ fn main() {
 fn json_command_for_cli(cmd: &crate::cli::Cmd) -> crate::json_output::JsonCommand {
     match cmd {
         crate::cli::Cmd::Restack { .. } => crate::machine_output::MachineCommand::Restack,
+        crate::cli::Cmd::AdoptPrefix { .. } => crate::machine_output::MachineCommand::AdoptPrefix,
         crate::cli::Cmd::DropMergedPrefix { .. } => {
             crate::machine_output::MachineCommand::DropMergedPrefix
         }
@@ -1194,8 +1256,9 @@ fn json_command_for_cli(cmd: &crate::cli::Cmd) -> crate::json_output::JsonComman
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_working_directory_override, command_requires_gh, json_command_for_raw_args,
-        parse_failure_as_json_output, resolve_update_pr_limit, run_cli, CommandOutput,
+        apply_working_directory_override, command_requires_gh, ensure_rewrite_completed,
+        json_command_for_raw_args, parse_failure_as_json_output, resolve_update_pr_limit, run_cli,
+        CommandOutput,
     };
     use crate::cli::{DryRunArgs, OutputFormat};
     use crate::json_output::{ErrorPayload, JsonCommand, JsonError, EXIT_FAILURE};
@@ -1218,6 +1281,30 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn completed_adopt_prefix_json_reports_destination_branch() {
+        let output = ensure_rewrite_completed(
+            OutputFormat::Json,
+            "spr adopt-prefix",
+            crate::machine_output::MachineCommand::AdoptPrefix,
+            crate::commands::RewriteCommandOutcome::Completed,
+            Some("stack".to_string()),
+            Vec::new(),
+        )
+        .unwrap();
+
+        match output.payload {
+            crate::machine_output::MachinePayload::Completed {
+                destination_branch,
+                local_pr_branch_actions,
+            } => {
+                assert_eq!(destination_branch.as_deref(), Some("stack"));
+                assert!(local_pr_branch_actions.is_empty());
+            }
+            other => panic!("unexpected machine payload: {:?}", other),
+        }
+    }
 
     struct CurrentDirGuard {
         original: PathBuf,
@@ -1336,6 +1423,15 @@ mod tests {
             from: None,
             allow_replayed_duplicates: false,
             query_changed_branches: false,
+            dry_run: DryRunArgs::default(),
+        }));
+    }
+
+    #[test]
+    fn adopt_prefix_is_local_only_for_tool_checks() {
+        assert!(!command_requires_gh(&crate::cli::Cmd::AdoptPrefix {
+            safe: false,
+            preview: false,
             dry_run: DryRunArgs::default(),
         }));
     }
@@ -1491,10 +1587,63 @@ mod tests {
             .to_string()
     }
 
-    fn refresh_stack_metadata(repo: &Path) {
+    fn refresh_current_stack_metadata(repo: &Path) {
         let _guard = DirGuard::change_to(repo);
         crate::stack_metadata::refresh_metadata_for_current_checkout("main", "dank-spr/", "ignore")
             .unwrap();
+    }
+
+    fn refresh_stack_metadata(repo: &Path, branch: &str) {
+        crate::stack_metadata::refresh_metadata_for_branch(
+            repo.to_str().unwrap(),
+            branch,
+            &crate::stack_metadata::RefreshMetadataContext {
+                base: "main".to_string(),
+                prefix: "dank-spr/".to_string(),
+                ignore_tag: "ignore".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+    }
+
+    fn init_adopt_prefix_conflict_repo() -> TempDir {
+        let dir = init_stack_repo();
+        let repo = dir.path();
+        git(repo, ["checkout", "-b", "stack"].as_slice());
+        commit_file(repo, "story.txt", "alpha-old\n", "feat: alpha\n\npr:alpha");
+        commit_file(repo, "story.txt", "beta-old\n", "feat: beta\n\npr:beta");
+        refresh_stack_metadata(repo, "stack");
+        let alpha_tip = rev_parse(repo, "stack~1");
+        let beta_tip = rev_parse(repo, "stack");
+        git(repo, ["branch", "dank-spr/alpha", &alpha_tip].as_slice());
+        git(repo, ["branch", "dank-spr/beta", &beta_tip].as_slice());
+        git(repo, ["checkout", "-b", "candidate", "main"].as_slice());
+        commit_file(
+            repo,
+            "story.txt",
+            "alpha-new\n",
+            "feat: alpha rewritten\n\npr:alpha",
+        );
+        dir
+    }
+
+    fn init_adopt_prefix_no_suffix_repo() -> TempDir {
+        let dir = init_stack_repo();
+        let repo = dir.path();
+        git(repo, ["checkout", "-b", "stack"].as_slice());
+        commit_file(repo, "alpha.txt", "alpha-old\n", "feat: alpha\n\npr:alpha");
+        refresh_stack_metadata(repo, "stack");
+        let alpha_tip = rev_parse(repo, "stack");
+        git(repo, ["branch", "dank-spr/alpha", &alpha_tip].as_slice());
+        git(repo, ["checkout", "-b", "candidate", "main"].as_slice());
+        commit_file(
+            repo,
+            "alpha.txt",
+            "alpha-new\n",
+            "feat: alpha rewritten\n\npr:alpha",
+        );
+        dir
     }
 
     fn prep_json_gh_script(log_path: &std::path::Path) -> String {
@@ -3033,7 +3182,7 @@ mod tests {
             .to_string();
         git(&repo, ["branch", "dank-spr/alpha", &alpha_tip].as_slice());
         git(&repo, ["branch", "dank-spr/beta", &beta_tip].as_slice());
-        refresh_stack_metadata(&repo);
+        refresh_current_stack_metadata(&repo);
 
         git(&repo, ["checkout", "dank-spr/alpha"].as_slice());
         let alpha_tail = commit_file(
@@ -3139,7 +3288,7 @@ mod tests {
         let repo = dir.path().join("repo");
         let alpha_tip = rev_parse(&repo, "HEAD~1");
         git(&repo, ["branch", "dank-spr/alpha", &alpha_tip].as_slice());
-        refresh_stack_metadata(&repo);
+        refresh_current_stack_metadata(&repo);
         git(&repo, ["checkout", "dank-spr/alpha"].as_slice());
         commit_file(
             &repo,
@@ -3215,7 +3364,7 @@ mod tests {
         let _restore = CurrentDirGuard::capture();
         let dir = init_update_stack_repo();
         let repo = dir.path().join("repo");
-        refresh_stack_metadata(&repo);
+        refresh_current_stack_metadata(&repo);
         git(&repo, ["checkout", "main"].as_slice());
         git(&repo, ["checkout", "-b", "unrelated"].as_slice());
         commit_file(
@@ -3255,7 +3404,7 @@ mod tests {
         let beta_tip = rev_parse(&repo, "HEAD");
         git(&repo, ["branch", "dank-spr/alpha", &alpha_tip].as_slice());
         git(&repo, ["branch", "dank-spr/beta", &beta_tip].as_slice());
-        refresh_stack_metadata(&repo);
+        refresh_current_stack_metadata(&repo);
 
         git(&repo, ["checkout", "dank-spr/alpha"].as_slice());
         let alpha_tail = commit_file(
@@ -3312,6 +3461,146 @@ mod tests {
         assert_eq!(rev_parse(&repo, "dank-spr/alpha"), alpha_tail);
         assert_ne!(rev_parse(&repo, "dank-spr/alpha"), rewritten_alpha_tip);
         assert_eq!(rev_parse(&repo, "dank-spr/beta"), rev_parse(&repo, "stack"));
+    }
+
+    #[test]
+    fn run_cli_resume_adopt_prefix_syncs_unchecked_out_destination_branch_after_conflict() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_adopt_prefix_conflict_repo();
+        let repo = repo.path();
+        let candidate_head = rev_parse(repo, "HEAD");
+        let old_stack_head = rev_parse(repo, "stack");
+        let adopt_cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--local-pr-branches",
+            "create-or-update",
+            "adopt-prefix",
+            "--json",
+        ])
+        .unwrap();
+
+        let suspended = run_cli(adopt_cli, OutputFormat::Json).unwrap();
+        let (resume_file, temp_worktree) = match suspended {
+            CommandOutput::Machine(output) => match output.payload {
+                crate::machine_output::MachinePayload::Suspended { details } => {
+                    assert_eq!(details.original_branch, "stack");
+                    assert_eq!(details.conflicted_paths, vec!["story.txt".to_string()]);
+                    (
+                        PathBuf::from(details.resume_file),
+                        PathBuf::from(details.temp_worktree),
+                    )
+                }
+                other => panic!("unexpected machine payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        };
+        assert_eq!(rev_parse(repo, "stack"), old_stack_head);
+        write_file(&temp_worktree, "story.txt", "beta-resolved\n");
+        git(&temp_worktree, ["add", "story.txt"].as_slice());
+        let resume_cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--local-pr-branches",
+            "create-or-update",
+            "resume",
+            "--json",
+            resume_file.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let resumed = run_cli(resume_cli, OutputFormat::Json).unwrap();
+
+        match resumed {
+            CommandOutput::Machine(output) => match output.payload {
+                crate::machine_output::MachinePayload::Completed {
+                    local_pr_branch_actions,
+                    ..
+                } => {
+                    assert_eq!(local_pr_branch_actions.len(), 2);
+                    assert_eq!(local_pr_branch_actions[0].stable_handle, "pr:alpha");
+                    assert_eq!(
+                        local_pr_branch_actions[0].action,
+                        crate::local_pr_branches::LocalPrBranchActionKind::Updated
+                    );
+                    assert_eq!(local_pr_branch_actions[1].stable_handle, "pr:beta");
+                    assert_eq!(
+                        local_pr_branch_actions[1].action,
+                        crate::local_pr_branches::LocalPrBranchActionKind::Updated
+                    );
+                }
+                other => panic!("unexpected machine payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+
+        let rewritten_stack_head = rev_parse(repo, "stack");
+        assert_ne!(rewritten_stack_head, old_stack_head);
+        assert_eq!(rev_parse(repo, "HEAD"), candidate_head);
+        assert_eq!(rev_parse(repo, "dank-spr/alpha"), candidate_head);
+        assert_eq!(rev_parse(repo, "dank-spr/beta"), rewritten_stack_head);
+        assert!(!resume_file.exists());
+    }
+
+    #[test]
+    fn run_cli_adopt_prefix_no_suffix_syncs_destination_branch_after_direct_ref_move() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_adopt_prefix_no_suffix_repo();
+        let repo = repo.path();
+        let candidate_head = rev_parse(repo, "HEAD");
+        let old_stack_head = rev_parse(repo, "stack");
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--local-pr-branches",
+            "create-or-update",
+            "adopt-prefix",
+            "--json",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::Machine(output) => match output.payload {
+                crate::machine_output::MachinePayload::Completed {
+                    destination_branch,
+                    local_pr_branch_actions,
+                } => {
+                    assert_eq!(destination_branch.as_deref(), Some("stack"));
+                    assert_eq!(local_pr_branch_actions.len(), 1);
+                    assert_eq!(local_pr_branch_actions[0].stable_handle, "pr:alpha");
+                    assert_eq!(
+                        local_pr_branch_actions[0].action,
+                        crate::local_pr_branches::LocalPrBranchActionKind::Updated
+                    );
+                }
+                other => panic!("unexpected machine payload: {:?}", other),
+            },
+            other => panic!("unexpected command output: {:?}", other),
+        }
+
+        assert_ne!(candidate_head, old_stack_head);
+        assert_eq!(rev_parse(repo, "HEAD"), candidate_head);
+        assert_eq!(rev_parse(repo, "stack"), candidate_head);
+        assert_eq!(rev_parse(repo, "dank-spr/alpha"), candidate_head);
     }
 
     #[test]
