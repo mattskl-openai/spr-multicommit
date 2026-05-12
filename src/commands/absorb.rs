@@ -1,10 +1,11 @@
-//! Absorb append-only local per-PR branch tails back into the current stack.
+//! Absorb append-only local per-PR branch tails back into the owning stack.
 //!
-//! `spr absorb` inspects the current local stack, looks for each group's exact
+//! `spr absorb` identifies the owning local stack from the invoking checkout,
+//! inspects that whole stack, looks for each group's exact
 //! canonical local branch, and classifies it as absorbable,
 //! skippable, or blocking. When one or more groups have append-only local
-//! branch tails, the command rebuilds the checked-out stack branch from its
-//! current merge-base and inserts those tails immediately after their owning
+//! branch tails, the command rebuilds the owning stack branch from its current
+//! merge-base and inserts those tails immediately after their owning
 //! group's real commits and before any trailing ignored block. Rewritten local
 //! per-PR branches are treated as a distinct no-op only when they still descend
 //! from the same stack merge-base and reach the same pre-tail tree as the
@@ -16,20 +17,22 @@ use tracing::info;
 
 use crate::branch_names::{group_branch_identities, group_branch_name};
 use crate::commands::common::{self, CherryPickEmptyPolicy, CherryPickOp};
+use crate::commands::owning_stack;
 use crate::commands::rewrite_resume::{
-    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
+    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteDestinationKind,
+    RewriteSession,
 };
 use crate::config::DirtyWorktreePolicy;
 use crate::execution::ExecutionMode;
 use crate::git::{
     git_commit_message, git_commit_parent_count, git_commit_tree, git_current_branch,
     git_is_ancestor, git_local_branch_tip, git_merge_base, git_patch_ids_for_commits,
-    git_rev_list_range, git_rev_parse,
+    git_rev_list_range, git_rev_parse, git_ro,
 };
-use crate::parsing::{derive_local_groups_with_ignored, Group};
+use crate::parsing::{derive_groups_between_with_ignored, derive_local_groups_with_ignored, Group};
 use crate::selectors::{resolve_group_index, GroupSelector};
 
-/// Rebuilds the current stack branch by folding append-only local per-PR branch
+/// Rebuilds the owning stack branch by folding append-only local per-PR branch
 /// tails back into their owning PR groups.
 ///
 /// The exact source branch rule is intentional: only the local branch resolved
@@ -45,16 +48,14 @@ use crate::selectors::{resolve_group_index, GroupSelector};
 /// stack commit that would still be replayed after this group's insertion
 /// point.
 pub fn absorb_branch_tails(
-    base: &str,
-    prefix: &str,
-    ignore_tag: &str,
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
     from: Option<&GroupSelector>,
     execution_mode: ExecutionMode,
     dirty_worktree_policy: DirtyWorktreePolicy,
     options: AbsorbOptions,
-) -> Result<RewriteCommandOutcome> {
-    let (_stack_head, plan) =
-        build_plan_for_current_stack(base, prefix, ignore_tag, from, options)?;
+) -> Result<AbsorbOutcome> {
+    let target = resolve_absorb_target(metadata_context)?;
+    let plan = build_plan_for_stack_ref(metadata_context, &target.stack_ref, from, options)?;
     let validation = validate_absorb_plan(&plan);
     if !matches!(validation, AbsorbPlanValidation::NoGroups) {
         emit_absorb_summary(&plan);
@@ -62,7 +63,7 @@ pub fn absorb_branch_tails(
     match validation {
         AbsorbPlanValidation::NoGroups => {
             info!("No local PR groups found; nothing to absorb.");
-            Ok(RewriteCommandOutcome::Completed)
+            Ok(AbsorbOutcome::completed(target.stack_branch))
         }
         AbsorbPlanValidation::Blocked { lines } => Err(anyhow!(
             "Refusing to absorb branch tails until blocking branches are fixed:\n{}",
@@ -70,12 +71,11 @@ pub fn absorb_branch_tails(
         )),
         AbsorbPlanValidation::NoAbsorbableGroups => {
             info!("No absorbable branch tails found; nothing to rewrite.");
-            Ok(RewriteCommandOutcome::Completed)
+            Ok(AbsorbOutcome::completed(target.stack_branch))
         }
         AbsorbPlanValidation::ReadyToRewrite => execute_absorb_plan(
-            base,
-            prefix,
-            ignore_tag,
+            metadata_context,
+            &target,
             &plan,
             execution_mode,
             dirty_worktree_policy,
@@ -91,42 +91,79 @@ pub fn absorb_branch_tails(
 /// changed suffix. Targeted queries return the requested suffix so callers can
 /// protect the whole transaction boundary before running apply mode.
 pub fn query_absorb_changed_branches(
-    base: &str,
-    prefix: &str,
-    ignore_tag: &str,
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
     from: Option<&GroupSelector>,
     options: AbsorbOptions,
 ) -> Result<Vec<String>> {
-    let (_stack_head, plan) =
-        build_plan_for_current_stack(base, prefix, ignore_tag, from, options)?;
+    let target = resolve_absorb_target(metadata_context)?;
+    let plan = build_plan_for_stack_ref(metadata_context, &target.stack_ref, from, options)?;
     match validate_absorb_plan(&plan) {
         AbsorbPlanValidation::NoGroups => Ok(Vec::new()),
         AbsorbPlanValidation::NoAbsorbableGroups if plan.requested_start_index.is_some() => {
-            changed_branches_for_plan(prefix, &plan)
+            changed_branches_for_plan(&metadata_context.prefix, &target.stack_branch, &plan)
         }
         AbsorbPlanValidation::NoAbsorbableGroups => Ok(Vec::new()),
         AbsorbPlanValidation::Blocked { lines } => Err(anyhow!(
             "Refusing to query changed branches until blocking branches are fixed:\n{}",
             lines.join("\n")
         )),
-        AbsorbPlanValidation::ReadyToRewrite => changed_branches_for_plan(prefix, &plan),
+        AbsorbPlanValidation::ReadyToRewrite => {
+            changed_branches_for_plan(&metadata_context.prefix, &target.stack_branch, &plan)
+        }
     }
 }
 
-fn changed_branches_for_plan(prefix: &str, plan: &RewritePlan) -> Result<Vec<String>> {
+fn changed_branches_for_plan(
+    prefix: &str,
+    stack_branch: &str,
+    plan: &RewritePlan,
+) -> Result<Vec<String>> {
     let first_changed_group = plan.requested_start_index.unwrap_or_else(|| {
         plan.groups
             .iter()
             .position(|group| group.source.is_absorbable())
             .expect("ready-to-rewrite absorb plan should contain an absorbable group")
     });
-    let mut changed_branches = vec![git_current_branch()?];
+    let mut changed_branches = vec![stack_branch.to_string()];
     changed_branches.extend(
         plan.groups[first_changed_group..]
             .iter()
             .map(|group| group_branch_name(prefix, &group.group)),
     );
     Ok(changed_branches)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsorbOutcome {
+    pub rewrite_outcome: RewriteCommandOutcome,
+    pub owning_stack_branch: String,
+}
+
+impl AbsorbOutcome {
+    fn completed(owning_stack_branch: String) -> Self {
+        Self {
+            rewrite_outcome: RewriteCommandOutcome::Completed,
+            owning_stack_branch,
+        }
+    }
+}
+
+impl common::DirtyWorktreeOutcome for AbsorbOutcome {
+    fn keeps_dirty_worktree_restore_deferred(&self) -> bool {
+        matches!(
+            self.rewrite_outcome,
+            RewriteCommandOutcome::Suspended { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AbsorbTarget {
+    stack_branch: String,
+    stack_ref: String,
+    stack_head: String,
+    original_worktree_root: String,
+    destination_kind: RewriteDestinationKind,
 }
 
 /// CLI-configurable behavior switches for `spr absorb`.
@@ -445,40 +482,103 @@ impl std::fmt::Display for AbsorbBlocker {
     }
 }
 
-fn build_plan_for_current_stack(
-    base: &str,
-    prefix: &str,
-    ignore_tag: &str,
+fn resolve_absorb_target(
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
+) -> Result<AbsorbTarget> {
+    let invoking_branch = git_current_branch()?;
+    let invoking_head = git_rev_parse("HEAD")?;
+    let original_worktree_root = rewrite_resume::current_repo_root()?;
+    let (_merge_base, _leading_ignored, candidate_groups) =
+        derive_local_groups_with_ignored(&metadata_context.base, &metadata_context.ignore_tag)?;
+
+    if candidate_groups.is_empty() {
+        return Ok(AbsorbTarget {
+            stack_branch: invoking_branch,
+            stack_ref: "HEAD".to_string(),
+            stack_head: invoking_head,
+            original_worktree_root,
+            destination_kind: RewriteDestinationKind::CheckedOutBranch,
+        });
+    }
+
+    let Some(resolved_stack) = owning_stack::load_recorded_owning_stack_for_candidate_groups(
+        metadata_context,
+        &candidate_groups,
+    )?
+    else {
+        let invoking_is_canonical_local_pr_branch = candidate_groups
+            .iter()
+            .any(|group| group_branch_name(&metadata_context.prefix, group) == invoking_branch);
+        if invoking_is_canonical_local_pr_branch {
+            return Err(anyhow!(
+                "current checkout {} is a canonical local PR branch, but repo-local stack metadata is missing; run `spr update` from the owning stack branch before absorbing from it",
+                invoking_branch
+            ));
+        }
+        return Ok(AbsorbTarget {
+            stack_branch: invoking_branch,
+            stack_ref: "HEAD".to_string(),
+            stack_head: invoking_head,
+            original_worktree_root,
+            destination_kind: RewriteDestinationKind::CheckedOutBranch,
+        });
+    };
+
+    let destination_kind = if invoking_branch == resolved_stack.stack_branch
+        && invoking_head == resolved_stack.stack_head
+    {
+        RewriteDestinationKind::CheckedOutBranch
+    } else {
+        RewriteDestinationKind::UncheckedOutBranchRef
+    };
+    Ok(AbsorbTarget {
+        stack_ref: format!("refs/heads/{}", resolved_stack.stack_branch),
+        stack_branch: resolved_stack.stack_branch,
+        stack_head: resolved_stack.stack_head,
+        original_worktree_root,
+        destination_kind,
+    })
+}
+
+fn build_plan_for_stack_ref(
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
+    stack_ref: &str,
     from: Option<&GroupSelector>,
     options: AbsorbOptions,
-) -> Result<(String, RewritePlan)> {
-    let (merge_base, leading_ignored, groups) = derive_local_groups_with_ignored(base, ignore_tag)?;
+) -> Result<RewritePlan> {
+    let (merge_base, leading_ignored, groups) = derive_groups_between_with_ignored(
+        &metadata_context.base,
+        stack_ref,
+        &metadata_context.ignore_tag,
+    )?;
     let requested_start_index = from
         .map(|selector| resolve_group_index(&groups, selector))
         .transpose()?;
     if groups.is_empty() {
-        Ok((
-            git_rev_parse("HEAD")?,
-            RewritePlan {
-                merge_base,
-                leading_ignored,
-                groups: Vec::new(),
-                requested_start_index: None,
-                operations: Vec::new(),
-            },
-        ))
+        Ok(RewritePlan {
+            merge_base,
+            leading_ignored,
+            groups: Vec::new(),
+            requested_start_index: None,
+            operations: Vec::new(),
+        })
     } else {
-        group_branch_identities(&groups, prefix)?;
-        let stack_head = git_rev_parse("HEAD")?;
+        group_branch_identities(&groups, &metadata_context.prefix)?;
+        let stack_head = git_rev_parse(stack_ref)?;
         let preliminary_group_plans = groups
             .into_iter()
             .enumerate()
             .map(|group| {
                 let (index, group) = group;
                 if requested_start_index.is_some_and(|start| index < start) {
-                    build_out_of_scope_group_rewrite_plan(group, prefix)
+                    build_out_of_scope_group_rewrite_plan(group, &metadata_context.prefix)
                 } else {
-                    build_preliminary_group_rewrite_plan(group, prefix, &merge_base, &stack_head)
+                    build_preliminary_group_rewrite_plan(
+                        group,
+                        &metadata_context.prefix,
+                        &merge_base,
+                        &stack_head,
+                    )
                 }
             })
             .collect::<Result<Vec<_>>>()?;
@@ -491,16 +591,13 @@ fn build_plan_for_current_stack(
             })
             .collect::<Result<Vec<_>>>()?;
         let operations = build_rewrite_operations(&leading_ignored, &group_plans);
-        Ok((
-            stack_head,
-            RewritePlan {
-                merge_base,
-                leading_ignored,
-                groups: group_plans,
-                requested_start_index,
-                operations,
-            },
-        ))
+        Ok(RewritePlan {
+            merge_base,
+            leading_ignored,
+            groups: group_plans,
+            requested_start_index,
+            operations,
+        })
     }
 }
 
@@ -1028,16 +1125,15 @@ fn build_replay_ops_for_commits(
     ops
 }
 
-/// Executes a validated absorb rewrite plan by rebuilding the current stack in
-/// a temporary worktree and resetting the checked-out branch to the new tip.
+/// Executes a validated absorb rewrite plan by rebuilding the owning stack in
+/// a temporary worktree and then updating its checked-out branch or branch ref.
 fn execute_absorb_plan(
-    base: &str,
-    prefix: &str,
-    ignore_tag: &str,
+    metadata_context: &crate::stack_metadata::RefreshMetadataContext,
+    target: &AbsorbTarget,
     plan: &RewritePlan,
     execution_mode: ExecutionMode,
     dirty_worktree_policy: DirtyWorktreePolicy,
-) -> Result<RewriteCommandOutcome> {
+) -> Result<AbsorbOutcome> {
     emit_rewrite_plan(plan);
     common::with_dirty_worktree_policy(
         execution_mode,
@@ -1048,33 +1144,42 @@ fn execute_absorb_plan(
                 info!("Dry run complete. No local git state or GitHub state was changed.");
                 info!("Run `spr absorb` without `--dry-run` to apply the rewrite.");
                 info!("After inspecting the rewritten stack, run `spr update`.");
-                Ok(RewriteCommandOutcome::Completed)
+                Ok(AbsorbOutcome::completed(target.stack_branch.clone()))
             } else {
-                let (cur_branch, short) = common::get_current_branch_and_short()?;
-                let original_head = git_rev_parse("HEAD")?;
-                let original_worktree_root = rewrite_resume::current_repo_root()?;
+                if target.destination_kind == RewriteDestinationKind::UncheckedOutBranchRef {
+                    owning_stack::ensure_branch_not_checked_out(&target.stack_branch)?;
+                }
+                let short = git_ro(["rev-parse", "--short", &target.stack_head].as_slice())?
+                    .trim()
+                    .to_string();
                 let resume_path = rewrite_resume::prepare_resume_path_for_new_session(
                     execution_mode,
                     RewriteCommandKind::Absorb,
-                    &cur_branch,
-                    &original_head,
+                    &target.stack_branch,
+                    &target.stack_head,
                 )?;
-                let backup_tag =
-                    common::create_backup_tag(execution_mode, "absorb", &cur_branch, &short)?;
+                let backup_tag = common::create_backup_tag_at(
+                    execution_mode,
+                    "absorb",
+                    &target.stack_branch,
+                    &short,
+                    &target.stack_head,
+                )?;
                 let (tmp_path, tmp_branch) = common::create_temp_worktree(
                     execution_mode,
                     "absorb",
                     &plan.merge_base,
                     &short,
                 )?;
-                rewrite_resume::run_rewrite_session(
+                let rewrite_outcome = rewrite_resume::run_rewrite_session(
                     execution_mode,
                     RewriteSession {
                         command_kind: RewriteCommandKind::Absorb,
                         conflict_policy: RewriteConflictPolicy::Suspend,
-                        original_worktree_root,
-                        original_branch: cur_branch,
-                        original_head,
+                        original_worktree_root: target.original_worktree_root.clone(),
+                        original_branch: target.stack_branch.clone(),
+                        original_head: target.stack_head.clone(),
+                        destination_kind: target.destination_kind,
                         resume_path,
                         temp_branch: tmp_branch,
                         temp_worktree_path: tmp_path,
@@ -1085,13 +1190,13 @@ fn execute_absorb_plan(
                             "No GitHub changes were made. Run `spr update` after inspecting the rewritten stack."
                                 .to_string(),
                         ),
-                        metadata_refresh_context: Some(crate::stack_metadata::RefreshMetadataContext {
-                            base: base.to_string(),
-                            prefix: prefix.to_string(),
-                            ignore_tag: ignore_tag.to_string(),
-                        }),
+                        metadata_refresh_context: Some(metadata_context.clone()),
                     },
-                )
+                )?;
+                Ok(AbsorbOutcome {
+                    rewrite_outcome,
+                    owning_stack_branch: target.stack_branch.clone(),
+                })
             }
         },
     )
@@ -1164,12 +1269,29 @@ fn short_sha(sha: &str) -> &str {
 }
 
 #[cfg(test)]
+fn build_plan_for_current_stack(
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+    from: Option<&GroupSelector>,
+    options: AbsorbOptions,
+) -> Result<(String, RewritePlan)> {
+    let metadata_context = crate::stack_metadata::RefreshMetadataContext {
+        base: base.to_string(),
+        prefix: prefix.to_string(),
+        ignore_tag: ignore_tag.to_string(),
+    };
+    let stack_head = git_rev_parse("HEAD")?;
+    let plan = build_plan_for_stack_ref(&metadata_context, "HEAD", from, options)?;
+    Ok((stack_head, plan))
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        absorb_branch_tails, build_plan_for_current_stack, build_rewrite_operations,
-        query_absorb_changed_branches, validate_absorb_plan, AbsorbBlocker, AbsorbClassification,
-        AbsorbOptions, AbsorbPlanValidation, AbsorbSkipReason, AbsorbTail,
-        CopiedLaterStackCommitPolicy, GroupRewritePlan, LaterReplayedCommit,
+        build_plan_for_current_stack, build_rewrite_operations, validate_absorb_plan,
+        AbsorbBlocker, AbsorbClassification, AbsorbOptions, AbsorbPlanValidation, AbsorbSkipReason,
+        AbsorbTail, CopiedLaterStackCommitPolicy, GroupRewritePlan, LaterReplayedCommit,
         LaterReplayedCommitKind, RewritePlan, SourceBranchRecord,
     };
     use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp};
@@ -1179,6 +1301,7 @@ mod tests {
     use crate::execution::ExecutionMode;
     use crate::parsing::{derive_local_groups_with_ignored, Group};
     use crate::selectors::{ExplicitGroupSelector, GroupSelector};
+    use crate::stack_metadata::RefreshMetadataContext;
     use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
     use std::env;
     use std::fs;
@@ -1271,6 +1394,47 @@ mod tests {
         git(repo, ["rev-parse", "--abbrev-ref", "HEAD"].as_slice())
             .trim()
             .to_string()
+    }
+
+    fn metadata_context(base: &str, prefix: &str, ignore_tag: &str) -> RefreshMetadataContext {
+        RefreshMetadataContext {
+            base: base.to_string(),
+            prefix: prefix.to_string(),
+            ignore_tag: ignore_tag.to_string(),
+        }
+    }
+
+    fn absorb_branch_tails(
+        base: &str,
+        prefix: &str,
+        ignore_tag: &str,
+        from: Option<&GroupSelector>,
+        execution_mode: ExecutionMode,
+        dirty_worktree_policy: DirtyWorktreePolicy,
+        options: AbsorbOptions,
+    ) -> anyhow::Result<RewriteCommandOutcome> {
+        super::absorb_branch_tails(
+            &metadata_context(base, prefix, ignore_tag),
+            from,
+            execution_mode,
+            dirty_worktree_policy,
+            options,
+        )
+        .map(|outcome| outcome.rewrite_outcome)
+    }
+
+    fn query_absorb_changed_branches(
+        base: &str,
+        prefix: &str,
+        ignore_tag: &str,
+        from: Option<&GroupSelector>,
+        options: AbsorbOptions,
+    ) -> anyhow::Result<Vec<String>> {
+        super::query_absorb_changed_branches(
+            &metadata_context(base, prefix, ignore_tag),
+            from,
+            options,
+        )
     }
 
     #[test]

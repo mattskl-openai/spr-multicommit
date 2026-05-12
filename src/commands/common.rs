@@ -70,16 +70,27 @@ pub fn create_backup_tag(
     cur_branch: &str,
     short: &str,
 ) -> Result<String> {
+    create_backup_tag_at(execution_mode, kind, cur_branch, short, "HEAD")
+}
+
+/// Creates or updates a local backup tag pointing at `target`.
+pub fn create_backup_tag_at(
+    execution_mode: ExecutionMode,
+    kind: &str,
+    cur_branch: &str,
+    short: &str,
+    target: &str,
+) -> Result<String> {
     let backup = format!("backup/{}/{}-{}", kind, cur_branch, short);
     let exists = git_ro(["tag", "--list", &backup].as_slice())?;
     if exists.trim().is_empty() {
-        info!("Creating backup tag at HEAD: {}", backup);
+        info!("Creating backup tag at {}: {}", target, backup);
     } else {
-        info!("Backup tag exists; overwriting at HEAD: {}", backup);
+        info!("Backup tag exists; overwriting at {}: {}", target, backup);
     }
     // Use `-f` to make backup creation idempotent. When the name already
-    // exists, we explicitly move it to the current HEAD.
-    let _ = git_rw(execution_mode, ["tag", "-f", &backup, "HEAD"].as_slice())?;
+    // exists, we explicitly move it to the current target.
+    let _ = git_rw(execution_mode, ["tag", "-f", &backup, target].as_slice())?;
     Ok(backup)
 }
 
@@ -168,6 +179,14 @@ pub fn run_native_rebase_with_abort(
             }
         }
     }
+}
+
+/// Returns the worktree path that currently has `branch` checked out, if any.
+pub fn checked_out_worktree_for_branch(branch: &str) -> Result<Option<String>> {
+    Ok(worktree_entries()?
+        .into_iter()
+        .find(|entry| entry.branch.as_deref() == Some(branch))
+        .map(|entry| entry.path))
 }
 
 /// Returns true when a local branch with the given name exists.

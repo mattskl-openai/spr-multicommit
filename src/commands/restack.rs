@@ -17,7 +17,8 @@ use tracing::{info, warn};
 use crate::commands::common;
 use crate::commands::common::{CherryPickEmptyPolicy, CherryPickOp, NativeRebaseOutcome};
 use crate::commands::rewrite_resume::{
-    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
+    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteDestinationKind,
+    RewriteSession,
 };
 use crate::config::{DirtyWorktreePolicy, RestackConflictPolicy};
 use crate::execution::ExecutionMode;
@@ -618,6 +619,7 @@ fn restack_after_resolved(
                             original_worktree_root,
                             original_branch: cur_branch.clone(),
                             original_head,
+                            destination_kind: RewriteDestinationKind::CheckedOutBranch,
                             resume_path,
                             temp_branch: tmp_branch,
                             temp_worktree_path: tmp_path,

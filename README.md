@@ -273,21 +273,21 @@ Behavior:
 
 ### spr absorb
 
-Absorb commits appended to canonical local per-PR branches back into the checked-out stack branch.
+Absorb commits appended to canonical local per-PR branches back into the owning stack branch.
 
 Behavior:
 
-- If you append commits to the end of a local PR branch such as `user-spr/alpha`, `spr absorb` rebuilds the local stack so the new commits become part of the matching PR group while preserving PR-group order
+- If you append commits to the end of a local PR branch such as `user-spr/alpha`, `spr absorb` may be run from that branch or from the owning stack branch; when the invoking checkout's selector sequence identifies one verified live stack, `spr absorb` rebuilds that owning stack so new commits from every absorbable local PR branch become part of their matching PR groups while preserving PR-group order
 - Inspects only each group's exact resolved local branch
 - Skips missing branches, branches whose rewritten-equivalent prefix still descends from the same stack merge-base and ends at the same pre-tail tree as the current stack, and branches that are behind the current stack
 - Refuses to operate when two live PR groups would derive concrete branch names that differ only by case
 - Refuses to guess through divergence, source branches that incorporated later stack commits, merge commits, or absorbed commits that contain group markers
 - By default, also blocks copied later stack commits whose original replay would otherwise become empty or ambiguous
 - `--allow-replayed-duplicates` overrides that copied-commit blocker for safe cases by absorbing the copied commit and keeping its later non-seed replay in the rebuilt stack
-- Rebuilds the current stack from its existing `merge-base(base, HEAD)` rather than restacking onto the latest base tip
+- Rebuilds the owning stack from its existing `merge-base(base, owning-stack-tip)` rather than restacking onto the latest base tip
 - Inserts absorbed commits after the group's real commits and before that group's trailing ignored block
 - Creates a local backup tag before rewriting the stack
-- Before rewriting the checked-out branch, `spr absorb` follows the `dirty_worktree` config.
+- Before rewriting from the invoking checkout, `spr absorb` follows the `dirty_worktree` config. If the owning stack branch is checked out in another worktree, absorb refuses to move it by ref.
 - On cherry-pick conflict, `spr absorb` suspends the rewrite, leaves the temp worktree in place, and prints `spr resume <path>`
 - Does not update GitHub; inspect the rewritten stack first, then run `spr update`
 - When `local_pr_branches` is enabled, synchronizes local resolved PR branches to the absorbed stack's final group tips after the local rewrite succeeds. A branch checked out in any worktree is reported as blocked and is not moved.
@@ -302,7 +302,6 @@ git checkout user-spr/alpha
 git commit -m "feat: alpha branch tail"
 git commit -m "feat: alpha branch tail 2"
 
-git checkout <stack-branch>
 spr absorb
 spr list commit
 spr update
