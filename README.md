@@ -76,7 +76,10 @@ Configuration
 spr reads configuration from YAML in two locations (repo overrides home):
 
 1. `$HOME/.spr_multicommit_cfg.yml`
-2. `<repo-root>/.spr_multicommit_cfg.yml`
+2. `<git-main-worktree-root>/.spr_multicommit_cfg.yml`
+
+When `spr` runs from a linked worktree, repository config still comes from Git's main worktree.
+A `.spr_multicommit_cfg.yml` that exists only in the linked worktree is ignored.
 
 Supported keys:
 
