@@ -1,7 +1,7 @@
 //! Repository and user configuration for `spr`.
 //!
 //! Configuration is loaded from `$HOME/.spr_multicommit_cfg.yml` and then
-//! overridden by `<repo-root>/.spr_multicommit_cfg.yml` when present.
+//! overridden by `<git-main-worktree-root>/.spr_multicommit_cfg.yml` when present.
 
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
@@ -251,7 +251,7 @@ pub fn load_config() -> Result<Config> {
     }
 
     // Repo config overrides home
-    if let Ok(Some(root)) = crate::git::repo_root() {
+    if let Some(root) = crate::git::main_worktree_root()? {
         let mut p = PathBuf::from(root);
         p.push(".spr_multicommit_cfg.yml");
         if let Some(repo_cfg) = read_config_file(&p)? {
@@ -266,12 +266,55 @@ pub fn load_config() -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_overrides, default_config, normalize_config, normalize_prefix, read_config_file,
-        DirtyWorktreePolicy, FileConfig, LocalPrBranchSyncPolicy, PrDescriptionMode,
-        RestackConflictPolicy,
+        apply_overrides, default_config, load_config, normalize_config, normalize_prefix,
+        read_config_file, DirtyWorktreePolicy, FileConfig, LocalPrBranchSyncPolicy,
+        PrDescriptionMode, RestackConflictPolicy,
     };
+    use crate::test_support::{git, init_repo, lock_cwd, DirGuard};
+    use std::env;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: String) -> Self {
+            let old = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(old) = &self.old {
+                env::set_var(self.key, old);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn add_linked_worktree(repo: &Path) -> (tempfile::TempDir, PathBuf) {
+        let linked_parent = tempdir().unwrap();
+        let linked_path = linked_parent.path().join("linked-worktree");
+        git(repo, ["branch", "linked-config-test", "HEAD"].as_slice());
+        git(
+            repo,
+            [
+                "worktree",
+                "add",
+                linked_path.to_str().unwrap(),
+                "linked-config-test",
+            ]
+            .as_slice(),
+        );
+        (linked_parent, linked_path)
+    }
 
     #[test]
     fn read_config_file_allows_yaml_comments() {
@@ -377,6 +420,51 @@ restack_conflict: rollback
         let cfg = default_config();
 
         assert_eq!(cfg.local_pr_branches, LocalPrBranchSyncPolicy::Off);
+    }
+
+    #[test]
+    fn load_config_reads_main_worktree_repo_config_from_linked_worktree() {
+        let _lock = lock_cwd();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home.path().display().to_string());
+        let repo_dir = init_repo();
+        let repo = repo_dir.path().to_path_buf();
+        fs::write(
+            repo.join(".spr_multicommit_cfg.yml"),
+            "base: origin/release-candidate\n",
+        )
+        .unwrap();
+        let (_linked_parent, linked_path) = add_linked_worktree(&repo);
+        fs::write(
+            linked_path.join(".spr_multicommit_cfg.yml"),
+            "base: origin/linked-worktree-only\n",
+        )
+        .unwrap();
+        let _guard = DirGuard::change_to(&linked_path);
+
+        let cfg = load_config().unwrap();
+
+        assert_eq!(cfg.base, "origin/release-candidate");
+    }
+
+    #[test]
+    fn load_config_ignores_linked_worktree_repo_config_without_main_repo_config() {
+        let _lock = lock_cwd();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home.path().display().to_string());
+        let repo_dir = init_repo();
+        let repo = repo_dir.path().to_path_buf();
+        let (_linked_parent, linked_path) = add_linked_worktree(&repo);
+        fs::write(
+            linked_path.join(".spr_multicommit_cfg.yml"),
+            "base: origin/linked-worktree-only\n",
+        )
+        .unwrap();
+        let _guard = DirGuard::change_to(&linked_path);
+
+        let cfg = load_config().unwrap();
+
+        assert_eq!(cfg.base, "");
     }
 
     #[test]

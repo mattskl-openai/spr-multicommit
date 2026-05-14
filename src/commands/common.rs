@@ -35,7 +35,7 @@ use tracing::{info, warn};
 
 use crate::config::DirtyWorktreePolicy;
 use crate::execution::ExecutionMode;
-use crate::git::{git_ro, git_rw, normalize_branch_name, repo_root};
+use crate::git::{git_ro, git_rw, repo_root, worktree_entries};
 use crate::parsing::Group;
 
 /// Returns the current branch name and the short SHA of `HEAD`.
@@ -170,53 +170,12 @@ pub fn run_native_rebase_with_abort(
     }
 }
 
-/// A single parsed entry from `git worktree list --porcelain`.
-///
-/// The `branch` value, when present, is normalized to a local branch name.
-#[derive(Debug, Clone)]
-struct WorktreeEntry {
-    path: String,
-    branch: Option<String>,
-}
-
-/// Lists worktrees in porcelain form and extracts their paths and branches.
-///
-/// We parse porcelain output to reliably determine whether a temp branch is
-/// currently checked out elsewhere, which must be resolved before deleting the
-/// branch.
-fn list_worktrees() -> Result<Vec<WorktreeEntry>> {
-    let out = git_ro(["worktree", "list", "--porcelain"].as_slice())?;
-    let mut entries: Vec<WorktreeEntry> = Vec::new();
-    let mut cur_path: Option<String> = None;
-    let mut cur_branch: Option<String> = None;
-
-    for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("worktree ") {
-            if let Some(path) = cur_path.take() {
-                entries.push(WorktreeEntry {
-                    path,
-                    branch: cur_branch.take(),
-                });
-            }
-            cur_path = Some(rest.trim().to_string());
-            cur_branch = None;
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("branch ") {
-            if cur_path.is_some() {
-                cur_branch = Some(normalize_branch_name(rest.trim()));
-            }
-        }
-    }
-
-    if let Some(path) = cur_path.take() {
-        entries.push(WorktreeEntry {
-            path,
-            branch: cur_branch.take(),
-        });
-    }
-
-    Ok(entries)
+/// Returns the worktree path that currently has `branch` checked out, if any.
+pub fn checked_out_worktree_for_branch(branch: &str) -> Result<Option<String>> {
+    Ok(worktree_entries()?
+        .into_iter()
+        .find(|entry| entry.branch.as_deref() == Some(branch))
+        .map(|entry| entry.path))
 }
 
 /// Returns true when a local branch with the given name exists.
@@ -236,7 +195,7 @@ fn cleanup_existing_temp_state(
     tmp_path: &str,
     tmp_branch: &str,
 ) -> Result<()> {
-    let entries = list_worktrees()?;
+    let entries = worktree_entries()?;
     let mut removed_paths: HashSet<String> = HashSet::new();
 
     // If the temp branch is checked out in any worktree, remove those first

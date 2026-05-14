@@ -12,7 +12,7 @@ use tracing::info;
 use crate::branch_names::group_branch_name;
 use crate::config::LocalPrBranchSyncPolicy;
 use crate::execution::ExecutionMode;
-use crate::git::{git_is_ancestor, git_local_branch_tip, git_ro, git_rw};
+use crate::git::{git_is_ancestor, git_local_branch_tip, git_rw, worktree_entries};
 use crate::parsing::Group;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,12 +268,10 @@ fn backup_tag_for_non_fast_forward(
 }
 
 fn checked_out_local_branches() -> Result<HashSet<String>> {
-    let output = git_ro(["worktree", "list", "--porcelain"].as_slice())
-        .context("failed to list git worktrees")?;
-    Ok(output
-        .lines()
-        .filter_map(|line| line.strip_prefix("branch refs/heads/"))
-        .map(str::to_string)
+    Ok(worktree_entries()
+        .context("failed to list git worktrees")?
+        .into_iter()
+        .filter_map(|entry| entry.branch)
         .collect())
 }
 
