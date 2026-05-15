@@ -170,14 +170,6 @@ pub fn run_native_rebase_with_abort(
     }
 }
 
-/// Returns the worktree path that currently has `branch` checked out, if any.
-pub fn checked_out_worktree_for_branch(branch: &str) -> Result<Option<String>> {
-    Ok(worktree_entries()?
-        .into_iter()
-        .find(|entry| entry.branch.as_deref() == Some(branch))
-        .map(|entry| entry.path))
-}
-
 /// Returns true when a local branch with the given name exists.
 fn branch_exists(branch: &str) -> Result<bool> {
     let out = git_ro(["branch", "--list", branch].as_slice())?;
