@@ -144,6 +144,23 @@ pub enum Cmd {
         dry_run: DryRunArgs,
     },
 
+    /// Adopt rewritten lower-stack history as the new prefix of its live stack
+    #[command(
+        long_about = "Adopt rewritten lower-stack history as the new prefix of its existing live stack.\n\nRun this from a checkout whose committed history through `HEAD` is the rewritten bottom prefix you want to keep. `spr adopt-prefix` resolves the owning live stack from explicit `pr:` and `branch:` selectors, verifies that the candidate still represents the same live bottom sequence, then rebuilds the remaining raw history above the verified stack branch. Adoption preserves the verified live stack merge base and rejects candidates that would change the publishable selector sequence.\n\nThe candidate checkout is the prefix source, not the rebuilt destination branch. The verified owning full-stack branch must not be checked out in another worktree while adoption runs. `spr adopt-prefix` is local-only and does not update GitHub; run `spr update` after inspecting the result."
+    )]
+    AdoptPrefix {
+        /// Create a local backup tag at the old owning stack tip before rewriting
+        #[arg(long)]
+        safe: bool,
+
+        /// Print the resolved adoption plan and do not rewrite or publish
+        #[arg(long)]
+        preview: bool,
+
+        #[command(flatten)]
+        dry_run: DryRunArgs,
+    },
+
     /// Drop bottom PR groups whose GitHub PRs already merged, without landing or mutating PRs
     #[command(
         long_about = "Drop bottom PR groups whose GitHub PRs already merged, without landing or mutating PRs.\n\n`spr drop-merged-prefix` is local post-merge maintenance. It reads GitHub PR state, verifies each dropped PR's GitHub merge commit is contained in the configured SPR base, and then rewrites only the checked-out local stack.\n\nIt does not merge, close, retarget, comment on, or push GitHub PRs. After inspecting the rewritten stack, run `spr update` to publish remaining PR branch updates."
@@ -191,7 +208,7 @@ pub enum Cmd {
 
     /// Resume a suspended local rewrite from a resume-state file
     #[command(
-        long_about = "Resume a suspended local rewrite from a resume-state file.\n\nRun `spr resume <path>` with the exact path printed by `spr restack`, `spr absorb`, `spr move`, or `spr fix-pr` after a cherry-pick conflict. The supported workflow is: resolve the conflict in the printed temp rewrite worktree, stage the resolution, and then run the printed `spr resume <path>` command from any worktree in the same repository.\n\nThe resume file lives under the repository common Git directory, usually `.git/spr/resume/`. `spr resume` tolerates one accidental manual `git cherry-pick --continue` for the paused step, but broader manual replay edits are rejected."
+        long_about = "Resume a suspended local rewrite from a resume-state file.\n\nRun `spr resume <path>` with the exact path printed by `spr restack`, `spr adopt-prefix`, `spr absorb`, `spr move`, or `spr fix-pr` after a cherry-pick conflict. The supported workflow is: resolve the conflict in the printed temp rewrite worktree, stage the resolution, and then run the printed `spr resume <path>` command from any worktree in the same repository.\n\nThe resume file lives under the repository common Git directory, usually `.git/spr/resume/`. `spr resume` tolerates one accidental manual `git cherry-pick --continue` for the paused step, but broader manual replay edits are rejected."
     )]
     Resume {
         /// Explicit path to the suspended rewrite's resume-state JSON file
@@ -524,6 +541,26 @@ mod tests {
                 dry_run,
             } => {
                 assert_eq!(after.to_string(), "pr:alpha");
+                assert!(safe);
+                assert!(preview);
+                assert_eq!(ExecutionMode::from(dry_run), ExecutionMode::Apply);
+                assert_eq!(cli.output.format(), OutputFormat::Json);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn adopt_prefix_preview_flag_parses_with_json_and_safe() {
+        let cli =
+            Cli::try_parse_from(["spr", "adopt-prefix", "--safe", "--preview", "--json"]).unwrap();
+
+        match cli.cmd {
+            Cmd::AdoptPrefix {
+                safe,
+                preview,
+                dry_run,
+            } => {
                 assert!(safe);
                 assert!(preview);
                 assert_eq!(ExecutionMode::from(dry_run), ExecutionMode::Apply);
