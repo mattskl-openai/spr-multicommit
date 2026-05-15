@@ -58,6 +58,8 @@ pub struct MachineSuspendedPayload {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum MachinePayload {
     Completed {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination_branch: Option<String>,
         local_pr_branch_actions: Vec<crate::local_pr_branches::LocalPrBranchAction>,
     },
     Suspended {
@@ -71,10 +73,19 @@ impl MachineOutput {
         command: MachineCommand,
         local_pr_branch_actions: Vec<crate::local_pr_branches::LocalPrBranchAction>,
     ) -> Self {
+        Self::completed_with_destination_branch(command, None, local_pr_branch_actions)
+    }
+
+    pub fn completed_with_destination_branch(
+        command: MachineCommand,
+        destination_branch: Option<String>,
+        local_pr_branch_actions: Vec<crate::local_pr_branches::LocalPrBranchAction>,
+    ) -> Self {
         Self {
             schema_version: JSON_OUTPUT_SCHEMA_VERSION,
             command,
             payload: MachinePayload::Completed {
+                destination_branch,
                 local_pr_branch_actions,
             },
         }

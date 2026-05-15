@@ -7,7 +7,8 @@ use tracing::info;
 use crate::commands::common;
 use crate::commands::common::CherryPickOp;
 use crate::commands::rewrite_resume::{
-    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteSession,
+    self, RewriteCommandKind, RewriteCommandOutcome, RewriteConflictPolicy, RewriteDestinationKind,
+    RewriteSession,
 };
 use crate::config::DirtyWorktreePolicy;
 use crate::execution::ExecutionMode;
@@ -182,6 +183,7 @@ pub fn fix_pr_tail(
                     original_worktree_root,
                     original_branch: cur_branch,
                     original_head,
+                    destination_kind: RewriteDestinationKind::CheckedOutBranch,
                     resume_path,
                     temp_branch: tmp_branch,
                     temp_worktree_path: tmp_path,

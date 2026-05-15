@@ -39,6 +39,8 @@ pub enum RewriteCommandOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteResumeContext {
     pub original_worktree_root: String,
+    pub original_branch: String,
+    pub destination_kind: RewriteDestinationKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,14 @@ impl RewriteCommandKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteDestinationKind {
+    #[default]
+    CheckedOutBranch,
+    UncheckedOutBranchRef,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RewriteReplayStep {
     pub source_sha: String,
@@ -96,6 +106,8 @@ pub struct RewriteResumeState {
     pub original_worktree_root: String,
     pub original_branch: String,
     pub original_head: String,
+    #[serde(default)]
+    pub destination_kind: RewriteDestinationKind,
     pub temp_branch: String,
     pub temp_worktree_path: String,
     pub backup_tag: Option<String>,
@@ -116,6 +128,7 @@ pub struct RewriteSession {
     pub original_worktree_root: String,
     pub original_branch: String,
     pub original_head: String,
+    pub destination_kind: RewriteDestinationKind,
     pub resume_path: PathBuf,
     pub temp_branch: String,
     pub temp_worktree_path: String,
@@ -198,6 +211,7 @@ pub fn run_rewrite_session(
         original_worktree_root: session.original_worktree_root,
         original_branch: session.original_branch,
         original_head: session.original_head.clone(),
+        destination_kind: session.destination_kind,
         temp_branch: session.temp_branch,
         temp_worktree_path: session.temp_worktree_path.clone(),
         backup_tag: session.backup_tag,
@@ -319,6 +333,8 @@ pub fn resume_context(path: &Path) -> Result<RewriteResumeContext> {
     validate_resume_state_against_current_repo(&resume_path, &state)?;
     Ok(RewriteResumeContext {
         original_worktree_root: state.original_worktree_root,
+        original_branch: state.original_branch,
+        destination_kind: state.destination_kind,
     })
 }
 
@@ -380,23 +396,9 @@ fn finish_rewrite(
     resume_path: &Path,
     restore_dirty_worktree_on_success: bool,
 ) -> Result<RewriteCommandOutcome> {
-    validate_original_worktree_target(&state)?;
+    validate_rewrite_destination(&state)?;
     let new_tip = common::tip_of_tmp(&state.temp_worktree_path)?;
-    info!(
-        "Updating original branch {} in {} to new tip {}...",
-        state.original_branch, state.original_worktree_root, new_tip
-    );
-    let _ = git_rw(
-        execution_mode,
-        [
-            "-C",
-            state.original_worktree_root.as_str(),
-            "reset",
-            "--hard",
-            &new_tip,
-        ]
-        .as_slice(),
-    )?;
+    update_destination(execution_mode, &state, &new_tip)?;
     let metadata_refresh_result = if execution_mode == ExecutionMode::DryRun {
         Ok(())
     } else if let Some(metadata_refresh_context) = &state.metadata_refresh_context {
@@ -843,7 +845,7 @@ fn validate_temp_worktree_exists(state: &RewriteResumeState) -> Result<()> {
     }
 }
 
-fn validate_original_worktree_target(state: &RewriteResumeState) -> Result<()> {
+fn validate_rewrite_destination(state: &RewriteResumeState) -> Result<()> {
     if !Path::new(&state.original_worktree_root).exists() {
         bail!(
             "original worktree root {} no longer exists",
@@ -851,26 +853,106 @@ fn validate_original_worktree_target(state: &RewriteResumeState) -> Result<()> {
         );
     }
 
-    let current_branch = branch_at(&state.original_worktree_root)?;
-    if current_branch != state.original_branch {
-        bail!(
-            "original worktree {} is now on branch {} instead of recorded branch {}",
-            state.original_worktree_root,
-            current_branch,
-            state.original_branch
-        );
+    match state.destination_kind {
+        RewriteDestinationKind::CheckedOutBranch => {
+            let current_branch = branch_at(&state.original_worktree_root)?;
+            if current_branch != state.original_branch {
+                bail!(
+                    "original worktree {} is now on branch {} instead of recorded branch {}",
+                    state.original_worktree_root,
+                    current_branch,
+                    state.original_branch
+                );
+            }
+
+            let current_head = head_at(&state.original_worktree_root)?;
+            if current_head != state.original_head {
+                bail!(
+                    "original branch {} moved from recorded tip {} to {}; resume refuses to reset it",
+                    state.original_branch,
+                    state.original_head,
+                    current_head
+                );
+            }
+        }
+        RewriteDestinationKind::UncheckedOutBranchRef => {
+            if let Some(worktree) = common::checked_out_worktree_for_branch(&state.original_branch)?
+            {
+                bail!(
+                    "destination branch {} is checked out in worktree {}; resume refuses to move it by ref",
+                    state.original_branch,
+                    worktree
+                );
+            }
+            let branch_ref = format!("refs/heads/{}", state.original_branch);
+            let current_head = git_ro(
+                [
+                    "-C",
+                    state.original_worktree_root.as_str(),
+                    "rev-parse",
+                    branch_ref.as_str(),
+                ]
+                .as_slice(),
+            )?
+            .trim()
+            .to_string();
+            if current_head != state.original_head {
+                bail!(
+                    "destination branch {} moved from recorded tip {} to {}; resume refuses to update it",
+                    state.original_branch,
+                    state.original_head,
+                    current_head
+                );
+            }
+        }
     }
 
-    let current_head = head_at(&state.original_worktree_root)?;
-    if current_head != state.original_head {
-        bail!(
-            "original branch {} moved from recorded tip {} to {}; resume refuses to reset it",
-            state.original_branch,
-            state.original_head,
-            current_head
-        );
-    }
+    Ok(())
+}
 
+fn update_destination(
+    execution_mode: ExecutionMode,
+    state: &RewriteResumeState,
+    new_tip: &str,
+) -> Result<()> {
+    match state.destination_kind {
+        RewriteDestinationKind::CheckedOutBranch => {
+            info!(
+                "Updating original branch {} in {} to new tip {}...",
+                state.original_branch, state.original_worktree_root, new_tip
+            );
+            let _ = git_rw(
+                execution_mode,
+                [
+                    "-C",
+                    state.original_worktree_root.as_str(),
+                    "reset",
+                    "--hard",
+                    new_tip,
+                ]
+                .as_slice(),
+            )?;
+        }
+        RewriteDestinationKind::UncheckedOutBranchRef => {
+            info!(
+                "Updating destination branch {} from {} to new tip {}...",
+                state.original_branch, state.original_head, new_tip
+            );
+            let branch_ref = format!("refs/heads/{}", state.original_branch);
+            let _ = git_rw(
+                execution_mode,
+                [
+                    "-C",
+                    state.original_worktree_root.as_str(),
+                    "update-ref",
+                    branch_ref.as_str(),
+                    new_tip,
+                    state.original_head.as_str(),
+                ]
+                .as_slice(),
+            )?;
+        }
+    }
     Ok(())
 }
 fn default_resume_path(
@@ -1072,8 +1154,8 @@ mod tests {
         conflicted_paths_from_status_lines, default_resume_path,
         prepare_resume_path_for_new_session, resume_rewrite, run_rewrite_session,
         sanitize_branch_for_filename, suspend_instruction_lines, RewriteCommandKind,
-        RewriteCommandOutcome, RewriteConflictPolicy, RewriteReplayStep, RewriteResumeState,
-        RewriteSession, REWRITE_RESUME_SCHEMA_VERSION,
+        RewriteCommandOutcome, RewriteConflictPolicy, RewriteDestinationKind, RewriteReplayStep,
+        RewriteResumeState, RewriteSession, REWRITE_RESUME_SCHEMA_VERSION,
     };
     use crate::commands::common::{
         CherryPickEmptyPolicy, CherryPickOp, DeferredDirtyWorktreeRestore,
@@ -1182,6 +1264,7 @@ mod tests {
             original_worktree_root: repo.display().to_string(),
             original_branch: "stack".to_string(),
             original_head: original_head.clone(),
+            destination_kind: RewriteDestinationKind::CheckedOutBranch,
             resume_path,
             temp_branch: tmp_branch.clone(),
             temp_worktree_path: tmp_path.clone(),
@@ -1245,6 +1328,7 @@ mod tests {
                 original_worktree_root: repo.display().to_string(),
                 original_branch: "stack".to_string(),
                 original_head,
+                destination_kind: RewriteDestinationKind::CheckedOutBranch,
                 resume_path: resume_path.clone(),
                 temp_branch: tmp_branch,
                 temp_worktree_path: tmp_path,
@@ -1326,6 +1410,7 @@ mod tests {
                 original_worktree_root: repo.display().to_string(),
                 original_branch: "stack".to_string(),
                 original_head,
+                destination_kind: RewriteDestinationKind::CheckedOutBranch,
                 resume_path: resume_path.clone(),
                 temp_branch: tmp_branch,
                 temp_worktree_path: tmp_path,
@@ -1668,6 +1753,7 @@ mod tests {
             original_worktree_root: "/tmp/repo".to_string(),
             original_branch: "stack".to_string(),
             original_head: "abcdef0123456789".to_string(),
+            destination_kind: RewriteDestinationKind::CheckedOutBranch,
             temp_branch: "spr/tmp-restack-abcdef0".to_string(),
             temp_worktree_path: "/tmp/spr-restack-abcdef0".to_string(),
             backup_tag: None,
