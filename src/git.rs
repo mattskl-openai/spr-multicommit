@@ -219,6 +219,69 @@ pub fn repo_root() -> Result<Option<String>> {
     }
 }
 
+/// A single parsed entry from `git worktree list --porcelain`.
+///
+/// Git reports the main worktree first. The `branch` value, when present, is
+/// normalized to a local branch name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: String,
+    pub branch: Option<String>,
+}
+
+fn parse_worktree_list_porcelain(output: &str) -> Vec<WorktreeEntry> {
+    let mut entries = Vec::new();
+    let mut cur_path: Option<String> = None;
+    let mut cur_branch: Option<String> = None;
+
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            if let Some(path) = cur_path.take() {
+                entries.push(WorktreeEntry {
+                    path,
+                    branch: cur_branch.take(),
+                });
+            }
+            cur_path = Some(rest.trim().to_string());
+            cur_branch = None;
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            if cur_path.is_some() {
+                cur_branch = Some(normalize_branch_name(rest.trim()));
+            }
+        }
+    }
+
+    if let Some(path) = cur_path {
+        entries.push(WorktreeEntry {
+            path,
+            branch: cur_branch,
+        });
+    }
+
+    entries
+}
+
+/// Lists the repository's worktrees in Git's stable porcelain order.
+pub fn worktree_entries() -> Result<Vec<WorktreeEntry>> {
+    let out = git_ro(["worktree", "list", "--porcelain"].as_slice())?;
+    Ok(parse_worktree_list_porcelain(&out))
+}
+
+/// Returns the Git main worktree root when the current process is in a worktree.
+///
+/// `git worktree list --porcelain` reports the main worktree first. That root
+/// is the canonical repository config surface shared by every linked worktree.
+pub fn main_worktree_root() -> Result<Option<String>> {
+    if repo_root()?.is_none() {
+        return Ok(None);
+    }
+
+    let Some(main_worktree) = worktree_entries()?.into_iter().next() else {
+        bail!("git worktree list --porcelain returned no worktrees");
+    };
+    Ok(Some(main_worktree.path))
+}
+
 fn canonicalize_existing_path(path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path)
         .with_context(|| format!("failed to canonicalize path {}", path.display()))
@@ -520,4 +583,35 @@ pub fn list_remote_branches_with_prefix(prefix: &str) -> Result<Vec<String>> {
         }
     }
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_worktree_list_porcelain;
+
+    #[test]
+    fn parse_worktree_list_porcelain_preserves_main_worktree_first() {
+        let entries = parse_worktree_list_porcelain(
+            "worktree /repo\nHEAD abc123\nbranch refs/heads/main\n\nworktree /tmp/repo-stack\nHEAD def456\nbranch refs/heads/stack\n\n",
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "/repo");
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+        assert_eq!(entries[1].path, "/tmp/repo-stack");
+        assert_eq!(entries[1].branch.as_deref(), Some("stack"));
+    }
+
+    #[test]
+    fn parse_worktree_list_porcelain_keeps_detached_entries() {
+        let entries = parse_worktree_list_porcelain(
+            "worktree /repo\nHEAD abc123\ndetached\n\nworktree /tmp/repo-stack\nHEAD def456\nbranch refs/heads/stack\n",
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "/repo");
+        assert_eq!(entries[0].branch, None);
+        assert_eq!(entries[1].path, "/tmp/repo-stack");
+        assert_eq!(entries[1].branch.as_deref(), Some("stack"));
+    }
 }
