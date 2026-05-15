@@ -22,6 +22,7 @@ mod local_pr_branches;
 mod machine_output;
 mod maintenance_output;
 mod parsing;
+mod pr_base_chain;
 mod pr_labels;
 mod read_only_output;
 mod restack_output;
@@ -1434,6 +1435,19 @@ mod tests {
         )
     }
 
+    fn stale_update_base_gh_script(
+        log_path: &std::path::Path,
+        open_prs_path: &std::path::Path,
+        body_json_path: &std::path::Path,
+    ) -> String {
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'gh test wrapper'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*) cat \"{}\" ;;\n    *\"is:pr is:open head:dank-spr/alpha\"*|*\"is:pr is:open head:dank-spr/beta\"*)\n      echo '{{\"data\":{{\"pr0\":{{\"nodes\":[]}},\"pr1\":{{\"nodes\":[]}}}}}}' ;;\n    *\"pullRequest(number: 17)\"*\"pullRequest(number: 18)\"*) cat \"{}\" ;;\n    *\"mutation {{\"*) echo '{{\"data\":{{}}}}' ;;\n    *) echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            log_path.display(),
+            open_prs_path.display(),
+            body_json_path.display(),
+        )
+    }
+
     #[test]
     fn working_directory_override_changes_repo_context() {
         let _lock = lock_cwd();
@@ -2613,6 +2627,99 @@ mod tests {
             }
             other => panic!("unexpected command output: {:?}", other),
         }
+    }
+
+    #[test]
+    fn update_rejects_base_edits_that_do_not_converge_after_apply() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let origin_url = format!("file://{}", dir.path().join("origin.git").display());
+        git(
+            &repo,
+            ["remote", "set-url", "origin", origin_url.as_str()].as_slice(),
+        );
+        let log_path = repo.join("gh.log");
+        let open_prs_path = repo.join("gh-open.json");
+        let body_json_path = repo.join("gh-bodies.json");
+        fs::write(
+            &open_prs_path,
+            serde_json::to_string(&serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "nodes": [{
+                                "number": 17,
+                                "headRefName": "dank-spr/alpha",
+                                "baseRefName": "main",
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/17",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        },
+                        "pr1": {
+                            "nodes": [{
+                                "number": 18,
+                                "headRefName": "dank-spr/beta",
+                                "baseRefName": "main",
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/18",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &body_json_path,
+            serde_json::to_string(&serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "id": "PR_17",
+                            "body": "alpha body"
+                        },
+                        "pr1": {
+                            "id": "PR_18",
+                            "body": "beta body"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let script = stale_update_base_gh_script(&log_path, &open_prs_path, &body_json_path);
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "update",
+        ])
+        .unwrap();
+
+        let err = run_cli(cli, OutputFormat::Human).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "GitHub PR base chain did not converge after update: dank-spr/beta: main -> dank-spr/alpha"
+        );
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("baseRefName:\"dank-spr/alpha\""), "{log}");
     }
 
     #[test]

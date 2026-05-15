@@ -13,11 +13,15 @@ use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
 use crate::execution::ExecutionMode;
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
-    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, list_open_prs_for_heads,
+    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape,
     list_recent_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
 };
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::Group;
+use crate::pr_base_chain::{
+    build_desired_pr_base_chain, plan_base_reconciliation, verify_base_edits_converged,
+    BaseReconciliationAction, ObservedPrBaseChain,
+};
 use crate::update_output::{
     SkippedUpdateGroupData, UpdateEditAction, UpdateExecutionData, UpdateGroupData, UpdatePrAction,
     UpdatePushAction, UpdateSkippedReason,
@@ -114,40 +118,6 @@ fn pr_number_for_head(
     head: &str,
 ) -> Option<u64> {
     prs_by_head.get(&head_key(head)).copied()
-}
-
-fn open_pr_state_for_heads(
-    heads: &[String],
-) -> Result<(
-    HashMap<CanonicalBranchConflictKey, u64>,
-    HashMap<u64, String>,
-)> {
-    let mut prs_by_head = HashMap::new();
-    let mut current_base_by_number = HashMap::new();
-    for pr in list_open_prs_for_heads(heads)? {
-        prs_by_head.insert(head_key(&pr.head), pr.number);
-        current_base_by_number.insert(pr.number, pr.base);
-    }
-    Ok((prs_by_head, current_base_by_number))
-}
-
-fn planned_base_updates(
-    current_base_by_number: &HashMap<u64, String>,
-    desired_base_by_number: &HashMap<u64, String>,
-) -> Vec<u64> {
-    let mut numbers = desired_base_by_number
-        .iter()
-        .filter_map(|(number, desired_base)| {
-            let desired_base_ref = sanitize_gh_base_ref(desired_base);
-            current_base_by_number
-                .get(number)
-                .map(|base_ref| sanitize_gh_base_ref(base_ref) != desired_base_ref)
-                .unwrap_or(true)
-                .then_some(*number)
-        })
-        .collect::<Vec<_>>();
-    numbers.sort_unstable();
-    numbers
 }
 
 /// Fail `spr update` early when branch-name reuse matches a recently closed or merged PR.
@@ -472,10 +442,16 @@ fn build_from_groups_internal(
     }
     let total_groups = groups.len();
     let branch_identities = group_branch_identities(&groups, prefix)?;
-    let desired_base_by_head: HashMap<String, String> =
-        common::build_head_base_chain(base, &groups, prefix)?
-            .into_iter()
-            .collect();
+    let desired_chain = build_desired_pr_base_chain(base, &groups, prefix)?;
+    let desired_base_by_head: HashMap<String, String> = desired_chain
+        .iter()
+        .map(|desired| {
+            (
+                desired.head_branch.clone(),
+                desired.expected_base_ref.clone(),
+            )
+        })
+        .collect();
 
     info!("Preparing {} group(s)…", groups.len());
 
@@ -483,11 +459,12 @@ fn build_from_groups_internal(
         .iter()
         .map(|identity| identity.exact.clone())
         .collect();
-    let (mut prs_by_head, mut current_base_by_number) = if no_pr {
-        (HashMap::new(), HashMap::new())
+    let mut observed_pr_bases = if no_pr {
+        ObservedPrBaseChain::default()
     } else {
-        open_pr_state_for_heads(&heads)?
+        ObservedPrBaseChain::observe_for_heads(&heads)?
     };
+    let mut prs_by_head = observed_pr_bases.pr_numbers_by_head();
     enforce_branch_reuse_guard(
         no_pr,
         allow_branch_reuse,
@@ -664,7 +641,6 @@ fn build_from_groups_internal(
                 pr_actions_by_group[group_idx] = if was_known {
                     UpdatePrAction::Existing
                 } else {
-                    current_base_by_number.insert(number, sanitize_gh_base_ref(&parent_branch));
                     UpdatePrAction::Created
                 };
             }
@@ -673,10 +649,8 @@ fn build_from_groups_internal(
     }
 
     if !no_pr && !dry_run {
-        let (refreshed_prs_by_head, refreshed_current_base_by_number) =
-            open_pr_state_for_heads(&heads)?;
-        prs_by_head.extend(refreshed_prs_by_head);
-        current_base_by_number.extend(refreshed_current_base_by_number);
+        observed_pr_bases = ObservedPrBaseChain::observe_for_heads(&heads)?;
+        prs_by_head.extend(observed_pr_bases.pr_numbers_by_head());
     }
 
     if !no_pr {
@@ -765,10 +739,20 @@ fn build_from_groups_internal(
                 }
             }
         }
-        let base_update_numbers =
-            planned_base_updates(&current_base_by_number, &desired_base_by_number)
-                .into_iter()
-                .collect::<HashSet<_>>();
+        let base_reconciliation = plan_base_reconciliation(&desired_chain, &observed_pr_bases);
+        let edited_head_branches = base_reconciliation
+            .iter()
+            .filter(|decision| decision.action == BaseReconciliationAction::NeedsEdit)
+            .map(|decision| decision.desired.head_branch.clone())
+            .collect::<Vec<_>>();
+        let base_update_numbers = base_reconciliation
+            .into_iter()
+            .filter_map(|decision| {
+                (decision.action == BaseReconciliationAction::NeedsEdit)
+                    .then_some(decision.remote_pr_number)
+                    .flatten()
+            })
+            .collect::<HashSet<_>>();
         for (&number, want_base) in &desired_base_by_number {
             if let Some(info) = bodies_by_number.get(&number) {
                 let desired_base_ref = sanitize_gh_base_ref(want_base);
@@ -788,6 +772,7 @@ fn build_from_groups_internal(
         for group_idx in created_without_number {
             description_actions_by_group[group_idx] = UpdateEditAction::Updated;
         }
+        let should_verify_base_updates = !edited_head_branches.is_empty();
         if !base_updates.is_empty() || !body_updates.is_empty() {
             if !base_updates.is_empty() {
                 run_update_mutations(
@@ -810,6 +795,12 @@ fn build_from_groups_internal(
                     false,
                     render_progress,
                 )?;
+            }
+            if should_verify_base_updates && execution_mode == ExecutionMode::Apply {
+                let refreshed_pr_bases = ObservedPrBaseChain::observe_for_heads(&heads)?;
+                let refreshed_decisions =
+                    plan_base_reconciliation(&desired_chain, &refreshed_pr_bases);
+                verify_base_edits_converged(&edited_head_branches, &refreshed_decisions)?;
             }
         } else {
             info!("All PR descriptions/base refs up-to-date; no edits needed");
@@ -997,8 +988,7 @@ mod tests {
     use super::{
         branch_reuse_guard_window, build_from_groups, build_from_tags, head_key,
         heads_without_open_prs, ignored_boundary_warning, parse_github_timestamp_rfc3339,
-        planned_base_updates, pr_number_for_head, recent_pr_age, recent_pr_age_blocks_recreation,
-        terminal_pr_action,
+        pr_number_for_head, recent_pr_age, recent_pr_age_blocks_recreation, terminal_pr_action,
     };
     use crate::branch_names::group_branch_identities;
     use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
@@ -1085,29 +1075,6 @@ mod tests {
 
         assert!(missing.is_empty());
         assert_eq!(pr_number_for_head(&prs_by_head, "dank-spr/alpha"), Some(17));
-    }
-
-    #[test]
-    fn planned_base_updates_only_retargets_the_post_land_bottom_pr() {
-        let current = HashMap::from([
-            (2, "dank-spr/alpha".to_string()),
-            (3, "dank-spr/beta".to_string()),
-        ]);
-        let desired = HashMap::from([(2, "main".to_string()), (3, "dank-spr/beta".to_string())]);
-
-        assert_eq!(planned_base_updates(&current, &desired), vec![2]);
-    }
-
-    #[test]
-    fn planned_base_updates_leave_a_correct_rewritten_chain_untouched() {
-        let current = HashMap::from([
-            (1, "main".to_string()),
-            (2, "dank-spr/alpha".to_string()),
-            (3, "dank-spr/beta".to_string()),
-        ]);
-        let desired = current.clone();
-
-        assert!(planned_base_updates(&current, &desired).is_empty());
     }
 
     #[test]
