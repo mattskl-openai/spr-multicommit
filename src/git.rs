@@ -396,11 +396,23 @@ pub fn get_remote_branches_sha(branches: &[String]) -> Result<HashMap<String, St
 }
 
 pub fn git_is_ancestor(ancestor: &str, descendant: &str) -> Result<bool> {
-    let status = Command::new("git")
+    let out = Command::new("git")
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .status()
+        .output()
         .with_context(|| "failed to run git merge-base --is-ancestor")?;
-    Ok(status.success())
+    if out.status.success() {
+        Ok(true)
+    } else if out.status.code() == Some(1) {
+        Ok(false)
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!(
+            "git merge-base --is-ancestor {} {} failed: {}",
+            ancestor,
+            descendant,
+            stderr
+        )
+    }
 }
 
 /// Resolves a revision to its full object id.
