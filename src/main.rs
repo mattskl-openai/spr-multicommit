@@ -1510,10 +1510,28 @@ mod tests {
         body_json_path: &std::path::Path,
     ) -> String {
         format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'gh test wrapper'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*) cat \"{}\" ;;\n    *\"is:pr is:open head:dank-spr/alpha\"*|*\"is:pr is:open head:dank-spr/beta\"*)\n      echo '{{\"data\":{{\"pr0\":{{\"nodes\":[]}},\"pr1\":{{\"nodes\":[]}}}}}}' ;;\n    *\"pullRequest(number: 17)\"*\"pullRequest(number: 18)\"*) cat \"{}\" ;;\n    *\"mutation {{\"*) echo '{{\"data\":{{}}}}' ;;\n    *) echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'gh test wrapper'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*) cat \"{}\" ;;\n    *\"is:pr is:open head:dank-spr/alpha\"*|*\"is:pr is:open head:dank-spr/beta\"*)\n      echo '{{\"data\":{{\"pr0\":{{\"nodes\":[]}},\"pr1\":{{\"nodes\":[]}}}}}}' ;;\n    *\"pullRequest(number: 18) {{ id isDraft }}\"*)\n      echo '{{\"data\":{{\"repository\":{{\"pr0\":{{\"id\":\"PR_18\",\"isDraft\":false}}}}}}}}' ;;\n    *\"pullRequest(number: 17)\"*\"pullRequest(number: 18)\"*) cat \"{}\" ;;\n    *\"mutation {{\"*) echo '{{\"data\":{{}}}}' ;;\n    *) echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
             open_prs_path.display(),
             body_json_path.display(),
+        )
+    }
+
+    fn protected_update_gh_script(
+        log_path: &std::path::Path,
+        stale_open_prs_path: &std::path::Path,
+        updated_open_prs_path: &std::path::Path,
+        body_json_path: &std::path::Path,
+        base_updated_path: &std::path::Path,
+    ) -> String {
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'gh test wrapper'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*)\n      if [ -f \"{}\" ]; then cat \"{}\"; else cat \"{}\"; fi ;;\n    *\"pullRequest(number: 18) {{ id isDraft }}\"*)\n      echo '{{\"data\":{{\"repository\":{{\"pr0\":{{\"id\":\"PR_18\",\"isDraft\":false}}}}}}}}' ;;\n    *\"pullRequest(number: 17)\"*\"pullRequest(number: 18)\"*) cat \"{}\" ;;\n    *\"updatePullRequest\"*\"baseRefName\"*) touch \"{}\"; echo '{{\"data\":{{}}}}' ;;\n    *\"mutation {{\"*) echo '{{\"data\":{{}}}}' ;;\n    *) echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            log_path.display(),
+            base_updated_path.display(),
+            updated_open_prs_path.display(),
+            stale_open_prs_path.display(),
+            body_json_path.display(),
+            base_updated_path.display(),
         )
     }
 
@@ -2789,6 +2807,135 @@ mod tests {
         );
         let log = fs::read_to_string(log_path).unwrap();
         assert!(log.contains("baseRefName:\"dank-spr/alpha\""), "{log}");
+    }
+
+    #[test]
+    fn update_draft_protection_wraps_head_push_and_base_reconciliation() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let origin_url = format!("file://{}", dir.path().join("origin.git").display());
+        git(
+            &repo,
+            ["remote", "set-url", "origin", origin_url.as_str()].as_slice(),
+        );
+        let log_path = repo.join("events.log");
+        let stale_open_prs_path = repo.join("gh-open-stale.json");
+        let updated_open_prs_path = repo.join("gh-open-updated.json");
+        let body_json_path = repo.join("gh-bodies.json");
+        let base_updated_path = repo.join("base-updated");
+        let open_prs = |beta_base: &str| {
+            serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": {
+                            "nodes": [{
+                                "number": 17,
+                                "headRefName": "dank-spr/alpha",
+                                "baseRefName": "main",
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/17",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        },
+                        "pr1": {
+                            "nodes": [{
+                                "number": 18,
+                                "headRefName": "dank-spr/beta",
+                                "baseRefName": beta_base,
+                                "state": "OPEN",
+                                "mergedAt": serde_json::Value::Null,
+                                "closedAt": serde_json::Value::Null,
+                                "url": "https://github.com/o/r/pull/18",
+                                "autoMergeRequest": serde_json::Value::Null
+                            }]
+                        }
+                    }
+                }
+            })
+        };
+        fs::write(
+            &stale_open_prs_path,
+            serde_json::to_string(&open_prs("main")).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &updated_open_prs_path,
+            serde_json::to_string(&open_prs("dank-spr/alpha")).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &body_json_path,
+            serde_json::to_string(&serde_json::json!({
+                "data": {
+                    "repository": {
+                        "pr0": { "id": "PR_17", "body": "alpha body" },
+                        "pr1": { "id": "PR_18", "body": "beta body" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let hook_path = repo.join(".git/hooks/pre-push");
+        fs::write(
+            &hook_path,
+            format!(
+                "#!/bin/sh\nprintf 'git-push\\n' >> \"{}\"\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook_path, permissions).unwrap();
+        let script = protected_update_gh_script(
+            &log_path,
+            &stale_open_prs_path,
+            &updated_open_prs_path,
+            &body_json_path,
+            &base_updated_path,
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "update",
+        ])
+        .unwrap();
+
+        run_cli(cli, OutputFormat::Human).unwrap();
+
+        let events = fs::read_to_string(log_path).unwrap();
+        let event_lines = events.lines().collect::<Vec<_>>();
+        let draft_idx = event_lines
+            .iter()
+            .position(|line| line.contains("convertPullRequestToDraft"))
+            .unwrap();
+        let push_idx = event_lines
+            .iter()
+            .position(|line| *line == "git-push")
+            .unwrap();
+        let base_idx = event_lines
+            .iter()
+            .position(|line| line.contains("updatePullRequest") && line.contains("baseRefName"))
+            .unwrap();
+        let ready_idx = event_lines
+            .iter()
+            .position(|line| line.contains("markPullRequestReadyForReview"))
+            .unwrap();
+        assert!(draft_idx < push_idx, "{events}");
+        assert!(push_idx < base_idx, "{events}");
+        assert!(base_idx < ready_idx, "{events}");
     }
 
     #[test]

@@ -767,6 +767,122 @@ fn fetch_pr_bodies_graphql_chunk(numbers: &[u64]) -> Result<HashMap<u64, PrBodyI
     Ok(out)
 }
 
+/// Existing pull request state needed while temporarily protecting reorder publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrStageInfo {
+    pub id: String,
+    pub is_draft: bool,
+}
+
+/// Fetch the mutation identity plus current ready-vs-draft stage for existing pull requests.
+pub fn fetch_pr_stage_info_graphql(numbers: &[u64]) -> Result<HashMap<u64, PrStageInfo>> {
+    if numbers.is_empty() {
+        Ok(HashMap::new())
+    } else {
+        let (owner, name) = get_repo_owner_name()?;
+        let mut q = String::from(
+            "query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ",
+        );
+        for (i, n) in numbers.iter().enumerate() {
+            q.push_str(&format!(
+                "pr{}: pullRequest(number: {}) {{ id isDraft }} ",
+                i, n
+            ));
+        }
+        q.push_str("} }");
+        let json = gh_ro(
+            [
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={}", q),
+                "-F",
+                &format!("owner={}", owner),
+                "-F",
+                &format!("name={}", name),
+            ]
+            .as_slice(),
+        )?;
+        let v: serde_json::Value = serde_json::from_str(&json)?;
+        let repo = &v["data"]["repository"];
+        let mut out = HashMap::new();
+        for (i, number) in numbers.iter().enumerate() {
+            let key = format!("pr{}", i);
+            let node = &repo[&key];
+            if node.is_null() {
+                bail!(
+                    "GitHub PR #{} was not found while reading draft stage",
+                    number
+                );
+            }
+            let id = node["id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("GitHub PR #{} result missing GraphQL id", number))?;
+            let is_draft = node["isDraft"]
+                .as_bool()
+                .ok_or_else(|| anyhow!("GitHub PR #{} result missing isDraft", number))?;
+            out.insert(
+                *number,
+                PrStageInfo {
+                    id: id.to_string(),
+                    is_draft,
+                },
+            );
+        }
+        Ok(out)
+    }
+}
+
+const MAX_PR_STAGE_MUTATIONS_PER_REQUEST: usize = 50;
+
+fn mutate_pull_request_stage(
+    mutation_name: &str,
+    pull_request_ids: &[String],
+    execution_mode: ExecutionMode,
+) -> Result<()> {
+    for chunk in pull_request_ids.chunks(MAX_PR_STAGE_MUTATIONS_PER_REQUEST) {
+        let mut mutation = String::from("mutation {");
+        for (i, pull_request_id) in chunk.iter().enumerate() {
+            mutation.push_str(&format!(
+                "m{}: {}(input:{{pullRequestId:\"{}\"}}){{ clientMutationId }} ",
+                i,
+                mutation_name,
+                graphql_escape(pull_request_id)
+            ));
+        }
+        mutation.push('}');
+        gh_rw(
+            execution_mode,
+            ["api", "graphql", "-f", &format!("query={}", mutation)].as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Temporarily draft existing pull requests before a protected reorder publication.
+pub fn convert_pull_requests_to_draft(
+    pull_request_ids: &[String],
+    execution_mode: ExecutionMode,
+) -> Result<()> {
+    mutate_pull_request_stage(
+        "convertPullRequestToDraft",
+        pull_request_ids,
+        execution_mode,
+    )
+}
+
+/// Restore existing pull requests to ready-for-review after a protected reorder publication.
+pub fn mark_pull_requests_ready_for_review(
+    pull_request_ids: &[String],
+    execution_mode: ExecutionMode,
+) -> Result<()> {
+    mutate_pull_request_stage(
+        "markPullRequestReadyForReview",
+        pull_request_ids,
+        execution_mode,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PrCiState {
