@@ -39,4 +39,7 @@ pub use rewrite_resume::{
     resume_context, resume_rewrite, RewriteCommandKind, RewriteCommandOutcome,
     RewriteDestinationKind, RewriteSuspendedState,
 };
-pub use update::{build_from_groups, build_from_groups_with_summary};
+pub use update::{
+    build_from_groups_with_summary, build_from_groups_with_summary_with_validation,
+    build_from_groups_with_validation, UpdatePushValidation,
+};

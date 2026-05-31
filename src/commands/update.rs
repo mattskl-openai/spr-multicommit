@@ -28,9 +28,23 @@ use crate::update_output::{
     SkippedUpdateGroupData, UpdateEditAction, UpdateExecutionData, UpdateGroupData, UpdatePrAction,
     UpdatePushAction, UpdateSkippedReason,
 };
+use crate::validation::ValidationDescriptor;
 
 #[cfg(test)]
 use crate::parsing::{derive_groups_between_with_ignored, split_groups_for_update};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatePushValidation {
+    Legacy,
+    Required(Vec<ValidationDescriptor>),
+    Skip,
+}
+
+impl UpdatePushValidation {
+    fn skips_push_hooks(&self) -> bool {
+        matches!(self, Self::Required(_) | Self::Skip)
+    }
+}
 
 /// Replace the existing spr stack block with `new_block`, or append it if missing.
 ///
@@ -569,6 +583,7 @@ fn build_from_groups_internal(
     allow_branch_reuse: bool,
     branch_reuse_guard_days: u32,
     local_pr_branch_policy: LocalPrBranchSyncPolicy,
+    push_validation: UpdatePushValidation,
     render_progress: bool,
 ) -> Result<UpdateExecutionData> {
     let dry_run = execution_mode == ExecutionMode::DryRun;
@@ -757,8 +772,42 @@ fn build_from_groups_internal(
             )
         })
         .collect();
+    let force_refspecs: Vec<String> = planned
+        .iter()
+        .filter(|planned_push| planned_push.kind == PushKind::Force)
+        .map(|planned_push| {
+            format!(
+                "{}:refs/heads/{}",
+                planned_push.target_sha, planned_push.branch
+            )
+        })
+        .collect();
+    if (!ff_refspecs.is_empty() || !force_refspecs.is_empty())
+        && execution_mode == ExecutionMode::Apply
+    {
+        match &push_validation {
+            UpdatePushValidation::Legacy => {}
+            UpdatePushValidation::Required(descriptors) => {
+                let receipt_paths = crate::validation::require_matching_receipts(descriptors)?;
+                info!(
+                    "Using {} per-PR validation receipt(s); skipping push-time hooks",
+                    receipt_paths.len()
+                );
+            }
+            UpdatePushValidation::Skip => {
+                warn!(
+                    "Skipping validation receipt enforcement and Git pre-push hooks because --skip-validation was requested"
+                );
+            }
+        }
+    }
+    let push_skips_hooks = push_validation.skips_push_hooks();
     if !ff_refspecs.is_empty() {
-        let mut argv: Vec<String> = vec!["push".into(), "origin".into()];
+        let mut argv: Vec<String> = vec!["push".into()];
+        if push_skips_hooks {
+            argv.push("--no-verify".into());
+        }
+        argv.push("origin".into());
         argv.extend(ff_refspecs.clone());
         let args: Vec<&str> = argv.iter().map(|item| item.as_str()).collect();
         if render_progress {
@@ -778,16 +827,6 @@ fn build_from_groups_internal(
         }
     }
 
-    let force_refspecs: Vec<String> = planned
-        .iter()
-        .filter(|planned_push| planned_push.kind == PushKind::Force)
-        .map(|planned_push| {
-            format!(
-                "{}:refs/heads/{}",
-                planned_push.target_sha, planned_push.branch
-            )
-        })
-        .collect();
     if !force_refspecs.is_empty() {
         let force_leases: Vec<String> = planned
             .iter()
@@ -801,7 +840,11 @@ fn build_from_groups_internal(
                 })
             })
             .collect();
-        let mut argv: Vec<String> = vec!["push".into(), "origin".into()];
+        let mut argv: Vec<String> = vec!["push".into()];
+        if push_skips_hooks {
+            argv.push("--no-verify".into());
+        }
+        argv.push("origin".into());
         if force_leases.is_empty() {
             argv.push("--force-with-lease".into());
         } else {
@@ -1138,6 +1181,39 @@ pub fn build_from_groups_with_summary(
     branch_reuse_guard_days: u32,
     local_pr_branch_policy: LocalPrBranchSyncPolicy,
 ) -> Result<UpdateExecutionData> {
+    build_from_groups_with_summary_with_validation(
+        base,
+        prefix,
+        skipped_handles,
+        no_pr,
+        execution_mode,
+        pr_description_mode,
+        limit,
+        groups,
+        list_order,
+        allow_branch_reuse,
+        branch_reuse_guard_days,
+        local_pr_branch_policy,
+        UpdatePushValidation::Legacy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_from_groups_with_summary_with_validation(
+    base: &str,
+    prefix: &str,
+    skipped_handles: &[String],
+    no_pr: bool,
+    execution_mode: ExecutionMode,
+    pr_description_mode: PrDescriptionMode,
+    limit: Option<Limit>,
+    groups: Vec<Group>,
+    list_order: ListOrder,
+    allow_branch_reuse: bool,
+    branch_reuse_guard_days: u32,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
+    push_validation: UpdatePushValidation,
+) -> Result<UpdateExecutionData> {
     build_from_groups_internal(
         base,
         prefix,
@@ -1151,11 +1227,13 @@ pub fn build_from_groups_with_summary(
         allow_branch_reuse,
         branch_reuse_guard_days,
         local_pr_branch_policy,
+        push_validation,
         false,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn build_from_groups(
     base: &str,
     prefix: &str,
@@ -1170,6 +1248,39 @@ pub fn build_from_groups(
     branch_reuse_guard_days: u32,
     local_pr_branch_policy: LocalPrBranchSyncPolicy,
 ) -> Result<()> {
+    build_from_groups_with_validation(
+        base,
+        prefix,
+        skipped_handles,
+        no_pr,
+        execution_mode,
+        pr_description_mode,
+        limit,
+        groups,
+        list_order,
+        allow_branch_reuse,
+        branch_reuse_guard_days,
+        local_pr_branch_policy,
+        UpdatePushValidation::Legacy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_from_groups_with_validation(
+    base: &str,
+    prefix: &str,
+    skipped_handles: &[String],
+    no_pr: bool,
+    execution_mode: ExecutionMode,
+    pr_description_mode: PrDescriptionMode,
+    limit: Option<Limit>,
+    groups: Vec<Group>,
+    list_order: ListOrder,
+    allow_branch_reuse: bool,
+    branch_reuse_guard_days: u32,
+    local_pr_branch_policy: LocalPrBranchSyncPolicy,
+    push_validation: UpdatePushValidation,
+) -> Result<()> {
     build_from_groups_internal(
         base,
         prefix,
@@ -1183,6 +1294,7 @@ pub fn build_from_groups(
         allow_branch_reuse,
         branch_reuse_guard_days,
         local_pr_branch_policy,
+        push_validation,
         true,
     )?;
     Ok(())
