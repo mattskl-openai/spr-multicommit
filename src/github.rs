@@ -638,6 +638,25 @@ fn terminal_info_from_head_search(
     })
 }
 
+fn select_latest_terminal_pr_match(
+    requested_head: &str,
+    prs: &[HeadSearchPr],
+) -> Result<Option<TerminalPrInfo>> {
+    let mut latest: Option<(OffsetDateTime, TerminalPrInfo)> = None;
+    for pr in filter_head_search_matches(requested_head, prs) {
+        let info = terminal_info_from_head_search(&pr, requested_head)?;
+        let terminal_at = parse_github_datetime_rfc3339(&info.terminal_at, requested_head)?;
+        if latest
+            .as_ref()
+            .map(|(current, _)| terminal_at > *current)
+            .unwrap_or(true)
+        {
+            latest = Some((terminal_at, info));
+        }
+    }
+    Ok(latest.map(|(_, info)| info))
+}
+
 #[derive(Clone)]
 pub struct PrBodyInfo {
     pub id: String,
@@ -1086,10 +1105,12 @@ fn parse_github_datetime_rfc3339(s: &str, context: &str) -> Result<OffsetDateTim
 /// `pullRequests(headRefName: ...)` lookup. It intentionally leans on GitHub's case-insensitive
 /// `head:` search semantics rather than the exact, case-sensitive `headRefName` filter so the
 /// branch-reuse guard can ask "is there any recent terminal PR on this case-insensitive head
-/// identity?" without enumerating full history. Callers should still compare the returned
-/// timestamp precisely because GitHub's `closed:` qualifier is date-based, not full RFC3339. The
-/// returned `terminal_at` remains state-specific: `mergedAt` for merged PRs and `closedAt` for
-/// manually closed PRs.
+/// identity?" without enumerating full history. GitHub search can also return prefix matches, so
+/// the fast batched query falls back to exhaustive search when its first hit does not match the
+/// complete case-folded head. Callers should still compare the returned timestamp precisely
+/// because GitHub's `closed:` qualifier is date-based, not full RFC3339. The returned
+/// `terminal_at` remains state-specific: `mergedAt` for merged PRs and `closedAt` for manually
+/// closed PRs.
 pub fn list_recent_terminal_prs_for_heads(
     heads: &[String],
     closed_since: OffsetDateTime,
@@ -1136,14 +1157,25 @@ fn list_recent_terminal_prs_for_heads_chunk(
     let data = &value["data"];
     for (i, requested_head) in heads.iter().enumerate() {
         let key = format!("pr{}", i);
-        let pr = data[&key]["nodes"]
+        let prs = data[&key]["nodes"]
             .as_array()
-            .and_then(|nodes| nodes.first())
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?;
-        if let Some(pr) = pr {
-            out.push(terminal_info_from_head_search(&pr, requested_head)?);
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .collect::<std::result::Result<Vec<HeadSearchPr>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(pr) = select_latest_terminal_pr_match(requested_head, &prs)? {
+            out.push(pr);
+        } else if !prs.is_empty() {
+            let search_query = recent_terminal_search_query(&repo, requested_head, closed_since);
+            let exhaustive_prs = list_prs_for_search_query_exhaustive(&search_query, "all")?;
+            if let Some(pr) = select_latest_terminal_pr_match(requested_head, &exhaustive_prs)? {
+                out.push(pr);
+            }
         }
     }
 
@@ -2126,19 +2158,19 @@ mod tests {
     }
 
     #[test]
-    fn list_recent_terminal_prs_for_heads_queries_recent_closed_search() {
+    fn list_recent_terminal_prs_for_heads_filters_prefix_matches() {
         let _lock = lock_cwd();
         let search_json = graphql_search_response(&[
             (
                 "pr0",
                 json!([
                     {
-                        "number": 11,
-                        "headRefName": "skilltest/alpha",
-                        "state": "MERGED",
-                        "mergedAt": "2026-02-01T00:00:00Z",
-                        "closedAt": "2026-02-01T00:00:01Z",
-                        "url": "https://github.com/o/r/pull/11"
+                        "number": 33,
+                        "headRefName": "skilltest/alphaSuffix",
+                        "state": "CLOSED",
+                        "mergedAt": null,
+                        "closedAt": "2026-02-20T00:00:00Z",
+                        "url": "https://github.com/o/r/pull/33"
                     }
                 ]),
             ),
@@ -2156,14 +2188,36 @@ mod tests {
                 ]),
             ),
         ]);
+        let exhaustive_json = serde_json::to_string(&json!([
+            {
+                "number": 33,
+                "headRefName": "skilltest/alphaSuffix",
+                "state": "CLOSED",
+                "mergedAt": null,
+                "closedAt": "2026-02-20T00:00:00Z",
+                "url": "https://github.com/o/r/pull/33"
+            },
+            {
+                "number": 11,
+                "headRefName": "skilltest/alpha",
+                "state": "MERGED",
+                "mergedAt": "2026-02-01T00:00:00Z",
+                "closedAt": "2026-02-01T00:00:01Z",
+                "url": "https://github.com/o/r/pull/11"
+            }
+        ]))
+        .unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let log_path = data_dir.path().join("gh.log");
         let response_path = data_dir.path().join("search.json");
+        let exhaustive_path = data_dir.path().join("exhaustive.json");
         fs::write(&response_path, search_json).unwrap();
+        fs::write(&exhaustive_path, exhaustive_json).unwrap();
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  cat \"{}\"\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  cat \"{}\"\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  cat \"{}\"\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
             response_path.display(),
+            exhaustive_path.display(),
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
         let closed_since = time::OffsetDateTime::parse(
@@ -2188,11 +2242,14 @@ mod tests {
 
         let log = fs::read_to_string(log_path).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("api graphql"));
         assert!(lines[0]
             .contains("is:pr is:closed head:skilltest/alpha closed:>=2026-02-01 sort:closed-desc"));
         assert!(lines[0]
             .contains("is:pr is:closed head:skilltest/beta closed:>=2026-02-01 sort:closed-desc"));
+        assert!(lines[1].contains("pr list --state all"));
+        assert!(lines[1]
+            .contains("is:pr is:closed head:skilltest/alpha closed:>=2026-02-01 sort:closed-desc"));
     }
 }
