@@ -88,6 +88,15 @@ pub struct TerminalPrInfo {
 
 const HEAD_SEARCH_LIMIT: usize = 100;
 const OPEN_CONFLICT_SEARCH_LIMIT: usize = 2;
+// GitHub documents a 500,000-node validation cap and additional undisclosed resource limits for
+// GraphQL queries. These are conservative operational starting points, not GitHub guarantees.
+// Keep the nested status query modest, and rely on run_read_chunk_with_retry to bisect any batch
+// that still triggers RESOURCE_LIMITS_EXCEEDED.
+const MAX_EXACT_HEADS_PER_QUERY: usize = 20;
+const MAX_CONFLICT_HEADS_PER_QUERY: usize = 10;
+const MAX_TERMINAL_HEADS_PER_QUERY: usize = 10;
+const MAX_PR_BODIES_PER_QUERY: usize = 10;
+const MAX_PR_STATUS_PER_QUERY: usize = 20;
 const HEAD_SEARCH_FIELDS: &str =
     "number,headRefName,baseRefName,state,mergedAt,closedAt,url,autoMergeRequest";
 const EXACT_HEAD_QUERY_LIMIT: usize = 10;
@@ -116,6 +125,33 @@ struct HeadSearchPr {
 
 fn head_key(head: &str) -> CanonicalBranchConflictKey {
     canonical_branch_conflict_key(head)
+}
+
+fn is_resource_limit_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("RESOURCE_LIMITS_EXCEEDED")
+        || msg.contains("Resource limits for this query exceeded")
+}
+
+fn run_read_chunk_with_retry<T, R, F, M>(items: &[T], run: &F, merge: &M) -> Result<R>
+where
+    F: Fn(&[T]) -> Result<R>,
+    M: Fn(R, R) -> R,
+{
+    match run(items) {
+        Ok(result) => Ok(result),
+        Err(err) if is_resource_limit_error(&err) && items.len() > 1 => {
+            info!(
+                "Resource limits for this query exceeded; retrying read with smaller chunks ({} item(s))",
+                items.len()
+            );
+            let mid = items.len() / 2;
+            let left = run_read_chunk_with_retry(&items[..mid], run, merge)?;
+            let right = run_read_chunk_with_retry(&items[mid..], run, merge)?;
+            Ok(merge(left, right))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn head_search_query(head: &str) -> String {
@@ -176,6 +212,26 @@ fn list_prs_for_search_query(query: &str, state: &str, limit: usize) -> Result<V
 /// Case-variant remote heads are intentionally not discovered by this helper; conflict detection
 /// stays in the separate search-based helpers below.
 fn list_exact_prs_for_heads(
+    heads: &[String],
+    states: &[&str],
+    limit: usize,
+) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
+    let mut out = HashMap::new();
+    for chunk in heads.chunks(MAX_EXACT_HEADS_PER_QUERY) {
+        let chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &|subset| list_exact_prs_for_heads_chunk(subset, states, limit),
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
+fn list_exact_prs_for_heads_chunk(
     heads: &[String],
     states: &[&str],
     limit: usize,
@@ -260,6 +316,24 @@ fn list_prs_for_search_query_exhaustive(query: &str, state: &str) -> Result<Vec<
 /// locally because exact-head multiplicity is already handled by the structured GraphQL lookup;
 /// this helper only answers whether any additional case-insensitive open hit exists.
 fn list_open_conflicting_prs_for_heads_search(
+    heads: &[String],
+) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
+    let mut out = HashMap::new();
+    for chunk in heads.chunks(MAX_CONFLICT_HEADS_PER_QUERY) {
+        let chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &list_open_conflicting_prs_for_heads_search_chunk,
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
+fn list_open_conflicting_prs_for_heads_search_chunk(
     heads: &[String],
 ) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
     let mut matches_by_head: HashMap<String, Vec<HeadSearchPr>> = heads
@@ -572,6 +646,22 @@ pub struct PrBodyInfo {
 
 pub fn fetch_pr_bodies_graphql(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInfo>> {
     let mut out = HashMap::new();
+    for chunk in numbers.chunks(MAX_PR_BODIES_PER_QUERY) {
+        let chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &fetch_pr_bodies_graphql_chunk,
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
+fn fetch_pr_bodies_graphql_chunk(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInfo>> {
+    let mut out = HashMap::new();
     if numbers.is_empty() {
         return Ok(out);
     }
@@ -660,6 +750,22 @@ pub struct PrCiReviewStatus {
 }
 
 pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiReviewStatus>> {
+    let mut out = HashMap::new();
+    for chunk in numbers.chunks(MAX_PR_STATUS_PER_QUERY) {
+        let chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &fetch_pr_ci_review_status_chunk,
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
+fn fetch_pr_ci_review_status_chunk(numbers: &[u64]) -> Result<HashMap<u64, PrCiReviewStatus>> {
     let mut out = HashMap::new();
     if numbers.is_empty() {
         return Ok(out);
@@ -939,6 +1045,25 @@ pub fn list_recent_terminal_prs_for_heads(
     heads: &[String],
     closed_since: OffsetDateTime,
 ) -> Result<Vec<TerminalPrInfo>> {
+    let mut out = Vec::new();
+    for chunk in heads.chunks(MAX_TERMINAL_HEADS_PER_QUERY) {
+        let mut chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &|subset| list_recent_terminal_prs_for_heads_chunk(subset, closed_since),
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.append(&mut chunk_out);
+    }
+    Ok(out)
+}
+
+fn list_recent_terminal_prs_for_heads_chunk(
+    heads: &[String],
+    closed_since: OffsetDateTime,
+) -> Result<Vec<TerminalPrInfo>> {
     let mut out: Vec<TerminalPrInfo> = Vec::new();
     if heads.is_empty() {
         return Ok(out);
@@ -1197,11 +1322,13 @@ mod tests {
         filter_head_search_matches, list_conflicting_prs_for_heads_search_exhaustive,
         list_exact_prs_for_heads, list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
         list_recent_terminal_prs_for_heads, parse_open_pr_automerge_node, resolve_pr_url_head_ref,
-        select_latest_merged_pr_match, select_single_open_pr_match, HeadSearchPr, PrState,
-        TerminalPrState, EXACT_HEAD_QUERY_LIMIT,
+        run_read_chunk_with_retry, select_latest_merged_pr_match, select_single_open_pr_match,
+        HeadSearchPr, PrState, TerminalPrState, EXACT_HEAD_QUERY_LIMIT,
     };
     use crate::test_support::lock_cwd;
+    use anyhow::anyhow;
     use serde_json::{json, Value};
+    use std::cell::Cell;
     use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1247,6 +1374,28 @@ mod tests {
             url: Some(format!("https://github.com/o/r/pull/{number}")),
             auto_merge_request: None,
         }
+    }
+
+    #[test]
+    fn read_chunk_retry_splits_resource_limit_failures_and_merges_results() {
+        let calls = Cell::new(0);
+        let run = |items: &[u64]| {
+            calls.set(calls.get() + 1);
+            if items.len() > 1 {
+                Err(anyhow!("RESOURCE_LIMITS_EXCEEDED"))
+            } else {
+                Ok(items.to_vec())
+            }
+        };
+        let merge = |mut left: Vec<u64>, right: Vec<u64>| {
+            left.extend(right);
+            left
+        };
+
+        let result = run_read_chunk_with_retry(&[1, 2, 3, 4], &run, &merge).unwrap();
+
+        assert_eq!(result, vec![1, 2, 3, 4]);
+        assert_eq!(calls.get(), 7);
     }
 
     fn install_gh_wrapper(script_body: &str) -> (TempDir, EnvVarGuard) {

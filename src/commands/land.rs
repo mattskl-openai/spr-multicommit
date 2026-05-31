@@ -46,6 +46,52 @@ fn resolve_landed_pr_segment<'a>(
     Ok((take_n, segment))
 }
 
+// Each older PR adds two mutative aliases: one comment and one close. GitHub does not publish a
+// safe alias count for this shape, so keep each write request deliberately small.
+const MAX_CLOSE_COMMENT_PRS_PER_MUTATION: usize = 3;
+
+fn build_land_merge_mutation(nth_id: &str, base: &str, mode: LandCmd) -> String {
+    let merge_method = match mode {
+        LandCmd::PerPr => "REBASE",
+        LandCmd::Flatten => "SQUASH",
+    };
+    format!(
+        "mutation {{b0: updatePullRequest(input:{{pullRequestId:\"{}\", baseRefName:\"{}\"}}){{ clientMutationId }} m0: mergePullRequest(input:{{pullRequestId:\"{}\", mergeMethod:{}}}){{ clientMutationId }} }}",
+        nth_id,
+        graphql_escape(&sanitize_gh_base_ref(base)),
+        nth_id,
+        merge_method,
+    )
+}
+
+fn build_close_comment_mutation(
+    prs: &[&crate::github::PrInfo],
+    ids_by_number: &HashMap<u64, String>,
+    merged_pr_number: u64,
+) -> Option<String> {
+    let mut mutation = String::from("mutation {");
+    let mut has_operations = false;
+    for (i, pr) in prs.iter().enumerate() {
+        let Some(id) = ids_by_number.get(&pr.number).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        has_operations = true;
+        let comment = format!("Merged as part of PR #{}", merged_pr_number);
+        mutation.push_str(&format!(
+            "c{}: addComment(input:{{subjectId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ",
+            i,
+            id,
+            graphql_escape(&comment)
+        ));
+        mutation.push_str(&format!(
+            "x{}: closePullRequest(input:{{pullRequestId:\"{}\"}}){{ clientMutationId }} ",
+            i, id
+        ));
+    }
+    mutation.push('}');
+    has_operations.then_some(mutation)
+}
+
 pub fn land_until(
     base: &str,
     prefix: &str,
@@ -169,7 +215,7 @@ pub fn land_until(
         }
     }
 
-    // Batch: set base of Nth PR, merge it (rebase or squash), and close others with a comment via GraphQL
+    // Set base of Nth PR, merge it (rebase or squash), then close older PRs in bounded chunks.
     let nth = segment[take_n - 1];
     let mut nums: Vec<u64> = vec![nth.number];
     for pr in &segment[..take_n - 1] {
@@ -184,58 +230,30 @@ pub fn land_until(
         bail!("Failed to fetch GraphQL id for PR #{}", nth.number);
     }
 
-    let mut m = String::from("mutation {");
-    // Ensure base for nth
-    m.push_str(&format!(
-        "b0: updatePullRequest(input:{{pullRequestId:\"{}\", baseRefName:\"{}\"}}){{ clientMutationId }} ",
-        nth_id,
-        graphql_escape(&sanitize_gh_base_ref(base))
-    ));
-    if let LandCmd::PerPr = mode {
-        // Merge nth with REBASE
-        m.push_str(&format!(
-            "m0: mergePullRequest(input:{{pullRequestId:\"{}\", mergeMethod:REBASE}}){{ clientMutationId }} ",
-            nth_id
-        ));
-    } else {
-        // Merge nth with SQUASH
-        m.push_str(&format!(
-            "m0: mergePullRequest(input:{{pullRequestId:\"{}\", mergeMethod:SQUASH}}){{ clientMutationId }} ",
-            nth_id
-        ));
-    }
-    // Close others with a comment
-    for (i, pr) in segment[..take_n - 1].iter().enumerate() {
-        let id = bodies
-            .get(&pr.number)
-            .map(|x| x.id.clone())
-            .unwrap_or_default();
-        if id.is_empty() {
-            continue;
-        }
-        let idx = i + 1;
-        let comment = format!("Merged as part of PR #{}", nth.number);
-        m.push_str(&format!(
-            "c{}: addComment(input:{{subjectId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ",
-            idx,
-            id,
-            graphql_escape(&comment)
-        ));
-        m.push_str(&format!(
-            "x{}: closePullRequest(input:{{pullRequestId:\"{}\"}}){{ clientMutationId }} ",
-            idx, id
-        ));
-    }
-    m.push('}');
+    let ids_by_number: HashMap<u64, String> = bodies
+        .iter()
+        .map(|(number, info)| (*number, info.id.clone()))
+        .collect();
     tracing::info!(
         "Merging PR #{} and closing {} other PR(s) on GitHub... this might take a few seconds.",
         nth.number,
         take_n - 1
     );
+    let merge_mutation = build_land_merge_mutation(&nth_id, base, mode);
     gh_rw(
         execution_mode,
-        ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
+        ["api", "graphql", "-f", &format!("query={}", merge_mutation)].as_slice(),
     )?;
+    for chunk in segment[..take_n - 1].chunks(MAX_CLOSE_COMMENT_PRS_PER_MUTATION) {
+        if let Some(close_mutation) =
+            build_close_comment_mutation(chunk, &ids_by_number, nth.number)
+        {
+            gh_rw(
+                execution_mode,
+                ["api", "graphql", "-f", &format!("query={}", close_mutation)].as_slice(),
+            )?;
+        }
+    }
 
     Ok(take_n)
 }
@@ -283,7 +301,10 @@ pub fn land_flatten_until(
 
 #[cfg(test)]
 mod tests {
-    use super::{land_until, resolve_land_take_count, resolve_landed_pr_segment};
+    use super::{
+        build_close_comment_mutation, build_land_merge_mutation, land_until,
+        resolve_land_take_count, resolve_landed_pr_segment,
+    };
     use crate::cli::LandCmd;
     use crate::execution::ExecutionMode;
     use crate::github::PrInfo;
@@ -397,5 +418,39 @@ mod tests {
                 .contains("pr:alpha and pr:Alpha derive conflicting branch names"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn land_merge_mutation_only_updates_and_merges_target_pr() {
+        let mutation = build_land_merge_mutation("PR_target", "origin/main", LandCmd::Flatten);
+
+        assert!(mutation.contains("updatePullRequest"));
+        assert!(mutation.contains("mergePullRequest"));
+        assert!(!mutation.contains("closePullRequest"));
+        assert!(!mutation.contains("addComment"));
+        assert!(mutation.contains("baseRefName:\"main\""));
+        assert!(mutation.contains("mergeMethod:SQUASH"));
+    }
+
+    #[test]
+    fn close_comment_mutation_only_closes_supplied_prs() {
+        let prs = [pr(1, "skilltest/alpha"), pr(2, "skilltest/beta")];
+        let ids = HashMap::from([(1, "PR_alpha".to_string()), (2, "PR_beta".to_string())]);
+
+        let mutation = build_close_comment_mutation(&[&prs[0]], &ids, 3).unwrap();
+
+        assert!(mutation.contains("PR_alpha"));
+        assert!(!mutation.contains("PR_beta"));
+        assert!(mutation.contains("Merged as part of PR #3"));
+        assert!(mutation.contains("addComment"));
+        assert!(mutation.contains("closePullRequest"));
+    }
+
+    #[test]
+    fn close_comment_mutation_skips_missing_and_empty_ids() {
+        let prs = [pr(1, "skilltest/alpha"), pr(2, "skilltest/beta")];
+        let ids = HashMap::from([(1, String::new())]);
+
+        assert!(build_close_comment_mutation(&[&prs[0], &prs[1]], &ids, 3).is_none());
     }
 }
