@@ -110,6 +110,10 @@ pub enum Cmd {
         #[arg(long)]
         allow_branch_reuse: bool,
 
+        /// Skip receipt enforcement and Git pre-push hooks
+        #[arg(long)]
+        skip_validation: bool,
+
         #[command(flatten)]
         dry_run: DryRunArgs,
 
@@ -117,6 +121,10 @@ pub enum Cmd {
         #[command(subcommand)]
         extent: Option<Extent>,
     },
+
+    /// Run configured pre-push hooks at every publishable PR boundary and record a receipt
+    #[command(alias = "v")]
+    Validate,
 
     /// Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base
     #[command(
@@ -361,6 +369,32 @@ mod tests {
         assert!(err
             .to_string()
             .contains("unrecognized subcommand 'commits'"));
+    }
+
+    #[test]
+    fn validate_command_parses() {
+        let cli = Cli::try_parse_from(["spr", "validate"]).unwrap();
+
+        assert!(matches!(cli.cmd, Cmd::Validate));
+    }
+
+    #[test]
+    fn validate_alias_parses() {
+        let cli = Cli::try_parse_from(["spr", "v"]).unwrap();
+
+        assert!(matches!(cli.cmd, Cmd::Validate));
+    }
+
+    #[test]
+    fn update_skip_validation_flag_parses() {
+        let cli = Cli::try_parse_from(["spr", "update", "--skip-validation"]).unwrap();
+
+        match cli.cmd {
+            Cmd::Update {
+                skip_validation, ..
+            } => assert!(skip_validation),
+            other => panic!("unexpected command: {:?}", other),
+        }
     }
 
     #[test]

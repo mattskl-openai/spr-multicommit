@@ -138,13 +138,19 @@ dirty_worktree: halt
 # case-only variants, had a recently merged or closed PR within the configured
 # window. Set to 0 to disable the guard.
 branch_reuse_guard_days: 180
+
+# How `spr update` handles pre-push validation.
+# - `legacy` (default): preserve Git's normal batched pre-push hook execution
+# - `required`: require matching `spr validate` receipts, then push with
+#   `--no-verify` to avoid rerunning hooks
+update_validation: legacy
 ```
 
 Precedence for defaults:
 
 - CLI flag > repo YAML > home YAML > git discovery (`origin/HEAD`)
 - Base has no built-in fallback; if discovery fails, set `base` explicitly
-- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `list_order = recent_on_bottom`, `local_pr_branches = off`, `restack_conflict = halt`, `dirty_worktree = halt`
+- Built-in defaults still apply for non-base keys: `prefix = "${USER}-spr/"`, `land = flatten`, `ignore_tag = "ignore"`, `pr_description_mode = overwrite`, `list_order = recent_on_bottom`, `local_pr_branches = off`, `restack_conflict = halt`, `dirty_worktree = halt`, `update_validation = legacy`
 
 Global flags
 ------------
@@ -153,7 +159,7 @@ Global flags
 - `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
 - `--local-pr-branches <off|update-existing|create-or-update>`: override local per-PR branch synchronization for this run
-- `--until <N|0|name|pr:<label>|branch:<branch-name>>`: target range used by `prep` and `land` (`0` means all)
+- `--until <N|0|name|pr:<label>|branch:<branch-name>>`: target range used by `validate`, `prep`, and `land` (`0` means all)
 - `--exact <I|name|pr:<label>|branch:<branch-name>>`: used by `prep` to select exactly one PR group
 - `--verbose`: enable verbose logging of underlying git/gh commands
 
@@ -180,6 +186,7 @@ Key options:
 - `--no-pr`: only (re)create branches; skip PR creation/updates; this path stays Git-only in `--json` mode
 - `--pr-description-mode <overwrite|stack_only>`: override `pr_description_mode` for this update run
 - `--allow-branch-reuse`: bypass the recent closed-or-merged branch-name reuse guard
+- `--skip-validation`: bypass receipt enforcement and push with `--no-verify`, intentionally skipping Git pre-push hooks
 - `--json`: write exactly one update summary object to stdout
 - Extent (optional subcommand):
   - `pr --to <N|name|pr:<label>|branch:<branch-name>>`: canonical selector for limiting updates to the first N PRs from the bottom
@@ -203,6 +210,40 @@ Behavior:
   - When `pr_description_mode` is `stack_only`, only the stack block (between markers) is updated; the rest of the body is preserved
   - After publishing branch heads, reconciles each PR base directly to the local stack chain
 - When `local_pr_branches` is enabled, synchronizes local branches named exactly like each group's resolved concrete branch after the update succeeds. `update-existing` only moves existing local branches; `create-or-update` also creates missing ones.
+- In the default `update_validation: legacy` mode, retains Git's normal batched pre-push behavior. A pre-commit-managed hook may select only one cumulative ref from each push batch.
+- In `update_validation: required` mode, requires matching successful `spr validate` receipts for every selected PR boundary before changing remote branches, then pushes with `--no-verify`.
+- `--skip-validation` bypasses both receipt enforcement and Git pre-push hooks.
+
+### spr validate
+
+Run configured Git pre-push hooks at every selected publishable PR boundary and record reusable
+local receipts for the exact PR-local ranges.
+
+Aliases:
+
+- `v`
+
+Behavior:
+
+- Validates the full publishable prefix by default after applying the same ignored-block rule as `spr update`.
+- Honors global `--until <N|0|name|pr:<label>|branch:<branch-name>>` to validate only the lower prefix through one PR boundary.
+- Reuses one detached temporary worktree and checks out the final commit in each PR group, bottom → top.
+- Runs the configured `pre-push` hook with a synthetic PR-local range: merge-base → PR 1 tip, then previous PR tip → current PR tip.
+- Reuses matching receipts for unchanged PR-local ranges and runs hooks only for missing or stale boundaries. Extending a validated stack by one PR validates only the new boundary.
+- Stops at the first hook failure and leaves the temporary worktree in place for inspection.
+- Keeps receipts already recorded for successful lower boundaries when a later boundary fails, so retries resume incrementally.
+- Refuses to issue a receipt when a successful hook rewrites tracked files.
+- Records receipts under the repository common Git directory at `.git/spr/validation_receipts_v2/`.
+- Succeeds with a receipt when no pre-push hook is installed.
+- `--json` writes validated, recorded, and reused counts; ordered per-boundary receipt details; hook state; and success status.
+
+Incremental workflow:
+
+```bash
+spr v --until 9
+spr u pr --to 9
+spr v --until 10  # reuses boundaries 1..=9 and validates only boundary 10
+```
 
 ### spr restack
 

@@ -28,6 +28,7 @@ pub enum JsonCommand {
     Status,
     SyncLocalBranches,
     Update,
+    Validate,
     Prep,
     RelinkPrs,
     Cleanup,
@@ -325,6 +326,8 @@ pub fn command_for_raw_args(args: &[OsString]) -> JsonCommand {
                 return JsonCommand::SyncLocalBranches;
             } else if arg == "update" || arg == "u" {
                 return JsonCommand::Update;
+            } else if arg == "validate" || arg == "v" {
+                return JsonCommand::Validate;
             } else if arg == "prep" {
                 return JsonCommand::Prep;
             } else if arg == "relink-prs" {

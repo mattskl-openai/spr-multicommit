@@ -419,6 +419,8 @@ pub fn prep_squash(
             no_pr: false,
             pr_description_mode,
             local_pr_branches: local_pr_branch_policy,
+            update_validation: crate::config::UpdateValidationPolicy::Legacy,
+            skip_validation: false,
         },
         resolved_extent,
         update_execution,
