@@ -84,6 +84,27 @@ fn resolve_land_plan<'a>(
     Ok((take_n, LandPlan::Fresh { segment }))
 }
 
+fn format_land_safety_failures(ci_bad: &[u64], review_bad: &[u64]) -> String {
+    let format_numbers = |numbers: &[u64]| {
+        numbers
+            .iter()
+            .map(|number| format!("#{number}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut failures = Vec::new();
+    if !ci_bad.is_empty() {
+        failures.push(format!("CI not passing: {}", format_numbers(ci_bad)));
+    }
+    if !review_bad.is_empty() {
+        failures.push(format!(
+            "Reviews not approved: {}",
+            format_numbers(review_bad)
+        ));
+    }
+    failures.join("; ")
+}
+
 // Each older PR adds two mutative aliases: one comment and one close. GitHub does not publish a
 // safe alias count for this shape, so keep each write request deliberately small.
 const MAX_CLOSE_COMMENT_PRS_PER_MUTATION: usize = 3;
@@ -275,34 +296,11 @@ pub fn land_until(
                 }
             }
             if !ci_bad.is_empty() || !rv_bad.is_empty() {
-                let ci_str = if ci_bad.is_empty() {
-                    String::from("none")
-                } else {
-                    ci_bad
-                        .iter()
-                        .map(|x| format!("#{}", x))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let rv_str = if rv_bad.is_empty() {
-                    String::from("none")
-                } else {
-                    rv_bad
-                        .iter()
-                        .map(|x| format!("#{}", x))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
+                let failures = format_land_safety_failures(&ci_bad, &rv_bad);
                 if bypass_safety {
-                    warn!(
-                        "Bypassing safety checks (--unsafe). CI not passing: {}; Reviews not approved: {}",
-                        ci_str, rv_str
-                    );
+                    warn!("Bypassing safety checks (--unsafe). {}", failures);
                 } else {
-                    bail!(
-                        "Refusing to land: CI not passing: {}; Reviews not approved: {}. Use --unsafe to override.",
-                        ci_str, rv_str
-                    );
+                    bail!("Refusing to land: {}. Use --unsafe to override.", failures);
                 }
             }
         }
@@ -440,8 +438,9 @@ pub fn land_flatten_until(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_close_comment_mutation, build_land_merge_mutation, land_until, resolve_land_plan,
-        resolve_land_take_count, run_land_mutations, LandMutationPlan, LandPlan,
+        build_close_comment_mutation, build_land_merge_mutation, format_land_safety_failures,
+        land_until, resolve_land_plan, resolve_land_take_count, run_land_mutations,
+        LandMutationPlan, LandPlan,
     };
     use crate::branch_names::canonical_branch_conflict_key;
     use crate::cli::LandCmd;
@@ -707,5 +706,21 @@ mod tests {
         assert!(!retry_calls[0].contains("mergePullRequest"));
         assert!(!retry_calls[0].contains("addComment"));
         assert!(retry_calls[0].contains("closePullRequest"));
+    }
+
+    #[test]
+    fn land_safety_failure_message_only_reports_failed_checks() {
+        assert_eq!(
+            format_land_safety_failures(&[17], &[]),
+            "CI not passing: #17"
+        );
+        assert_eq!(
+            format_land_safety_failures(&[], &[18]),
+            "Reviews not approved: #18"
+        );
+        assert_eq!(
+            format_land_safety_failures(&[17], &[18, 19]),
+            "CI not passing: #17; Reviews not approved: #18, #19"
+        );
     }
 }
