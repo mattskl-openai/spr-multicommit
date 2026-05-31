@@ -122,6 +122,21 @@ fn set_dry_run_env(execution_mode: ExecutionMode, assume_existing_prs: bool) {
     }
 }
 
+fn refresh_metadata_after_update(
+    context: &crate::stack_metadata::RefreshMetadataContext,
+) -> Result<()> {
+    if !crate::stack_metadata::refresh_metadata_for_current_checkout_if_attached(
+        &context.base,
+        &context.prefix,
+        &context.ignore_tag,
+    )? {
+        tracing::warn!(
+            "Skipping stack metadata refresh because HEAD is detached. Rerun `spr update` after completing the active Git operation."
+        );
+    }
+    Ok(())
+}
+
 /// Change to the requested working directory before config discovery or repo-scoped commands.
 fn apply_working_directory_override(path: Option<&Path>) -> Result<()> {
     if let Some(path) = path {
@@ -485,11 +500,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         execution,
                     );
                     if execution_mode == ExecutionMode::Apply {
-                        crate::stack_metadata::refresh_metadata_for_current_checkout(
-                            &metadata_refresh_context.base,
-                            &metadata_refresh_context.prefix,
-                            &metadata_refresh_context.ignore_tag,
-                        )?;
+                        refresh_metadata_after_update(&metadata_refresh_context)?;
                     }
                     Ok(CommandOutput::Update(crate::update_output::summary(
                         summary,
@@ -510,11 +521,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         local_pr_branch_policy,
                     )?;
                     if execution_mode == ExecutionMode::Apply {
-                        crate::stack_metadata::refresh_metadata_for_current_checkout(
-                            &metadata_refresh_context.base,
-                            &metadata_refresh_context.prefix,
-                            &metadata_refresh_context.ignore_tag,
-                        )?;
+                        refresh_metadata_after_update(&metadata_refresh_context)?;
                     }
                     Ok(CommandOutput::None)
                 }

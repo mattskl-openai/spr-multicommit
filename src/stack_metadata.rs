@@ -679,6 +679,19 @@ pub fn refresh_metadata_for_current_checkout(
     write_metadata_atomically(&path, &metadata)
 }
 
+pub fn refresh_metadata_for_current_checkout_if_attached(
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+) -> Result<bool> {
+    let repo_path = repo_root()?.ok_or_else(|| anyhow!("`spr` must run inside a git worktree"))?;
+    if current_branch_or_none(&repo_path)?.is_none() {
+        return Ok(false);
+    }
+    refresh_metadata_for_current_checkout(base, prefix, ignore_tag)?;
+    Ok(true)
+}
+
 pub fn refresh_metadata_for_branch(
     repo_path: &str,
     stack_branch: &str,
@@ -816,11 +829,13 @@ pub fn current_branch_or_none(repo_path: &str) -> Result<Option<String>> {
 mod tests {
     use super::{
         acquire_lock, apply_snapshot, load_metadata_from_path, metadata_lock_path,
-        ordered_known_branches, write_metadata_atomically, GroupSelectorText, PrBranchName,
-        PrBranchRecord, StackBranchName, StackId, StackMetadataFile, StackRecord, StackSnapshot,
+        ordered_known_branches, refresh_metadata_for_current_checkout_if_attached,
+        write_metadata_atomically, GroupSelectorText, PrBranchName, PrBranchRecord,
+        StackBranchName, StackId, StackMetadataFile, StackRecord, StackSnapshot,
         StackSnapshotGroup, TombstoneReason, LEGACY_STACK_METADATA_SCHEMA_VERSION,
         STACK_METADATA_SCHEMA_VERSION,
     };
+    use crate::test_support::{git, init_repo, lock_cwd, DirGuard};
     use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
@@ -860,6 +875,20 @@ mod tests {
 
         assert_eq!(known[0], preferred);
         assert_eq!(known.len(), 3);
+    }
+
+    #[test]
+    fn update_metadata_refresh_skips_detached_checkout() {
+        let _lock = lock_cwd();
+        let dir = init_repo();
+        let repo = dir.path();
+        git(repo, ["checkout", "--detach", "HEAD"].as_slice());
+        let _guard = DirGuard::change_to(repo);
+
+        assert!(
+            !refresh_metadata_for_current_checkout_if_attached("main", "dank-spr/", "ignore")
+                .unwrap()
+        );
     }
 
     #[test]
