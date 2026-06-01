@@ -457,7 +457,9 @@ fn try_fast_suffix_rebase(
     let rebase_args = [
         "rebase",
         "--reapply-cherry-picks",
-        "--empty=stop",
+        // Keep the legacy-compatible spelling: Git 2.43 supports `ask`, and
+        // newer Git treats it as the deprecated synonym for `stop`.
+        "--empty=ask",
         "--onto",
         metadata_context.base.as_str(),
         fast_plan.upstream_exclusive.as_str(),
