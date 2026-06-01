@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
 use crate::branch_names::{canonical_branch_conflict_key, group_branch_identities};
@@ -7,8 +7,9 @@ use crate::cli::LandCmd;
 use crate::execution::ExecutionMode;
 use crate::git::{gh_rw, git_ro, git_rw, sanitize_gh_base_ref, to_remote_ref};
 use crate::github::{
-    fetch_pr_bodies_graphql, fetch_pr_ci_review_status, graphql_escape, list_open_prs_for_heads,
-    PrCiState, PrReviewDecision,
+    fetch_pr_bodies_graphql, fetch_pr_ci_review_status, fetch_pr_issue_comment_bodies_graphql,
+    graphql_escape, list_open_or_merged_prs_for_heads, PrCiState, PrInfoWithState,
+    PrReviewDecision, PrState,
 };
 use crate::parsing::derive_local_groups;
 use crate::selectors::{resolve_inclusive_count, InclusiveSelector};
@@ -20,20 +21,57 @@ fn resolve_land_take_count(
     resolve_inclusive_count(groups, until)
 }
 
-fn resolve_landed_pr_segment<'a>(
+#[derive(Debug)]
+enum LandPlan<'a> {
+    Fresh {
+        segment: Vec<&'a PrInfoWithState>,
+    },
+    Recovery {
+        target: &'a PrInfoWithState,
+        open_older_prs: Vec<&'a PrInfoWithState>,
+    },
+}
+
+fn resolve_land_plan<'a>(
     groups: &[crate::parsing::Group],
     branch_identities: &[crate::branch_names::GroupBranchIdentity],
-    prs_by_head: &HashMap<
-        crate::branch_names::CanonicalBranchConflictKey,
-        &'a crate::github::PrInfo,
-    >,
+    prs_by_head: &HashMap<crate::branch_names::CanonicalBranchConflictKey, &'a PrInfoWithState>,
     until: &InclusiveSelector,
-) -> Result<(usize, Vec<&'a crate::github::PrInfo>)> {
+) -> Result<(usize, LandPlan<'a>)> {
     let take_n = resolve_land_take_count(groups, until)?;
-    let mut segment: Vec<&crate::github::PrInfo> = Vec::with_capacity(take_n);
+    let target_identity = &branch_identities[take_n - 1];
+    let target = prs_by_head
+        .get(&target_identity.conflict_key)
+        .copied()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No open PR found for local group '{}' (branch '{}')",
+                groups[take_n - 1].selector_text(),
+                target_identity.exact
+            )
+        })?;
+    if target.state == PrState::Merged {
+        let open_older_prs = branch_identities[..take_n - 1]
+            .iter()
+            .filter_map(|identity| prs_by_head.get(&identity.conflict_key).copied())
+            .filter(|pr| pr.state == PrState::Open)
+            .collect();
+        return Ok((
+            take_n,
+            LandPlan::Recovery {
+                target,
+                open_older_prs,
+            },
+        ));
+    }
+    let mut segment = Vec::with_capacity(take_n);
     for (g, identity) in groups[..take_n].iter().zip(branch_identities.iter()) {
         let head_branch = &identity.exact;
-        if let Some(pr) = prs_by_head.get(&identity.conflict_key).copied() {
+        if let Some(pr) = prs_by_head
+            .get(&identity.conflict_key)
+            .copied()
+            .filter(|pr| pr.state == PrState::Open)
+        {
             segment.push(pr);
         } else {
             bail!(
@@ -43,7 +81,113 @@ fn resolve_landed_pr_segment<'a>(
             );
         }
     }
-    Ok((take_n, segment))
+    Ok((take_n, LandPlan::Fresh { segment }))
+}
+
+fn format_land_safety_failures(ci_bad: &[u64], review_bad: &[u64]) -> String {
+    let format_numbers = |numbers: &[u64]| {
+        numbers
+            .iter()
+            .map(|number| format!("#{number}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut failures = Vec::new();
+    if !ci_bad.is_empty() {
+        failures.push(format!("CI not passing: {}", format_numbers(ci_bad)));
+    }
+    if !review_bad.is_empty() {
+        failures.push(format!(
+            "Reviews not approved: {}",
+            format_numbers(review_bad)
+        ));
+    }
+    failures.join("; ")
+}
+
+// Each older PR adds two mutative aliases: one comment and one close. GitHub does not publish a
+// safe alias count for this shape, so keep each write request deliberately small.
+const MAX_CLOSE_COMMENT_PRS_PER_MUTATION: usize = 3;
+
+fn build_land_merge_mutation(nth_id: &str, base: &str, mode: LandCmd) -> String {
+    let merge_method = match mode {
+        LandCmd::PerPr => "REBASE",
+        LandCmd::Flatten => "SQUASH",
+    };
+    format!(
+        "mutation {{b0: updatePullRequest(input:{{pullRequestId:\"{}\", baseRefName:\"{}\"}}){{ clientMutationId }} m0: mergePullRequest(input:{{pullRequestId:\"{}\", mergeMethod:{}}}){{ clientMutationId }} }}",
+        nth_id,
+        graphql_escape(&sanitize_gh_base_ref(base)),
+        nth_id,
+        merge_method,
+    )
+}
+
+fn cleanup_comment(merged_pr_number: u64) -> String {
+    format!("Merged as part of PR #{merged_pr_number}")
+}
+
+fn build_close_comment_mutation(
+    prs: &[&PrInfoWithState],
+    ids_by_number: &HashMap<u64, String>,
+    merged_pr_number: u64,
+    add_comment_numbers: &HashSet<u64>,
+) -> Option<String> {
+    let mut mutation = String::from("mutation {");
+    let mut has_operations = false;
+    for (i, pr) in prs.iter().enumerate() {
+        let Some(id) = ids_by_number.get(&pr.number).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        has_operations = true;
+        if add_comment_numbers.contains(&pr.number) {
+            mutation.push_str(&format!(
+                "c{}: addComment(input:{{subjectId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ",
+                i,
+                id,
+                graphql_escape(&cleanup_comment(merged_pr_number))
+            ));
+        }
+        mutation.push_str(&format!(
+            "x{}: closePullRequest(input:{{pullRequestId:\"{}\"}}){{ clientMutationId }} ",
+            i, id
+        ));
+    }
+    mutation.push('}');
+    has_operations.then_some(mutation)
+}
+
+struct LandMutationPlan<'a> {
+    base: &'a str,
+    mode: LandCmd,
+    target: &'a PrInfoWithState,
+    target_id: Option<&'a str>,
+    open_older_prs: &'a [&'a PrInfoWithState],
+    ids_by_number: &'a HashMap<u64, String>,
+    add_comment_numbers: &'a HashSet<u64>,
+}
+
+fn run_land_mutations<F>(plan: LandMutationPlan<'_>, mut run: F) -> Result<()>
+where
+    F: FnMut(String) -> Result<()>,
+{
+    if let Some(target_id) = plan.target_id {
+        run(build_land_merge_mutation(target_id, plan.base, plan.mode))?;
+    }
+    for chunk in plan
+        .open_older_prs
+        .chunks(MAX_CLOSE_COMMENT_PRS_PER_MUTATION)
+    {
+        if let Some(mutation) = build_close_comment_mutation(
+            chunk,
+            plan.ids_by_number,
+            plan.target.number,
+            plan.add_comment_numbers,
+        ) {
+            run(mutation)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn land_until(
@@ -66,16 +210,70 @@ pub fn land_until(
         .iter()
         .map(|identity| identity.exact.clone())
         .collect();
-    let prs = list_open_prs_for_heads(&heads)?;
+    let prs = list_open_or_merged_prs_for_heads(&heads)?;
     let prs_by_head: HashMap<_, _> = prs
         .iter()
         .map(|pr| (canonical_branch_conflict_key(&pr.head), pr))
         .collect();
-    if prs.is_empty() {
-        bail!("No open PRs with head starting with `{prefix}`.");
-    }
-    let (_, ordered) = resolve_landed_pr_segment(&groups, &branch_identities, &prs_by_head, until)?;
-    let segment = ordered.as_slice();
+    let (_, plan) = resolve_land_plan(&groups, &branch_identities, &prs_by_head, until)?;
+    let LandPlan::Fresh { segment } = &plan else {
+        let LandPlan::Recovery {
+            target,
+            open_older_prs,
+        } = &plan
+        else {
+            unreachable!()
+        };
+        if open_older_prs.is_empty() {
+            tracing::info!(
+                "PR #{} is already merged and its older PR cleanup is complete.",
+                target.number
+            );
+            return Ok(take_n);
+        }
+        let numbers = open_older_prs
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>();
+        let bodies = fetch_pr_bodies_graphql(&numbers)?;
+        let ids_by_number = bodies
+            .iter()
+            .map(|(number, info)| (*number, info.id.clone()))
+            .collect::<HashMap<_, _>>();
+        let expected_comment = cleanup_comment(target.number);
+        let mut add_comment_numbers = std::collections::HashSet::new();
+        for pr in open_older_prs {
+            let comments = fetch_pr_issue_comment_bodies_graphql(pr.number)?;
+            if !comments.iter().any(|comment| comment == &expected_comment) {
+                add_comment_numbers.insert(pr.number);
+            }
+        }
+        tracing::info!(
+            "PR #{} is already merged; closing {} remaining older PR(s).",
+            target.number,
+            open_older_prs.len()
+        );
+        return run_land_mutations(
+            LandMutationPlan {
+                base,
+                mode,
+                target,
+                target_id: None,
+                open_older_prs,
+                ids_by_number: &ids_by_number,
+                add_comment_numbers: &add_comment_numbers,
+            },
+            |mutation| {
+                gh_rw(
+                    execution_mode,
+                    ["api", "graphql", "-f", &format!("query={mutation}")].as_slice(),
+                )?;
+                Ok(())
+            },
+        )
+        .map(|()| take_n);
+    };
+    let segment = segment.as_slice();
 
     // Safety validation: CI and Reviews must be passing/approved for all PRs being landed
     let numbers: Vec<u64> = segment.iter().map(|p| p.number).collect();
@@ -98,34 +296,11 @@ pub fn land_until(
                 }
             }
             if !ci_bad.is_empty() || !rv_bad.is_empty() {
-                let ci_str = if ci_bad.is_empty() {
-                    String::from("none")
-                } else {
-                    ci_bad
-                        .iter()
-                        .map(|x| format!("#{}", x))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let rv_str = if rv_bad.is_empty() {
-                    String::from("none")
-                } else {
-                    rv_bad
-                        .iter()
-                        .map(|x| format!("#{}", x))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
+                let failures = format_land_safety_failures(&ci_bad, &rv_bad);
                 if bypass_safety {
-                    warn!(
-                        "Bypassing safety checks (--unsafe). CI not passing: {}; Reviews not approved: {}",
-                        ci_str, rv_str
-                    );
+                    warn!("Bypassing safety checks (--unsafe). {}", failures);
                 } else {
-                    bail!(
-                        "Refusing to land: CI not passing: {}; Reviews not approved: {}. Use --unsafe to override.",
-                        ci_str, rv_str
-                    );
+                    bail!("Refusing to land: {}. Use --unsafe to override.", failures);
                 }
             }
         }
@@ -169,7 +344,7 @@ pub fn land_until(
         }
     }
 
-    // Batch: set base of Nth PR, merge it (rebase or squash), and close others with a comment via GraphQL
+    // Set base of Nth PR, merge it (rebase or squash), then close older PRs in bounded chunks.
     let nth = segment[take_n - 1];
     let mut nums: Vec<u64> = vec![nth.number];
     for pr in &segment[..take_n - 1] {
@@ -184,57 +359,36 @@ pub fn land_until(
         bail!("Failed to fetch GraphQL id for PR #{}", nth.number);
     }
 
-    let mut m = String::from("mutation {");
-    // Ensure base for nth
-    m.push_str(&format!(
-        "b0: updatePullRequest(input:{{pullRequestId:\"{}\", baseRefName:\"{}\"}}){{ clientMutationId }} ",
-        nth_id,
-        graphql_escape(&sanitize_gh_base_ref(base))
-    ));
-    if let LandCmd::PerPr = mode {
-        // Merge nth with REBASE
-        m.push_str(&format!(
-            "m0: mergePullRequest(input:{{pullRequestId:\"{}\", mergeMethod:REBASE}}){{ clientMutationId }} ",
-            nth_id
-        ));
-    } else {
-        // Merge nth with SQUASH
-        m.push_str(&format!(
-            "m0: mergePullRequest(input:{{pullRequestId:\"{}\", mergeMethod:SQUASH}}){{ clientMutationId }} ",
-            nth_id
-        ));
-    }
-    // Close others with a comment
-    for (i, pr) in segment[..take_n - 1].iter().enumerate() {
-        let id = bodies
-            .get(&pr.number)
-            .map(|x| x.id.clone())
-            .unwrap_or_default();
-        if id.is_empty() {
-            continue;
-        }
-        let idx = i + 1;
-        let comment = format!("Merged as part of PR #{}", nth.number);
-        m.push_str(&format!(
-            "c{}: addComment(input:{{subjectId:\"{}\", body:\"{}\"}}){{ clientMutationId }} ",
-            idx,
-            id,
-            graphql_escape(&comment)
-        ));
-        m.push_str(&format!(
-            "x{}: closePullRequest(input:{{pullRequestId:\"{}\"}}){{ clientMutationId }} ",
-            idx, id
-        ));
-    }
-    m.push('}');
+    let ids_by_number: HashMap<u64, String> = bodies
+        .iter()
+        .map(|(number, info)| (*number, info.id.clone()))
+        .collect();
     tracing::info!(
         "Merging PR #{} and closing {} other PR(s) on GitHub... this might take a few seconds.",
         nth.number,
         take_n - 1
     );
-    gh_rw(
-        execution_mode,
-        ["api", "graphql", "-f", &format!("query={}", m)].as_slice(),
+    let add_comment_numbers = segment[..take_n - 1]
+        .iter()
+        .map(|pr| pr.number)
+        .collect::<std::collections::HashSet<_>>();
+    run_land_mutations(
+        LandMutationPlan {
+            base,
+            mode,
+            target: nth,
+            target_id: Some(&nth_id),
+            open_older_prs: &segment[..take_n - 1],
+            ids_by_number: &ids_by_number,
+            add_comment_numbers: &add_comment_numbers,
+        },
+        |mutation| {
+            gh_rw(
+                execution_mode,
+                ["api", "graphql", "-f", &format!("query={mutation}")].as_slice(),
+            )?;
+            Ok(())
+        },
     )?;
 
     Ok(take_n)
@@ -283,10 +437,15 @@ pub fn land_flatten_until(
 
 #[cfg(test)]
 mod tests {
-    use super::{land_until, resolve_land_take_count, resolve_landed_pr_segment};
+    use super::{
+        build_close_comment_mutation, build_land_merge_mutation, format_land_safety_failures,
+        land_until, resolve_land_plan, resolve_land_take_count, run_land_mutations,
+        LandMutationPlan, LandPlan,
+    };
+    use crate::branch_names::canonical_branch_conflict_key;
     use crate::cli::LandCmd;
     use crate::execution::ExecutionMode;
-    use crate::github::PrInfo;
+    use crate::github::{PrInfoWithState, PrState};
     use crate::parsing::Group;
     use crate::selectors::{ExplicitGroupSelector, GroupSelector, InclusiveSelector};
     use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
@@ -304,11 +463,20 @@ mod tests {
             .collect()
     }
 
-    fn pr(number: u64, head: &str) -> PrInfo {
-        PrInfo {
+    fn pr(number: u64, head: &str) -> PrInfoWithState {
+        PrInfoWithState {
             number,
             head: head.to_string(),
             base: "main".to_string(),
+            state: PrState::Open,
+            url: format!("https://github.com/o/r/pull/{number}"),
+        }
+    }
+
+    fn merged_pr(number: u64, head: &str) -> PrInfoWithState {
+        PrInfoWithState {
+            state: PrState::Merged,
+            ..pr(number, head)
         }
     }
 
@@ -340,12 +508,15 @@ mod tests {
         let until = InclusiveSelector::Group(GroupSelector::LocalPr(1));
 
         let (take_n, ordered) =
-            resolve_landed_pr_segment(&groups, &branch_identities, &prs_by_head, &until).unwrap();
+            resolve_land_plan(&groups, &branch_identities, &prs_by_head, &until).unwrap();
 
         assert_eq!(take_n, 1);
-        assert_eq!(ordered.len(), 1);
-        assert_eq!(ordered[0].number, 14);
-        assert_eq!(ordered[0].head, "skilltest/rho");
+        let LandPlan::Fresh { segment } = ordered else {
+            panic!("expected fresh land plan");
+        };
+        assert_eq!(segment.len(), 1);
+        assert_eq!(segment[0].number, 14);
+        assert_eq!(segment[0].head, "skilltest/rho");
     }
 
     #[test]
@@ -365,8 +536,7 @@ mod tests {
             .collect();
         let until = InclusiveSelector::Group(GroupSelector::LocalPr(2));
 
-        let err = resolve_landed_pr_segment(&groups, &branch_identities, &prs_by_head, &until)
-            .unwrap_err();
+        let err = resolve_land_plan(&groups, &branch_identities, &prs_by_head, &until).unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -396,6 +566,161 @@ mod tests {
             err.to_string()
                 .contains("pr:alpha and pr:Alpha derive conflicting branch names"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn land_merge_mutation_only_updates_and_merges_target_pr() {
+        let mutation = build_land_merge_mutation("PR_target", "origin/main", LandCmd::Flatten);
+
+        assert!(mutation.contains("updatePullRequest"));
+        assert!(mutation.contains("mergePullRequest"));
+        assert!(!mutation.contains("closePullRequest"));
+        assert!(!mutation.contains("addComment"));
+        assert!(mutation.contains("baseRefName:\"main\""));
+        assert!(mutation.contains("mergeMethod:SQUASH"));
+    }
+
+    #[test]
+    fn close_comment_mutation_only_closes_supplied_prs() {
+        let prs = [pr(1, "skilltest/alpha"), pr(2, "skilltest/beta")];
+        let ids = HashMap::from([(1, "PR_alpha".to_string()), (2, "PR_beta".to_string())]);
+
+        let mutation = build_close_comment_mutation(
+            &[&prs[0]],
+            &ids,
+            3,
+            &std::collections::HashSet::from([1]),
+        )
+        .unwrap();
+
+        assert!(mutation.contains("PR_alpha"));
+        assert!(!mutation.contains("PR_beta"));
+        assert!(mutation.contains("Merged as part of PR #3"));
+        assert!(mutation.contains("addComment"));
+        assert!(mutation.contains("closePullRequest"));
+    }
+
+    #[test]
+    fn close_comment_mutation_skips_missing_and_empty_ids() {
+        let prs = [pr(1, "skilltest/alpha"), pr(2, "skilltest/beta")];
+        let ids = HashMap::from([(1, String::new())]);
+
+        assert!(build_close_comment_mutation(
+            &[&prs[0], &prs[1]],
+            &ids,
+            3,
+            &std::collections::HashSet::from([1, 2]),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn recovery_plan_skips_merge_and_closes_only_remaining_open_prs() {
+        let groups = groups(&["alpha", "beta", "gamma"]);
+        let branch_identities =
+            crate::branch_names::group_branch_identities(&groups, "skilltest/").unwrap();
+        let prs = [
+            pr(1, "skilltest/alpha"),
+            merged_pr(2, "skilltest/beta"),
+            merged_pr(3, "skilltest/gamma"),
+        ];
+        let prs_by_head = prs
+            .iter()
+            .map(|pr| (canonical_branch_conflict_key(&pr.head), pr))
+            .collect();
+
+        let (_, plan) = resolve_land_plan(
+            &groups,
+            &branch_identities,
+            &prs_by_head,
+            &InclusiveSelector::All,
+        )
+        .unwrap();
+        let LandPlan::Recovery {
+            target,
+            open_older_prs,
+        } = plan
+        else {
+            panic!("expected recovery plan");
+        };
+
+        assert_eq!(target.number, 3);
+        assert_eq!(
+            open_older_prs
+                .iter()
+                .map(|pr| pr.number)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn partial_land_retry_skips_merge_and_does_not_duplicate_comment() {
+        let target = pr(3, "skilltest/gamma");
+        let older = pr(1, "skilltest/alpha");
+        let ids = HashMap::from([(1, "PR_alpha".to_string()), (3, "PR_gamma".to_string())]);
+        let comments = std::collections::HashSet::from([1]);
+        let mut first_calls = Vec::new();
+        let err = run_land_mutations(
+            LandMutationPlan {
+                base: "main",
+                mode: LandCmd::Flatten,
+                target: &target,
+                target_id: Some("PR_gamma"),
+                open_older_prs: &[&older],
+                ids_by_number: &ids,
+                add_comment_numbers: &comments,
+            },
+            |mutation| {
+                first_calls.push(mutation);
+                if first_calls.len() == 2 {
+                    anyhow::bail!("transient cleanup failure");
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("transient cleanup failure"));
+        assert!(first_calls[0].contains("mergePullRequest"));
+
+        let mut retry_calls = Vec::new();
+        run_land_mutations(
+            LandMutationPlan {
+                base: "main",
+                mode: LandCmd::Flatten,
+                target: &target,
+                target_id: None,
+                open_older_prs: &[&older],
+                ids_by_number: &ids,
+                add_comment_numbers: &std::collections::HashSet::new(),
+            },
+            |mutation| {
+                retry_calls.push(mutation);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(retry_calls.len(), 1);
+        assert!(!retry_calls[0].contains("mergePullRequest"));
+        assert!(!retry_calls[0].contains("addComment"));
+        assert!(retry_calls[0].contains("closePullRequest"));
+    }
+
+    #[test]
+    fn land_safety_failure_message_only_reports_failed_checks() {
+        assert_eq!(
+            format_land_safety_failures(&[17], &[]),
+            "CI not passing: #17"
+        );
+        assert_eq!(
+            format_land_safety_failures(&[], &[18]),
+            "Reviews not approved: #18"
+        );
+        assert_eq!(
+            format_land_safety_failures(&[17], &[18, 19]),
+            "CI not passing: #17; Reviews not approved: #18, #19"
         );
     }
 }

@@ -88,6 +88,15 @@ pub struct TerminalPrInfo {
 
 const HEAD_SEARCH_LIMIT: usize = 100;
 const OPEN_CONFLICT_SEARCH_LIMIT: usize = 2;
+// GitHub documents a 500,000-node validation cap and additional undisclosed resource limits for
+// GraphQL queries. These are conservative operational starting points, not GitHub guarantees.
+// Keep the nested status query modest, and rely on run_read_chunk_with_retry to bisect any batch
+// that still triggers RESOURCE_LIMITS_EXCEEDED.
+const MAX_EXACT_HEADS_PER_QUERY: usize = 20;
+const MAX_CONFLICT_HEADS_PER_QUERY: usize = 10;
+const MAX_TERMINAL_HEADS_PER_QUERY: usize = 10;
+const MAX_PR_BODIES_PER_QUERY: usize = 10;
+const MAX_PR_STATUS_PER_QUERY: usize = 20;
 const HEAD_SEARCH_FIELDS: &str =
     "number,headRefName,baseRefName,state,mergedAt,closedAt,url,autoMergeRequest";
 const EXACT_HEAD_QUERY_LIMIT: usize = 10;
@@ -116,6 +125,33 @@ struct HeadSearchPr {
 
 fn head_key(head: &str) -> CanonicalBranchConflictKey {
     canonical_branch_conflict_key(head)
+}
+
+pub(crate) fn is_resource_limit_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("RESOURCE_LIMITS_EXCEEDED")
+        || msg.contains("Resource limits for this query exceeded")
+}
+
+fn run_read_chunk_with_retry<T, R, F, M>(items: &[T], run: &F, merge: &M) -> Result<R>
+where
+    F: Fn(&[T]) -> Result<R>,
+    M: Fn(R, R) -> R,
+{
+    match run(items) {
+        Ok(result) => Ok(result),
+        Err(err) if is_resource_limit_error(&err) && items.len() > 1 => {
+            info!(
+                "Resource limits for this query exceeded; retrying read with smaller chunks ({} item(s))",
+                items.len()
+            );
+            let mid = items.len() / 2;
+            let left = run_read_chunk_with_retry(&items[..mid], run, merge)?;
+            let right = run_read_chunk_with_retry(&items[mid..], run, merge)?;
+            Ok(merge(left, right))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn head_search_query(head: &str) -> String {
@@ -176,6 +212,26 @@ fn list_prs_for_search_query(query: &str, state: &str, limit: usize) -> Result<V
 /// Case-variant remote heads are intentionally not discovered by this helper; conflict detection
 /// stays in the separate search-based helpers below.
 fn list_exact_prs_for_heads(
+    heads: &[String],
+    states: &[&str],
+    limit: usize,
+) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
+    let mut out = HashMap::new();
+    for chunk in heads.chunks(MAX_EXACT_HEADS_PER_QUERY) {
+        let chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &|subset| list_exact_prs_for_heads_chunk(subset, states, limit),
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
+fn list_exact_prs_for_heads_chunk(
     heads: &[String],
     states: &[&str],
     limit: usize,
@@ -260,6 +316,24 @@ fn list_prs_for_search_query_exhaustive(query: &str, state: &str) -> Result<Vec<
 /// locally because exact-head multiplicity is already handled by the structured GraphQL lookup;
 /// this helper only answers whether any additional case-insensitive open hit exists.
 fn list_open_conflicting_prs_for_heads_search(
+    heads: &[String],
+) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
+    let mut out = HashMap::new();
+    for chunk in heads.chunks(MAX_CONFLICT_HEADS_PER_QUERY) {
+        let chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &list_open_conflicting_prs_for_heads_search_chunk,
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
+fn list_open_conflicting_prs_for_heads_search_chunk(
     heads: &[String],
 ) -> Result<HashMap<String, Vec<HeadSearchPr>>> {
     let mut matches_by_head: HashMap<String, Vec<HeadSearchPr>> = heads
@@ -564,6 +638,25 @@ fn terminal_info_from_head_search(
     })
 }
 
+fn select_latest_terminal_pr_match(
+    requested_head: &str,
+    prs: &[HeadSearchPr],
+) -> Result<Option<TerminalPrInfo>> {
+    let mut latest: Option<(OffsetDateTime, TerminalPrInfo)> = None;
+    for pr in filter_head_search_matches(requested_head, prs) {
+        let info = terminal_info_from_head_search(&pr, requested_head)?;
+        let terminal_at = parse_github_datetime_rfc3339(&info.terminal_at, requested_head)?;
+        if latest
+            .as_ref()
+            .map(|(current, _)| terminal_at > *current)
+            .unwrap_or(true)
+        {
+            latest = Some((terminal_at, info));
+        }
+    }
+    Ok(latest.map(|(_, info)| info))
+}
+
 #[derive(Clone)]
 pub struct PrBodyInfo {
     pub id: String,
@@ -571,6 +664,71 @@ pub struct PrBodyInfo {
 }
 
 pub fn fetch_pr_bodies_graphql(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInfo>> {
+    let mut out = HashMap::new();
+    for chunk in numbers.chunks(MAX_PR_BODIES_PER_QUERY) {
+        let chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &fetch_pr_bodies_graphql_chunk,
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
+pub fn fetch_pr_issue_comment_bodies_graphql(number: u64) -> Result<Vec<String>> {
+    let (owner, name) = get_repo_owner_name()?;
+    let query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){ repository(owner:$owner,name:$name){ pullRequest(number:$number){ comments(first:100,after:$cursor){ pageInfo { hasNextPage endCursor } nodes { body } } } } }";
+    let mut cursor: Option<String> = None;
+    let mut bodies = Vec::new();
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+            "-F".to_string(),
+            format!("owner={owner}"),
+            "-F".to_string(),
+            format!("name={name}"),
+            "-F".to_string(),
+            format!("number={number}"),
+        ];
+        if let Some(cursor) = &cursor {
+            args.push("-F".to_string());
+            args.push(format!("cursor={cursor}"));
+        }
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let json = gh_ro(&arg_refs)?;
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        let comments = &value["data"]["repository"]["pullRequest"]["comments"];
+        bodies.extend(
+            comments["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|node| node["body"].as_str().map(str::to_string)),
+        );
+        if !comments["pageInfo"]["hasNextPage"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            break;
+        }
+        cursor = comments["pageInfo"]["endCursor"]
+            .as_str()
+            .map(str::to_string);
+        if cursor.is_none() {
+            bail!("PR #{number} comments page missing endCursor");
+        }
+    }
+    Ok(bodies)
+}
+
+fn fetch_pr_bodies_graphql_chunk(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInfo>> {
     let mut out = HashMap::new();
     if numbers.is_empty() {
         return Ok(out);
@@ -660,6 +818,22 @@ pub struct PrCiReviewStatus {
 }
 
 pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiReviewStatus>> {
+    let mut out = HashMap::new();
+    for chunk in numbers.chunks(MAX_PR_STATUS_PER_QUERY) {
+        let chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &fetch_pr_ci_review_status_chunk,
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
+fn fetch_pr_ci_review_status_chunk(numbers: &[u64]) -> Result<HashMap<u64, PrCiReviewStatus>> {
     let mut out = HashMap::new();
     if numbers.is_empty() {
         return Ok(out);
@@ -931,11 +1105,32 @@ fn parse_github_datetime_rfc3339(s: &str, context: &str) -> Result<OffsetDateTim
 /// `pullRequests(headRefName: ...)` lookup. It intentionally leans on GitHub's case-insensitive
 /// `head:` search semantics rather than the exact, case-sensitive `headRefName` filter so the
 /// branch-reuse guard can ask "is there any recent terminal PR on this case-insensitive head
-/// identity?" without enumerating full history. Callers should still compare the returned
-/// timestamp precisely because GitHub's `closed:` qualifier is date-based, not full RFC3339. The
-/// returned `terminal_at` remains state-specific: `mergedAt` for merged PRs and `closedAt` for
-/// manually closed PRs.
+/// identity?" without enumerating full history. GitHub search can also return prefix matches, so
+/// the fast batched query falls back to exhaustive search when its first hit does not match the
+/// complete case-folded head. Callers should still compare the returned timestamp precisely
+/// because GitHub's `closed:` qualifier is date-based, not full RFC3339. The returned
+/// `terminal_at` remains state-specific: `mergedAt` for merged PRs and `closedAt` for manually
+/// closed PRs.
 pub fn list_recent_terminal_prs_for_heads(
+    heads: &[String],
+    closed_since: OffsetDateTime,
+) -> Result<Vec<TerminalPrInfo>> {
+    let mut out = Vec::new();
+    for chunk in heads.chunks(MAX_TERMINAL_HEADS_PER_QUERY) {
+        let mut chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &|subset| list_recent_terminal_prs_for_heads_chunk(subset, closed_since),
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.append(&mut chunk_out);
+    }
+    Ok(out)
+}
+
+fn list_recent_terminal_prs_for_heads_chunk(
     heads: &[String],
     closed_since: OffsetDateTime,
 ) -> Result<Vec<TerminalPrInfo>> {
@@ -962,14 +1157,25 @@ pub fn list_recent_terminal_prs_for_heads(
     let data = &value["data"];
     for (i, requested_head) in heads.iter().enumerate() {
         let key = format!("pr{}", i);
-        let pr = data[&key]["nodes"]
+        let prs = data[&key]["nodes"]
             .as_array()
-            .and_then(|nodes| nodes.first())
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?;
-        if let Some(pr) = pr {
-            out.push(terminal_info_from_head_search(&pr, requested_head)?);
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .collect::<std::result::Result<Vec<HeadSearchPr>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(pr) = select_latest_terminal_pr_match(requested_head, &prs)? {
+            out.push(pr);
+        } else if !prs.is_empty() {
+            let search_query = recent_terminal_search_query(&repo, requested_head, closed_since);
+            let exhaustive_prs = list_prs_for_search_query_exhaustive(&search_query, "all")?;
+            if let Some(pr) = select_latest_terminal_pr_match(requested_head, &exhaustive_prs)? {
+                out.push(pr);
+            }
         }
     }
 
@@ -1193,15 +1399,19 @@ pub fn append_warning_to_pr(
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_merged_pr_merge_commit_oids, filter_case_variant_head_search_matches,
-        filter_head_search_matches, list_conflicting_prs_for_heads_search_exhaustive,
-        list_exact_prs_for_heads, list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
+        fetch_merged_pr_merge_commit_oids, fetch_pr_bodies_graphql,
+        fetch_pr_issue_comment_bodies_graphql, filter_case_variant_head_search_matches,
+        filter_head_search_matches, is_resource_limit_error,
+        list_conflicting_prs_for_heads_search_exhaustive, list_exact_prs_for_heads,
+        list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
         list_recent_terminal_prs_for_heads, parse_open_pr_automerge_node, resolve_pr_url_head_ref,
-        select_latest_merged_pr_match, select_single_open_pr_match, HeadSearchPr, PrState,
-        TerminalPrState, EXACT_HEAD_QUERY_LIMIT,
+        run_read_chunk_with_retry, select_latest_merged_pr_match, select_single_open_pr_match,
+        HeadSearchPr, PrState, TerminalPrState, EXACT_HEAD_QUERY_LIMIT,
     };
-    use crate::test_support::lock_cwd;
+    use crate::test_support::{init_repo, lock_cwd, DirGuard};
+    use anyhow::anyhow;
     use serde_json::{json, Value};
+    use std::cell::Cell;
     use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1247,6 +1457,39 @@ mod tests {
             url: Some(format!("https://github.com/o/r/pull/{number}")),
             auto_merge_request: None,
         }
+    }
+
+    #[test]
+    fn read_chunk_retry_splits_resource_limit_failures_and_merges_results() {
+        let calls = Cell::new(0);
+        let run = |items: &[u64]| {
+            calls.set(calls.get() + 1);
+            if items.len() > 1 {
+                Err(anyhow!("RESOURCE_LIMITS_EXCEEDED"))
+            } else {
+                Ok(items.to_vec())
+            }
+        };
+        let merge = |mut left: Vec<u64>, right: Vec<u64>| {
+            left.extend(right);
+            left
+        };
+
+        let result = run_read_chunk_with_retry(&[1, 2, 3, 4], &run, &merge).unwrap();
+
+        assert_eq!(result, vec![1, 2, 3, 4]);
+        assert_eq!(calls.get(), 7);
+    }
+
+    #[test]
+    fn resource_limit_classifier_accepts_both_github_spellings() {
+        assert!(is_resource_limit_error(&anyhow!(
+            "RESOURCE_LIMITS_EXCEEDED"
+        )));
+        assert!(is_resource_limit_error(&anyhow!(
+            "Resource limits for this query exceeded"
+        )));
+        assert!(!is_resource_limit_error(&anyhow!("different failure")));
     }
 
     fn install_gh_wrapper(script_body: &str) -> (TempDir, EnvVarGuard) {
@@ -1346,6 +1589,68 @@ mod tests {
             path_guard,
             log_path.display().to_string(),
         )
+    }
+
+    #[test]
+    fn fetch_pr_bodies_graphql_merges_results_across_wrapper_chunks() {
+        let _lock = lock_cwd();
+        let repo = init_repo();
+        crate::test_support::git(
+            repo.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/spr-test.git",
+            ]
+            .as_slice(),
+        );
+        let _guard = DirGuard::change_to(repo.path());
+        let data_dir = tempfile::tempdir().unwrap();
+        let log_path = data_dir.path().join("gh.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *\"pullRequest(number: 11)\"*) echo '{{\"data\":{{\"repository\":{{\"pr0\":{{\"id\":\"PR_11\",\"body\":\"body 11\"}}}}}}}}' ;;\n  *) echo '{{\"data\":{{\"repository\":{{\"pr0\":{{\"id\":\"PR_1\",\"body\":\"body 1\"}},\"pr1\":{{\"id\":\"PR_2\",\"body\":\"body 2\"}},\"pr2\":{{\"id\":\"PR_3\",\"body\":\"body 3\"}},\"pr3\":{{\"id\":\"PR_4\",\"body\":\"body 4\"}},\"pr4\":{{\"id\":\"PR_5\",\"body\":\"body 5\"}},\"pr5\":{{\"id\":\"PR_6\",\"body\":\"body 6\"}},\"pr6\":{{\"id\":\"PR_7\",\"body\":\"body 7\"}},\"pr7\":{{\"id\":\"PR_8\",\"body\":\"body 8\"}},\"pr8\":{{\"id\":\"PR_9\",\"body\":\"body 9\"}},\"pr9\":{{\"id\":\"PR_10\",\"body\":\"body 10\"}}}}}}}}' ;;\nesac\n",
+            log_path.display()
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+
+        let bodies = fetch_pr_bodies_graphql(&(1..=11).collect::<Vec<_>>()).unwrap();
+
+        assert_eq!(bodies.len(), 11);
+        for number in 1..=11 {
+            assert_eq!(bodies[&number].id, format!("PR_{number}"));
+            assert_eq!(bodies[&number].body, format!("body {number}"));
+        }
+        assert_eq!(fs::read_to_string(log_path).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn fetch_pr_issue_comment_bodies_graphql_reads_all_pages() {
+        let _lock = lock_cwd();
+        let repo = init_repo();
+        crate::test_support::git(
+            repo.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/spr-test.git",
+            ]
+            .as_slice(),
+        );
+        let _guard = DirGuard::change_to(repo.path());
+        let data_dir = tempfile::tempdir().unwrap();
+        let log_path = data_dir.path().join("gh.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *\"cursor=page-2\"*) echo '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"comments\":{{\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}},\"nodes\":[{{\"body\":\"second\"}}]}}}}}}}}}}' ;;\n  *) echo '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"comments\":{{\"pageInfo\":{{\"hasNextPage\":true,\"endCursor\":\"page-2\"}},\"nodes\":[{{\"body\":\"first\"}}]}}}}}}}}}}' ;;\nesac\n",
+            log_path.display()
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+
+        let bodies = fetch_pr_issue_comment_bodies_graphql(17).unwrap();
+
+        assert_eq!(bodies, vec!["first", "second"]);
+        assert_eq!(fs::read_to_string(log_path).unwrap().lines().count(), 2);
     }
 
     #[test]
@@ -1853,19 +2158,19 @@ mod tests {
     }
 
     #[test]
-    fn list_recent_terminal_prs_for_heads_queries_recent_closed_search() {
+    fn list_recent_terminal_prs_for_heads_filters_prefix_matches() {
         let _lock = lock_cwd();
         let search_json = graphql_search_response(&[
             (
                 "pr0",
                 json!([
                     {
-                        "number": 11,
-                        "headRefName": "skilltest/alpha",
-                        "state": "MERGED",
-                        "mergedAt": "2026-02-01T00:00:00Z",
-                        "closedAt": "2026-02-01T00:00:01Z",
-                        "url": "https://github.com/o/r/pull/11"
+                        "number": 33,
+                        "headRefName": "skilltest/alphaSuffix",
+                        "state": "CLOSED",
+                        "mergedAt": null,
+                        "closedAt": "2026-02-20T00:00:00Z",
+                        "url": "https://github.com/o/r/pull/33"
                     }
                 ]),
             ),
@@ -1883,14 +2188,36 @@ mod tests {
                 ]),
             ),
         ]);
+        let exhaustive_json = serde_json::to_string(&json!([
+            {
+                "number": 33,
+                "headRefName": "skilltest/alphaSuffix",
+                "state": "CLOSED",
+                "mergedAt": null,
+                "closedAt": "2026-02-20T00:00:00Z",
+                "url": "https://github.com/o/r/pull/33"
+            },
+            {
+                "number": 11,
+                "headRefName": "skilltest/alpha",
+                "state": "MERGED",
+                "mergedAt": "2026-02-01T00:00:00Z",
+                "closedAt": "2026-02-01T00:00:01Z",
+                "url": "https://github.com/o/r/pull/11"
+            }
+        ]))
+        .unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let log_path = data_dir.path().join("gh.log");
         let response_path = data_dir.path().join("search.json");
+        let exhaustive_path = data_dir.path().join("exhaustive.json");
         fs::write(&response_path, search_json).unwrap();
+        fs::write(&exhaustive_path, exhaustive_json).unwrap();
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  cat \"{}\"\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  cat \"{}\"\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  cat \"{}\"\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
             response_path.display(),
+            exhaustive_path.display(),
         );
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
         let closed_since = time::OffsetDateTime::parse(
@@ -1915,11 +2242,14 @@ mod tests {
 
         let log = fs::read_to_string(log_path).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("api graphql"));
         assert!(lines[0]
             .contains("is:pr is:closed head:skilltest/alpha closed:>=2026-02-01 sort:closed-desc"));
         assert!(lines[0]
             .contains("is:pr is:closed head:skilltest/beta closed:>=2026-02-01 sort:closed-desc"));
+        assert!(lines[1].contains("pr list --state all"));
+        assert!(lines[1]
+            .contains("is:pr is:closed head:skilltest/alpha closed:>=2026-02-01 sort:closed-desc"));
     }
 }

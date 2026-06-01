@@ -13,7 +13,7 @@ use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
 use crate::execution::ExecutionMode;
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
-    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape,
+    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, is_resource_limit_error,
     list_recent_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
 };
 use crate::limit::{apply_limit_groups, Limit};
@@ -187,6 +187,9 @@ fn enforce_branch_reuse_guard(
     }
 }
 
+// GitHub does not publish a safe alias count for batched mutations. Base edits are small and retry
+// by bisection on RESOURCE_LIMITS_EXCEEDED; body edits remain one-per-request because body size is
+// user-controlled.
 const MAX_BASE_UPDATES_PER_MUTATION: usize = 50;
 const MAX_BASE_MUTATION_CHARS: usize = 20_000;
 const MAX_BODY_UPDATES_PER_MUTATION: usize = 1;
@@ -268,10 +271,15 @@ fn chunk_update_inputs(
     chunks
 }
 
-fn is_resource_limit_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("RESOURCE_LIMITS_EXCEEDED")
-        || msg.contains("Resource limits for this query exceeded")
+fn should_use_single_update_mutation(
+    update_inputs: &[String],
+    max_ops: usize,
+    max_chars: usize,
+    prefer_single: bool,
+) -> bool {
+    prefer_single
+        && update_inputs.len() <= max_ops
+        && mutation_len_for_inputs(update_inputs) <= max_chars
 }
 
 fn run_update_chunk(execution_mode: ExecutionMode, update_inputs: &[String]) -> Result<()> {
@@ -348,11 +356,12 @@ fn run_update_mutations(
     } else {
         None
     };
-    let chunks = if prefer_single && mutation_len_for_inputs(&update_inputs) <= max_chars {
-        vec![update_inputs]
-    } else {
-        chunk_update_inputs(&update_inputs, max_ops, max_chars)
-    };
+    let chunks =
+        if should_use_single_update_mutation(&update_inputs, max_ops, max_chars, prefer_single) {
+            vec![update_inputs]
+        } else {
+            chunk_update_inputs(&update_inputs, max_ops, max_chars)
+        };
     for chunk in chunks {
         if let Err(e) = run_update_chunk_with_retry(execution_mode, &chunk, progress_bar.as_ref()) {
             if let Some(progress_bar) = &progress_bar {
@@ -988,7 +997,8 @@ mod tests {
     use super::{
         branch_reuse_guard_window, build_from_groups, build_from_tags, head_key,
         heads_without_open_prs, ignored_boundary_warning, parse_github_timestamp_rfc3339,
-        pr_number_for_head, recent_pr_age, recent_pr_age_blocks_recreation, terminal_pr_action,
+        pr_number_for_head, recent_pr_age, recent_pr_age_blocks_recreation,
+        should_use_single_update_mutation, terminal_pr_action,
     };
     use crate::branch_names::group_branch_identities;
     use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
@@ -1009,6 +1019,18 @@ mod tests {
 
         assert!(warning.contains("GitHub PRs above an ignored block include the ignored commits"));
         assert!(warning.contains("pr:beta, pr:gamma"));
+    }
+
+    #[test]
+    fn preferred_single_update_mutation_still_respects_max_operations() {
+        let update_inputs = vec!["a".to_string(), "b".to_string()];
+
+        assert!(!should_use_single_update_mutation(
+            &update_inputs,
+            1,
+            usize::MAX,
+            true
+        ));
     }
 
     #[test]

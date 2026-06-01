@@ -122,6 +122,27 @@ fn set_dry_run_env(execution_mode: ExecutionMode, assume_existing_prs: bool) {
     }
 }
 
+const DETACHED_METADATA_REFRESH_WARNING: &str = "Skipping stack metadata refresh because HEAD is detached. Rerun `spr update` after completing the active Git operation.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataRefreshOutcome {
+    Refreshed,
+    SkippedDetached,
+}
+
+fn refresh_metadata_after_update(
+    context: &crate::stack_metadata::RefreshMetadataContext,
+) -> Result<MetadataRefreshOutcome> {
+    if !crate::stack_metadata::refresh_metadata_for_current_checkout_if_attached(
+        &context.base,
+        &context.prefix,
+        &context.ignore_tag,
+    )? {
+        return Ok(MetadataRefreshOutcome::SkippedDetached);
+    }
+    Ok(MetadataRefreshOutcome::Refreshed)
+}
+
 /// Change to the requested working directory before config discovery or repo-scoped commands.
 fn apply_working_directory_override(path: Option<&Path>) -> Result<()> {
     if let Some(path) = path {
@@ -497,7 +518,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         branch_reuse_guard_days,
                         local_pr_branch_policy,
                     )?;
-                    let summary = crate::update_output::UpdateSummaryData::from_execution(
+                    let mut summary = crate::update_output::UpdateSummaryData::from_execution(
                         crate::update_output::UpdateRepoContext {
                             base: base.clone(),
                             from,
@@ -513,12 +534,13 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         resolved_extent,
                         execution,
                     );
-                    if execution_mode == ExecutionMode::Apply {
-                        crate::stack_metadata::refresh_metadata_for_current_checkout(
-                            &metadata_refresh_context.base,
-                            &metadata_refresh_context.prefix,
-                            &metadata_refresh_context.ignore_tag,
-                        )?;
+                    if execution_mode == ExecutionMode::Apply
+                        && refresh_metadata_after_update(&metadata_refresh_context)?
+                            == MetadataRefreshOutcome::SkippedDetached
+                    {
+                        summary
+                            .warnings
+                            .push(DETACHED_METADATA_REFRESH_WARNING.to_string());
                     }
                     Ok(CommandOutput::Update(crate::update_output::summary(
                         summary,
@@ -538,12 +560,11 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         branch_reuse_guard_days,
                         local_pr_branch_policy,
                     )?;
-                    if execution_mode == ExecutionMode::Apply {
-                        crate::stack_metadata::refresh_metadata_for_current_checkout(
-                            &metadata_refresh_context.base,
-                            &metadata_refresh_context.prefix,
-                            &metadata_refresh_context.ignore_tag,
-                        )?;
+                    if execution_mode == ExecutionMode::Apply
+                        && refresh_metadata_after_update(&metadata_refresh_context)?
+                            == MetadataRefreshOutcome::SkippedDetached
+                    {
+                        eprintln!("{DETACHED_METADATA_REFRESH_WARNING}");
                     }
                     Ok(CommandOutput::None)
                 }
