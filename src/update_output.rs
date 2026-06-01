@@ -39,7 +39,6 @@ pub struct UpdateOptions {
 pub enum ResolvedUpdateLimit {
     All,
     ByPr { count: usize },
-    ByCommits { count: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

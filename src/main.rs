@@ -486,19 +486,12 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     match extent {
                         crate::cli::Extent::Pr { to, n, legacy_n } => {
                             let limit = resolve_update_pr_limit(&groups, to, n, legacy_n)?;
-                            let count = match limit {
-                                crate::limit::Limit::ByPr(count) => count,
-                                crate::limit::Limit::ByCommits(_) => unreachable!(),
-                            };
+                            let crate::limit::Limit::ByPr(count) = limit;
                             (
                                 Some(limit),
                                 crate::update_output::ResolvedUpdateLimit::ByPr { count },
                             )
                         }
-                        crate::cli::Extent::Commits { n } => (
-                            Some(crate::limit::Limit::ByCommits(n)),
-                            crate::update_output::ResolvedUpdateLimit::ByCommits { count: n },
-                        ),
                     }
                 } else {
                     (None, crate::update_output::ResolvedUpdateLimit::All)
@@ -3243,47 +3236,6 @@ mod tests {
                 assert_eq!(output.data.extent, ResolvedUpdateLimit::ByPr { count: 1 });
                 assert_eq!(output.data.groups.len(), 1);
                 assert_eq!(output.data.groups[0].stable_handle, "pr:alpha");
-            }
-            other => panic!("unexpected command output: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn update_json_commit_extent_reports_resolved_commit_limit() {
-        let _lock = lock_cwd();
-        let dir = init_update_stack_repo();
-        let repo = dir.path().join("repo");
-        let _guard = DirGuard::change_to(&repo);
-        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
-        let (_wrapper_dir, _path_guard) = install_failing_gh_wrapper();
-        let cli = crate::cli::Cli::try_parse_from([
-            "spr",
-            "--cd",
-            repo.to_str().unwrap(),
-            "--base",
-            "main",
-            "--prefix",
-            "dank-spr/",
-            "update",
-            "--dry-run",
-            "--json",
-            "--no-pr",
-            "commits",
-            "2",
-        ])
-        .unwrap();
-
-        let output = run_cli(cli, OutputFormat::Json).unwrap();
-
-        match output {
-            CommandOutput::Update(output) => {
-                assert_eq!(
-                    output.data.extent,
-                    ResolvedUpdateLimit::ByCommits { count: 2 }
-                );
-                assert_eq!(output.data.groups.len(), 1);
-                assert_eq!(output.data.groups[0].stable_handle, "pr:alpha");
-                assert_eq!(output.data.groups[0].target_sha.len(), 40);
             }
             other => panic!("unexpected command output: {:?}", other),
         }
