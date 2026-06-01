@@ -185,7 +185,6 @@ Key options:
   - `pr --to <N|name|pr:<label>|branch:<branch-name>>`: canonical selector for limiting updates to the first N PRs from the bottom
   - `pr --n <N>`: legacy numeric-only form
   - `pr <N>`: backward-compatible positional numeric form
-  - `commits --n <N>`: limit to first N commits (untested)
 
 Behavior:
 

@@ -17,8 +17,6 @@ pub enum Extent {
         #[arg(value_name = "N", hide = true, conflicts_with_all = ["to", "n"])]
         legacy_n: Option<usize>,
     },
-    /// Update only the first N commits from base..from (push partial groups if needed)
-    Commits { n: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -354,6 +352,15 @@ mod tests {
             } => assert!(allow_replayed_duplicates),
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn update_commit_extent_is_rejected() {
+        let err = Cli::try_parse_from(["spr", "update", "commits", "2"]).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("unrecognized subcommand 'commits'"));
     }
 
     #[test]
