@@ -390,7 +390,7 @@ fn run_update_mutations(
     Ok(())
 }
 
-fn ignored_boundary_warning(skipped_handles: &[String]) -> String {
+pub(crate) fn ignored_boundary_warning(skipped_handles: &[String]) -> String {
     format!(
         "Skipping PR groups above the ignored block. GitHub PRs above an ignored block include the ignored commits, which defeats the point of `pr:ignore`. These groups stay local-only: {}",
         skipped_handles.join(", ")

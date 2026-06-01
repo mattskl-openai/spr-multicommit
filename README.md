@@ -223,8 +223,14 @@ Aliases:
 
 - `v`
 
+Key options:
+
+- `--from <REF>`: commit range upper bound when parsing tags (default `HEAD`)
+- `--until <N|0|name|pr:<label>|branch:<branch-name>>`: validate only the lower prefix through one PR boundary
+
 Behavior:
 
+- Accepts `--from <REF>` to validate the same source-ref stack slice accepted by `spr update --from <REF>` (default `HEAD`).
 - Validates the full publishable prefix by default after applying the same ignored-block rule as `spr update`.
 - Honors global `--until <N|0|name|pr:<label>|branch:<branch-name>>` to validate only the lower prefix through one PR boundary.
 - Reuses one detached temporary worktree and checks out the final commit in each PR group, bottom → top.

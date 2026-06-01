@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::branch_names::group_branch_identities;
 use crate::git::{git_common_dir, git_rev_parse, git_ro, repo_root};
-use crate::parsing::{derive_local_groups_with_ignored, split_groups_for_update, Group};
+use crate::parsing::{derive_groups_between_with_ignored, split_groups_for_update, Group};
 use crate::selectors::{resolve_inclusive_count, InclusiveSelector};
 
 const VALIDATION_PROTOCOL_VERSION: u32 = 2;
@@ -315,6 +315,7 @@ fn hook_input_path() -> PathBuf {
 
 fn run_pre_push_hook(
     worktree: &Path,
+    pre_push_hook: &HookFingerprint,
     origin_push_url: &str,
     branch: &str,
     previous_tip: &str,
@@ -327,9 +328,14 @@ fn run_pre_push_hook(
         format!("{ref_name} {current_tip} {ref_name} {previous_tip}\n"),
     )
     .with_context(|| format!("failed to write hook input {}", input_path.display()))?;
-    let output = Command::new("git")
+    let hooks_path = Path::new(&pre_push_hook.path)
+        .parent()
+        .ok_or_else(|| anyhow!("pre-push hook path {} has no parent", pre_push_hook.path))?;
+    let status = Command::new("git")
         .current_dir(worktree)
         .args([
+            "-c",
+            &format!("core.hooksPath={}", hooks_path.display()),
             "hook",
             "run",
             "--ignore-missing",
@@ -339,12 +345,10 @@ fn run_pre_push_hook(
             "origin",
             origin_push_url,
         ])
-        .output()
+        .status()
         .context("failed to spawn git hook run pre-push")?;
     let _ = fs::remove_file(&input_path);
-    eprint!("{}", String::from_utf8_lossy(&output.stdout));
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    if !output.status.success() {
+    if !status.success() {
         bail!("pre-push hook failed");
     }
     Ok(())
@@ -370,14 +374,25 @@ fn cleanup_worktree(worktree: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn validate_current_stack(
     base: &str,
     prefix: &str,
     ignore_tag: &str,
     until: &InclusiveSelector,
 ) -> Result<ValidationSummaryData> {
+    validate_stack(base, prefix, ignore_tag, "HEAD", until)
+}
+
+pub fn validate_stack(
+    base: &str,
+    prefix: &str,
+    ignore_tag: &str,
+    from: &str,
+    until: &InclusiveSelector,
+) -> Result<ValidationSummaryData> {
     let (merge_base, leading_ignored, all_groups) =
-        derive_local_groups_with_ignored(base, ignore_tag)?;
+        derive_groups_between_with_ignored(base, from, ignore_tag)?;
     let (mut groups, skipped_groups) = split_groups_for_update(&leading_ignored, all_groups);
     let group_count = resolve_inclusive_count(&groups, until)?;
     groups.truncate(group_count);
@@ -427,6 +442,7 @@ pub fn validate_current_stack(
                 run_git_in(&worktree, ["clean", "-fd"].as_slice())?;
                 run_pre_push_hook(
                     &worktree,
+                    &descriptor.pre_push_hook,
                     &descriptor.origin_push_url,
                     &descriptor.head_branch,
                     &descriptor.previous_tip_sha,
@@ -507,26 +523,49 @@ pub fn validate_current_stack(
 }
 
 pub fn print_validation_summary(summary: &ValidationSummaryData) {
-    println!(
-        "Validated {} local PR boundary/boundaries ({} recorded, {} reused)",
-        summary.validated_group_count, summary.recorded_group_count, summary.reused_group_count
-    );
-    if summary.pre_push_hook_present {
-        for receipt in &summary.receipts {
-            if receipt.action == ValidationReceiptAction::Recorded {
-                println!("Recorded validation receipt: {}", receipt.path);
-            }
+    println!("{}", validation_status_line(summary));
+    if !summary.pre_push_hook_executable {
+        if summary.pre_push_hook_present {
+            println!("The configured pre-push hook is not executable");
+        } else {
+            println!("No pre-push hook is installed");
         }
-    } else {
-        println!("No executable pre-push hook is installed");
     }
+    for receipt in &summary.receipts {
+        if receipt.action == ValidationReceiptAction::Recorded {
+            println!("Recorded validation receipt: {}", receipt.path);
+        }
+    }
+    if !summary.skipped_groups.is_empty() {
+        eprintln!("{}", validation_skipped_groups_warning(summary).unwrap());
+    }
+}
+
+fn validation_status_line(summary: &ValidationSummaryData) -> String {
+    if summary.pre_push_hook_executable {
+        format!(
+            "Validated {} local PR boundary/boundaries ({} recorded, {} reused)",
+            summary.validated_group_count, summary.recorded_group_count, summary.reused_group_count
+        )
+    } else {
+        format!(
+            "Recorded receipts for {} local PR boundary/boundaries without running a pre-push hook ({} recorded, {} reused)",
+            summary.validated_group_count, summary.recorded_group_count, summary.reused_group_count
+        )
+    }
+}
+
+fn validation_skipped_groups_warning(summary: &ValidationSummaryData) -> Option<String> {
+    (!summary.skipped_groups.is_empty())
+        .then(|| crate::commands::update::ignored_boundary_warning(&summary.skipped_groups))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_descriptors, require_matching_receipts, validate_current_stack,
-        ValidationReceiptAction, ValidationSummaryData,
+        build_descriptors, require_matching_receipts, validate_current_stack, validate_stack,
+        validation_skipped_groups_warning, validation_status_line, ValidationReceiptAction,
+        ValidationSummaryData,
     };
     use crate::commands::{build_from_groups_with_validation, UpdatePushValidation};
     use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
@@ -558,6 +597,7 @@ mod tests {
             ["config", "user.email", "spr@example.com"].as_slice(),
         );
         git(&repo, ["config", "user.name", "SPR Tests"].as_slice());
+        git(&repo, ["config", "core.hooksPath", ".git/hooks"].as_slice());
         write_file(&repo, "README.md", "init\n");
         git(&repo, ["add", "README.md"].as_slice());
         git(&repo, ["commit", "-m", "init"].as_slice());
@@ -672,6 +712,23 @@ mod tests {
         commit_file(&repo.repo, "gamma.txt", "gamma tip\n", "gamma pr:gamma")
     }
 
+    fn validation_summary(
+        pre_push_hook_present: bool,
+        pre_push_hook_executable: bool,
+        skipped_groups: Vec<String>,
+    ) -> ValidationSummaryData {
+        ValidationSummaryData {
+            success: true,
+            validated_group_count: 2,
+            recorded_group_count: 2,
+            reused_group_count: 0,
+            skipped_groups,
+            receipts: Vec::new(),
+            pre_push_hook_present,
+            pre_push_hook_executable,
+        }
+    }
+
     #[test]
     fn validates_each_pr_tip_with_pr_local_ranges_and_historical_contents() {
         let _cwd_lock = lock_cwd();
@@ -725,6 +782,83 @@ mod tests {
     }
 
     #[test]
+    fn validation_fixture_overrides_machine_global_hooks_path() {
+        let repo = init_validation_repo();
+
+        assert_eq!(
+            git(
+                &repo.repo,
+                ["config", "--local", "--get", "core.hooksPath"].as_slice()
+            )
+            .trim(),
+            ".git/hooks"
+        );
+    }
+
+    #[test]
+    fn validate_from_ref_records_receipts_for_selected_source_stack() {
+        let _cwd_lock = lock_cwd();
+        let repo = init_validation_repo();
+        let _cwd = DirGuard::change_to(&repo.repo);
+        git(
+            &repo.repo,
+            ["branch", "old-stack", &repo.alpha_tip].as_slice(),
+        );
+
+        let summary = validate_stack(
+            "main",
+            "spr/",
+            "ignore",
+            "old-stack",
+            &InclusiveSelector::All,
+        )
+        .unwrap();
+
+        assert_eq!(summary.validated_group_count, 1);
+        assert_eq!(summary.receipts[0].stable_handle, "pr:alpha");
+        assert_eq!(summary.receipts[0].tip_sha, repo.alpha_tip);
+    }
+
+    #[test]
+    fn relative_hooks_path_executes_the_fingerprinted_hook_for_every_boundary() {
+        let _cwd_lock = lock_cwd();
+        let repo = init_validation_repo();
+        let _cwd = DirGuard::change_to(&repo.repo);
+        git(&repo.repo, ["checkout", "main"].as_slice());
+        git(&repo.repo, ["checkout", "-b", "relative-hooks"].as_slice());
+        git(
+            &repo.repo,
+            ["config", "core.hooksPath", "hooksdir"].as_slice(),
+        );
+        let hook = repo.repo.join("hooksdir/pre-push");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf a >> '{}'\n", repo.log.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        git(&repo.repo, ["add", "hooksdir/pre-push"].as_slice());
+        git(
+            &repo.repo,
+            ["commit", "-m", "alpha hook pr:alpha"].as_slice(),
+        );
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf b >> '{}'\n", repo.log.display()),
+        )
+        .unwrap();
+        git(&repo.repo, ["add", "hooksdir/pre-push"].as_slice());
+        git(&repo.repo, ["commit", "-m", "beta hook pr:beta"].as_slice());
+
+        validate_current_stack("main", "spr/", "ignore", &InclusiveSelector::All).unwrap();
+
+        assert_eq!(fs::read_to_string(&repo.log).unwrap(), "bb");
+    }
+
+    #[test]
     fn non_executable_hook_succeeds_and_writes_receipts_without_running_hook() {
         let _cwd_lock = lock_cwd();
         let repo = init_validation_repo();
@@ -743,6 +877,28 @@ mod tests {
         assert!(summary.pre_push_hook_present);
         assert!(!summary.pre_push_hook_executable);
         assert!(!repo.log.exists());
+    }
+
+    #[test]
+    fn non_executable_hook_summary_says_receipts_were_recorded_without_running_hook() {
+        let line = validation_status_line(&validation_summary(true, false, Vec::new()));
+
+        assert!(line.contains("Recorded receipts"));
+        assert!(line.contains("without running a pre-push hook"));
+        assert!(!line.starts_with("Validated"));
+    }
+
+    #[test]
+    fn validation_summary_warns_about_skipped_ignored_groups() {
+        let warning = validation_skipped_groups_warning(&validation_summary(
+            false,
+            false,
+            vec!["pr:beta".to_string()],
+        ))
+        .unwrap();
+
+        assert!(warning.contains("Skipping PR groups above the ignored block"));
+        assert!(warning.contains("pr:beta"));
     }
 
     #[test]

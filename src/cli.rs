@@ -124,7 +124,11 @@ pub enum Cmd {
 
     /// Run configured pre-push hooks at every publishable PR boundary and record a receipt
     #[command(alias = "v")]
-    Validate,
+    Validate {
+        /// Source ref to read commits from, matching `spr update --from`
+        #[arg(long, default_value = "HEAD")]
+        from: String,
+    },
 
     /// Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base
     #[command(
@@ -320,7 +324,7 @@ pub struct Cli {
     /// Sync local per-PR branches named like each group's resolved concrete branch
     #[arg(long, global = true, value_enum)]
     pub local_pr_branches: Option<crate::config::LocalPrBranchSyncPolicy>,
-    /// Global until (used by prep/land). Accepts 0, a local PR number, or a group selector
+    /// Global until (used by validate/prep/land). Accepts 0, a local PR number, or a group selector
     #[arg(
         long,
         global = true,
@@ -375,14 +379,28 @@ mod tests {
     fn validate_command_parses() {
         let cli = Cli::try_parse_from(["spr", "validate"]).unwrap();
 
-        assert!(matches!(cli.cmd, Cmd::Validate));
+        assert!(matches!(cli.cmd, Cmd::Validate { ref from } if from == "HEAD"));
     }
 
     #[test]
     fn validate_alias_parses() {
         let cli = Cli::try_parse_from(["spr", "v"]).unwrap();
 
-        assert!(matches!(cli.cmd, Cmd::Validate));
+        assert!(matches!(cli.cmd, Cmd::Validate { ref from } if from == "HEAD"));
+    }
+
+    #[test]
+    fn validate_from_ref_parses() {
+        let cli = Cli::try_parse_from(["spr", "validate", "--from", "old-stack"]).unwrap();
+
+        assert!(matches!(cli.cmd, Cmd::Validate { ref from } if from == "old-stack"));
+    }
+
+    #[test]
+    fn global_until_help_mentions_validate() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("used by validate/prep/land"));
     }
 
     #[test]
