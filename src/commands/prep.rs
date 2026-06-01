@@ -26,6 +26,7 @@ pub struct PrepExecutionOptions {
     pub local_pr_branch_policy: crate::config::LocalPrBranchSyncPolicy,
     pub selection: crate::cli::PrepSelection,
     pub execution_mode: ExecutionMode,
+    pub update_validation: crate::config::UpdateValidationPolicy,
 }
 
 fn resolve_prep_window(
@@ -203,6 +204,7 @@ pub fn prep_squash(
         local_pr_branch_policy,
         selection,
         execution_mode,
+        update_validation,
     } = options;
     let dry_run = execution_mode == ExecutionMode::DryRun;
     let (merge_base, groups) = derive_local_groups(base, ignore_tag)?;
@@ -389,11 +391,22 @@ pub fn prep_squash(
     )?;
 
     let (limit, next_idx_opt, resolved_extent) = limit_and_next_idx(&groups, &selection)?;
-    let (_merge_base, leading_ignored, updated_groups) =
+    let (updated_merge_base, leading_ignored, updated_groups) =
         derive_groups_between_with_ignored(base, &parent_sha, ignore_tag)?;
     let (updated_groups, skipped_handles) =
         split_groups_for_update(&leading_ignored, updated_groups);
-    let update_execution = crate::commands::build_from_groups_with_summary(
+    let push_validation = if update_validation == crate::config::UpdateValidationPolicy::Required {
+        crate::commands::UpdatePushValidation::Required(crate::validation::build_descriptors(
+            base,
+            prefix,
+            ignore_tag,
+            &updated_merge_base,
+            &crate::limit::apply_limit_groups(updated_groups.clone(), limit)?,
+        )?)
+    } else {
+        crate::commands::UpdatePushValidation::Legacy
+    };
+    let update_execution = crate::commands::build_from_groups_with_summary_with_validation(
         base,
         prefix,
         &skipped_handles,
@@ -406,6 +419,7 @@ pub fn prep_squash(
         true,
         0,
         local_pr_branch_policy,
+        push_validation,
     )?;
     let update_summary = UpdateSummaryData::from_execution(
         UpdateRepoContext {
@@ -419,7 +433,7 @@ pub fn prep_squash(
             no_pr: false,
             pr_description_mode,
             local_pr_branches: local_pr_branch_policy,
-            update_validation: crate::config::UpdateValidationPolicy::Legacy,
+            update_validation,
             skip_validation: false,
         },
         resolved_extent,
@@ -608,6 +622,7 @@ mod tests {
                 local_pr_branch_policy: crate::config::LocalPrBranchSyncPolicy::Off,
                 selection: PrepSelection::All,
                 execution_mode: ExecutionMode::DryRun,
+                update_validation: crate::config::UpdateValidationPolicy::Legacy,
             },
         )
         .unwrap_err();

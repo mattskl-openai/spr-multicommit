@@ -40,6 +40,6 @@ pub use rewrite_resume::{
     RewriteDestinationKind, RewriteSuspendedState,
 };
 pub use update::{
-    build_from_groups_with_summary, build_from_groups_with_summary_with_validation,
-    build_from_groups_with_validation, UpdatePushValidation,
+    build_from_groups_with_summary_with_validation, build_from_groups_with_validation,
+    UpdatePushValidation,
 };

@@ -535,7 +535,7 @@ fn run_update_mutations(
     Ok(())
 }
 
-fn ignored_boundary_warning(skipped_handles: &[String]) -> String {
+pub(crate) fn ignored_boundary_warning(skipped_handles: &[String]) -> String {
     format!(
         "Skipping PR groups above the ignored block. GitHub PRs above an ignored block include the ignored commits, which defeats the point of `pr:ignore`. These groups stay local-only: {}",
         skipped_handles.join(", ")
@@ -1164,38 +1164,6 @@ fn build_from_groups_internal(
         groups,
         local_pr_branch_actions,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_from_groups_with_summary(
-    base: &str,
-    prefix: &str,
-    skipped_handles: &[String],
-    no_pr: bool,
-    execution_mode: ExecutionMode,
-    pr_description_mode: PrDescriptionMode,
-    limit: Option<Limit>,
-    groups: Vec<Group>,
-    list_order: ListOrder,
-    allow_branch_reuse: bool,
-    branch_reuse_guard_days: u32,
-    local_pr_branch_policy: LocalPrBranchSyncPolicy,
-) -> Result<UpdateExecutionData> {
-    build_from_groups_with_summary_with_validation(
-        base,
-        prefix,
-        skipped_handles,
-        no_pr,
-        execution_mode,
-        pr_description_mode,
-        limit,
-        groups,
-        list_order,
-        allow_branch_reuse,
-        branch_reuse_guard_days,
-        local_pr_branch_policy,
-        UpdatePushValidation::Legacy,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
