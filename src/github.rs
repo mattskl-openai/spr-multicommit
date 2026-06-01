@@ -127,7 +127,7 @@ fn head_key(head: &str) -> CanonicalBranchConflictKey {
     canonical_branch_conflict_key(head)
 }
 
-fn is_resource_limit_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_resource_limit_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     msg.contains("RESOURCE_LIMITS_EXCEEDED")
         || msg.contains("Resource limits for this query exceeded")
@@ -658,6 +658,55 @@ pub fn fetch_pr_bodies_graphql(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInf
         out.extend(chunk_out);
     }
     Ok(out)
+}
+
+pub fn fetch_pr_issue_comment_bodies_graphql(number: u64) -> Result<Vec<String>> {
+    let (owner, name) = get_repo_owner_name()?;
+    let query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){ repository(owner:$owner,name:$name){ pullRequest(number:$number){ comments(first:100,after:$cursor){ pageInfo { hasNextPage endCursor } nodes { body } } } } }";
+    let mut cursor: Option<String> = None;
+    let mut bodies = Vec::new();
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+            "-F".to_string(),
+            format!("owner={owner}"),
+            "-F".to_string(),
+            format!("name={name}"),
+            "-F".to_string(),
+            format!("number={number}"),
+        ];
+        if let Some(cursor) = &cursor {
+            args.push("-F".to_string());
+            args.push(format!("cursor={cursor}"));
+        }
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let json = gh_ro(&arg_refs)?;
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        let comments = &value["data"]["repository"]["pullRequest"]["comments"];
+        bodies.extend(
+            comments["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|node| node["body"].as_str().map(str::to_string)),
+        );
+        if !comments["pageInfo"]["hasNextPage"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            break;
+        }
+        cursor = comments["pageInfo"]["endCursor"]
+            .as_str()
+            .map(str::to_string);
+        if cursor.is_none() {
+            bail!("PR #{number} comments page missing endCursor");
+        }
+    }
+    Ok(bodies)
 }
 
 fn fetch_pr_bodies_graphql_chunk(numbers: &[u64]) -> Result<HashMap<u64, PrBodyInfo>> {
@@ -1318,14 +1367,16 @@ pub fn append_warning_to_pr(
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_merged_pr_merge_commit_oids, filter_case_variant_head_search_matches,
-        filter_head_search_matches, list_conflicting_prs_for_heads_search_exhaustive,
-        list_exact_prs_for_heads, list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
+        fetch_merged_pr_merge_commit_oids, fetch_pr_bodies_graphql,
+        fetch_pr_issue_comment_bodies_graphql, filter_case_variant_head_search_matches,
+        filter_head_search_matches, is_resource_limit_error,
+        list_conflicting_prs_for_heads_search_exhaustive, list_exact_prs_for_heads,
+        list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
         list_recent_terminal_prs_for_heads, parse_open_pr_automerge_node, resolve_pr_url_head_ref,
         run_read_chunk_with_retry, select_latest_merged_pr_match, select_single_open_pr_match,
         HeadSearchPr, PrState, TerminalPrState, EXACT_HEAD_QUERY_LIMIT,
     };
-    use crate::test_support::lock_cwd;
+    use crate::test_support::{init_repo, lock_cwd, DirGuard};
     use anyhow::anyhow;
     use serde_json::{json, Value};
     use std::cell::Cell;
@@ -1396,6 +1447,17 @@ mod tests {
 
         assert_eq!(result, vec![1, 2, 3, 4]);
         assert_eq!(calls.get(), 7);
+    }
+
+    #[test]
+    fn resource_limit_classifier_accepts_both_github_spellings() {
+        assert!(is_resource_limit_error(&anyhow!(
+            "RESOURCE_LIMITS_EXCEEDED"
+        )));
+        assert!(is_resource_limit_error(&anyhow!(
+            "Resource limits for this query exceeded"
+        )));
+        assert!(!is_resource_limit_error(&anyhow!("different failure")));
     }
 
     fn install_gh_wrapper(script_body: &str) -> (TempDir, EnvVarGuard) {
@@ -1495,6 +1557,68 @@ mod tests {
             path_guard,
             log_path.display().to_string(),
         )
+    }
+
+    #[test]
+    fn fetch_pr_bodies_graphql_merges_results_across_wrapper_chunks() {
+        let _lock = lock_cwd();
+        let repo = init_repo();
+        crate::test_support::git(
+            repo.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/spr-test.git",
+            ]
+            .as_slice(),
+        );
+        let _guard = DirGuard::change_to(repo.path());
+        let data_dir = tempfile::tempdir().unwrap();
+        let log_path = data_dir.path().join("gh.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *\"pullRequest(number: 11)\"*) echo '{{\"data\":{{\"repository\":{{\"pr0\":{{\"id\":\"PR_11\",\"body\":\"body 11\"}}}}}}}}' ;;\n  *) echo '{{\"data\":{{\"repository\":{{\"pr0\":{{\"id\":\"PR_1\",\"body\":\"body 1\"}},\"pr1\":{{\"id\":\"PR_2\",\"body\":\"body 2\"}},\"pr2\":{{\"id\":\"PR_3\",\"body\":\"body 3\"}},\"pr3\":{{\"id\":\"PR_4\",\"body\":\"body 4\"}},\"pr4\":{{\"id\":\"PR_5\",\"body\":\"body 5\"}},\"pr5\":{{\"id\":\"PR_6\",\"body\":\"body 6\"}},\"pr6\":{{\"id\":\"PR_7\",\"body\":\"body 7\"}},\"pr7\":{{\"id\":\"PR_8\",\"body\":\"body 8\"}},\"pr8\":{{\"id\":\"PR_9\",\"body\":\"body 9\"}},\"pr9\":{{\"id\":\"PR_10\",\"body\":\"body 10\"}}}}}}}}' ;;\nesac\n",
+            log_path.display()
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+
+        let bodies = fetch_pr_bodies_graphql(&(1..=11).collect::<Vec<_>>()).unwrap();
+
+        assert_eq!(bodies.len(), 11);
+        for number in 1..=11 {
+            assert_eq!(bodies[&number].id, format!("PR_{number}"));
+            assert_eq!(bodies[&number].body, format!("body {number}"));
+        }
+        assert_eq!(fs::read_to_string(log_path).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn fetch_pr_issue_comment_bodies_graphql_reads_all_pages() {
+        let _lock = lock_cwd();
+        let repo = init_repo();
+        crate::test_support::git(
+            repo.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/spr-test.git",
+            ]
+            .as_slice(),
+        );
+        let _guard = DirGuard::change_to(repo.path());
+        let data_dir = tempfile::tempdir().unwrap();
+        let log_path = data_dir.path().join("gh.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *\"cursor=page-2\"*) echo '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"comments\":{{\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}},\"nodes\":[{{\"body\":\"second\"}}]}}}}}}}}}}' ;;\n  *) echo '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"comments\":{{\"pageInfo\":{{\"hasNextPage\":true,\"endCursor\":\"page-2\"}},\"nodes\":[{{\"body\":\"first\"}}]}}}}}}}}}}' ;;\nesac\n",
+            log_path.display()
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+
+        let bodies = fetch_pr_issue_comment_bodies_graphql(17).unwrap();
+
+        assert_eq!(bodies, vec!["first", "second"]);
+        assert_eq!(fs::read_to_string(log_path).unwrap().lines().count(), 2);
     }
 
     #[test]

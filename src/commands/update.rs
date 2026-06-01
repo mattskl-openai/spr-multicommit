@@ -13,7 +13,7 @@ use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
 use crate::execution::ExecutionMode;
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
-    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape,
+    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, is_resource_limit_error,
     list_recent_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
 };
 use crate::limit::{apply_limit_groups, Limit};
@@ -280,12 +280,6 @@ fn should_use_single_update_mutation(
     prefer_single
         && update_inputs.len() <= max_ops
         && mutation_len_for_inputs(update_inputs) <= max_chars
-}
-
-fn is_resource_limit_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("RESOURCE_LIMITS_EXCEEDED")
-        || msg.contains("Resource limits for this query exceeded")
 }
 
 fn run_update_chunk(execution_mode: ExecutionMode, update_inputs: &[String]) -> Result<()> {
