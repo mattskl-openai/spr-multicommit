@@ -34,39 +34,24 @@ mod summary_output;
 mod test_support;
 mod update_output;
 
-fn resolve_update_pr_limit(
+fn resolve_update_until_limit(
     groups: &[crate::parsing::Group],
-    to: Option<crate::selectors::GroupSelector>,
-    n: Option<usize>,
-    legacy_n: Option<usize>,
-) -> Result<crate::limit::Limit> {
-    let provided_limit_count =
-        usize::from(to.is_some()) + usize::from(n.is_some()) + usize::from(legacy_n.is_some());
-    if provided_limit_count > 1 {
-        Err(anyhow::anyhow!(
-            "`spr update pr` accepts only one limit selector: `--to <N|label|pr:<label>>`, `--n <N>`, or the positional `N`."
-        ))
-    } else if let Some(to) = to {
-        let count = crate::selectors::resolve_group_ordinal(groups, &to)?;
-        Ok(crate::limit::Limit::ByPr(count))
-    } else if let Some(n) = n {
-        if n == 0 {
-            Err(anyhow::anyhow!("`spr update pr --n` must be 1 or greater."))
-        } else {
-            Ok(crate::limit::Limit::ByPr(n))
+    until: Option<&crate::selectors::InclusiveSelector>,
+) -> Result<(
+    Option<crate::limit::Limit>,
+    crate::update_output::ResolvedUpdateLimit,
+)> {
+    match until {
+        None | Some(crate::selectors::InclusiveSelector::All) => {
+            Ok((None, crate::update_output::ResolvedUpdateLimit::All))
         }
-    } else if let Some(n) = legacy_n {
-        if n == 0 {
-            Err(anyhow::anyhow!(
-                "`spr update pr` positional limit must be 1 or greater."
+        Some(selector) => {
+            let count = crate::selectors::resolve_inclusive_count(groups, selector)?;
+            Ok((
+                Some(crate::limit::Limit::ByPr(count)),
+                crate::update_output::ResolvedUpdateLimit::ByPr { count },
             ))
-        } else {
-            Ok(crate::limit::Limit::ByPr(n))
         }
-    } else {
-        Err(anyhow::anyhow!(
-            "`spr update pr` requires either `--to <N|label|pr:<label>>` or `--n <N>`."
-        ))
     }
 }
 
@@ -463,7 +448,6 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             pr_description_mode: pr_description_mode_override,
             allow_branch_reuse,
             dry_run,
-            extent,
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
             set_dry_run_env(execution_mode, assume_existing_prs);
@@ -485,20 +469,8 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 let (groups, skipped_handles) =
                     crate::parsing::split_groups_for_update(&leading_ignored, all_groups);
                 crate::branch_names::group_branch_identities(&groups, &prefix)?;
-                let (limit, resolved_extent) = if let Some(extent) = extent {
-                    match extent {
-                        crate::cli::Extent::Pr { to, n, legacy_n } => {
-                            let limit = resolve_update_pr_limit(&groups, to, n, legacy_n)?;
-                            let crate::limit::Limit::ByPr(count) = limit;
-                            (
-                                Some(limit),
-                                crate::update_output::ResolvedUpdateLimit::ByPr { count },
-                            )
-                        }
-                    }
-                } else {
-                    (None, crate::update_output::ResolvedUpdateLimit::All)
-                };
+                let (limit, resolved_extent) =
+                    resolve_update_until_limit(&groups, cli.until.as_ref())?;
                 if output_format == crate::cli::OutputFormat::Json {
                     let execution = crate::commands::build_from_groups_with_summary(
                         &base,
@@ -1257,8 +1229,8 @@ fn json_command_for_cli(cmd: &crate::cli::Cmd) -> crate::json_output::JsonComman
 mod tests {
     use super::{
         apply_working_directory_override, command_requires_gh, ensure_rewrite_completed,
-        json_command_for_raw_args, parse_failure_as_json_output, resolve_update_pr_limit, run_cli,
-        CommandOutput,
+        json_command_for_raw_args, parse_failure_as_json_output, resolve_update_until_limit,
+        run_cli, CommandOutput,
     };
     use crate::cli::{DryRunArgs, OutputFormat};
     use crate::json_output::{ErrorPayload, JsonCommand, JsonError, EXIT_FAILURE};
@@ -1267,7 +1239,7 @@ mod tests {
     };
     use crate::parsing::{derive_local_groups_with_ignored, Group};
     use crate::read_only_output::ReadOnlyPayload;
-    use crate::selectors::{ExplicitGroupSelector, GroupSelector};
+    use crate::selectors::{ExplicitGroupSelector, GroupSelector, InclusiveSelector};
     use crate::test_support::{
         commit_file, git, init_case_conflicting_stack_repo, init_repo as init_stack_repo, lock_cwd,
         write_file, DirGuard,
@@ -1373,38 +1345,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_update_pr_limit_rejects_conflicting_selectors() {
+    fn resolve_update_until_limit_preserves_full_prefix() {
         let groups = vec![group("alpha")];
-        let result = resolve_update_pr_limit(
-            &groups,
-            Some(GroupSelector::Explicit(ExplicitGroupSelector::PrLabel(
-                "alpha".to_string(),
-            ))),
-            Some(1),
-            None,
-        );
-        let err = match result {
-            Ok(_) => panic!("expected conflicting selector inputs to fail"),
-            Err(err) => err,
-        };
+        let all = InclusiveSelector::All;
 
-        assert!(
-            err.to_string().contains("accepts only one limit selector"),
-            "unexpected error: {err}"
-        );
+        for until in [None, Some(&all)] {
+            let (limit, resolved_extent) =
+                resolve_update_until_limit(&groups, until).expect("full prefix should resolve");
+
+            assert!(limit.is_none());
+            assert_eq!(resolved_extent, ResolvedUpdateLimit::All);
+        }
     }
 
     #[test]
-    fn resolve_update_pr_limit_rejects_local_only_group_selector() {
+    fn resolve_update_until_limit_rejects_local_only_group_selector() {
         let groups = vec![group("alpha")];
-        let result = resolve_update_pr_limit(
-            &groups,
-            Some(GroupSelector::Explicit(ExplicitGroupSelector::PrLabel(
-                "beta".to_string(),
-            ))),
-            None,
-            None,
-        );
+        let selector = InclusiveSelector::Group(GroupSelector::Explicit(
+            ExplicitGroupSelector::PrLabel("beta".to_string()),
+        ));
+        let result = resolve_update_until_limit(&groups, Some(&selector));
         let err = match result {
             Ok(_) => panic!("expected local-only selector to fail"),
             Err(err) => err,
@@ -1471,7 +1431,6 @@ mod tests {
             pr_description_mode: None,
             allow_branch_reuse: false,
             dry_run: DryRunArgs::default(),
-            extent: None,
         }));
     }
 
@@ -1485,7 +1444,6 @@ mod tests {
             pr_description_mode: None,
             allow_branch_reuse: false,
             dry_run: DryRunArgs::default(),
-            extent: None,
         }));
     }
 
@@ -3604,7 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn update_json_pr_selector_reports_resolved_pr_extent() {
+    fn update_json_until_selector_reports_resolved_pr_extent() {
         let _lock = lock_cwd();
         let dir = init_update_stack_repo();
         let repo = dir.path().join("repo");
@@ -3623,9 +3581,8 @@ mod tests {
             "--dry-run",
             "--json",
             "--no-pr",
-            "pr",
-            "--to",
-            "beta",
+            "--until",
+            "pr:beta",
         ])
         .unwrap();
 
@@ -3641,7 +3598,7 @@ mod tests {
     }
 
     #[test]
-    fn update_json_legacy_pr_limit_reports_resolved_pr_extent() {
+    fn update_json_until_zero_reports_full_extent() {
         let _lock = lock_cwd();
         let dir = init_update_stack_repo();
         let repo = dir.path().join("repo");
@@ -3660,8 +3617,8 @@ mod tests {
             "--dry-run",
             "--json",
             "--no-pr",
-            "pr",
-            "1",
+            "--until",
+            "0",
         ])
         .unwrap();
 
@@ -3669,9 +3626,10 @@ mod tests {
 
         match output {
             CommandOutput::Update(output) => {
-                assert_eq!(output.data.extent, ResolvedUpdateLimit::ByPr { count: 1 });
-                assert_eq!(output.data.groups.len(), 1);
+                assert_eq!(output.data.extent, ResolvedUpdateLimit::All);
+                assert_eq!(output.data.groups.len(), 2);
                 assert_eq!(output.data.groups[0].stable_handle, "pr:alpha");
+                assert_eq!(output.data.groups[1].stable_handle, "pr:beta");
             }
             other => panic!("unexpected command output: {:?}", other),
         }

@@ -3,22 +3,6 @@ use std::path::PathBuf;
 
 use crate::execution::ExecutionMode;
 
-#[derive(Subcommand, Debug, Clone)]
-pub enum Extent {
-    /// Update the first N PRs (bottom-up)
-    Pr {
-        /// Limit updates through this local PR number or group selector
-        #[arg(long, value_name = "N|name|pr:<label>|branch:<branch-name>", conflicts_with_all = ["n", "legacy_n"])]
-        to: Option<crate::selectors::GroupSelector>,
-        /// Legacy numeric-only limit
-        #[arg(long, value_name = "N", conflicts_with_all = ["to", "legacy_n"])]
-        n: Option<usize>,
-        /// Backward-compatible positional numeric limit
-        #[arg(value_name = "N", hide = true, conflicts_with_all = ["to", "n"])]
-        legacy_n: Option<usize>,
-    },
-}
-
 #[derive(Clone, Debug)]
 pub enum PrepSelection {
     Until(crate::selectors::InclusiveSelector),
@@ -112,10 +96,6 @@ pub enum Cmd {
 
         #[command(flatten)]
         dry_run: DryRunArgs,
-
-        /// Limit how much to update (optional sub-mode)
-        #[command(subcommand)]
-        extent: Option<Extent>,
     },
 
     /// Restack PRs by rebasing the top commits after the bottom N PR groups onto the latest base
@@ -329,7 +309,7 @@ pub struct Cli {
     /// Sync local per-PR branches named like each group's resolved concrete branch
     #[arg(long, global = true, value_enum)]
     pub local_pr_branches: Option<crate::config::LocalPrBranchSyncPolicy>,
-    /// Global until (used by prep/land). Accepts 0, a local PR number, or a group selector
+    /// Global until (used by update/prep/land). Accepts 0, a local PR number, or a group selector
     #[arg(
         long,
         global = true,
@@ -375,9 +355,67 @@ mod tests {
     fn update_commit_extent_is_rejected() {
         let err = Cli::try_parse_from(["spr", "update", "commits", "2"]).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("unrecognized subcommand 'commits'"));
+        assert!(err.to_string().contains("unexpected argument 'commits'"));
+    }
+
+    #[test]
+    fn update_pr_extent_forms_are_rejected() {
+        for args in [
+            &["spr", "u", "pr", "--to", "2"][..],
+            &["spr", "u", "pr", "--n", "2"][..],
+            &["spr", "u", "pr", "2"][..],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+
+            assert!(
+                err.to_string().contains("unexpected argument 'pr'"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_until_selectors_parse() {
+        let cases = [
+            (
+                "2",
+                crate::selectors::InclusiveSelector::Group(
+                    crate::selectors::GroupSelector::LocalPr(2),
+                ),
+            ),
+            ("0", crate::selectors::InclusiveSelector::All),
+            (
+                "beta",
+                crate::selectors::InclusiveSelector::Group(crate::selectors::GroupSelector::Bare(
+                    "beta".to_string(),
+                )),
+            ),
+            (
+                "pr:beta",
+                crate::selectors::InclusiveSelector::Group(
+                    crate::selectors::GroupSelector::Explicit(
+                        crate::selectors::ExplicitGroupSelector::PrLabel("beta".to_string()),
+                    ),
+                ),
+            ),
+            (
+                "branch:feature/login",
+                crate::selectors::InclusiveSelector::Group(
+                    crate::selectors::GroupSelector::Explicit(
+                        crate::selectors::ExplicitGroupSelector::BranchName(
+                            "feature/login".to_string(),
+                        ),
+                    ),
+                ),
+            ),
+        ];
+
+        for (selector, expected) in cases {
+            let cli = Cli::try_parse_from(["spr", "u", "--until", selector]).unwrap();
+
+            assert_eq!(cli.until, Some(expected));
+            assert!(matches!(cli.cmd, Cmd::Update { .. }));
+        }
     }
 
     #[test]
@@ -646,19 +684,17 @@ mod tests {
     }
 
     #[test]
-    fn update_json_flag_parses_with_extent_subcommand() {
-        let cli = Cli::try_parse_from(["spr", "update", "--json", "pr", "1"]).unwrap();
+    fn update_json_flag_parses_with_until() {
+        let cli = Cli::try_parse_from(["spr", "update", "--json", "--until", "1"]).unwrap();
 
-        match cli.cmd {
-            Cmd::Update {
-                extent: Some(super::Extent::Pr { legacy_n, .. }),
-                ..
-            } => {
-                assert_eq!(cli.output.format(), OutputFormat::Json);
-                assert_eq!(legacy_n, Some(1));
-            }
-            other => panic!("unexpected command: {:?}", other),
-        }
+        assert!(matches!(cli.cmd, Cmd::Update { .. }));
+        assert_eq!(cli.output.format(), OutputFormat::Json);
+        assert_eq!(
+            cli.until,
+            Some(crate::selectors::InclusiveSelector::Group(
+                crate::selectors::GroupSelector::LocalPr(1)
+            ))
+        );
     }
 
     #[test]
