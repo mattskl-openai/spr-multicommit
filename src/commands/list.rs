@@ -191,7 +191,6 @@ struct PrSummaryLine<'a> {
     local_pr_num: usize,
     stable_handle: &'a str,
     short: &'a str,
-    head_branch: &'a str,
     pr_number: Option<u64>,
     count: usize,
 }
@@ -204,13 +203,12 @@ fn format_pr_summary_line(line: PrSummaryLine<'_>) -> String {
     };
     let plural = if line.count == 1 { "commit" } else { "commits" };
     format!(
-        "{}{} LPR #{} / {} - {} : {}{} - {} {}",
+        "{}{} LPR #{} / {} - {}{} - {} {}",
         line.ci_icon,
         line.rv_icon,
         line.local_pr_num,
         line.stable_handle,
         line.short,
-        line.head_branch,
         remote_pr_num,
         line.count,
         plural
@@ -221,14 +219,13 @@ fn format_commit_group_header(
     local_pr_num: usize,
     stable_handle: &str,
     pr_number: Option<u64>,
-    head_branch: &str,
 ) -> String {
     let remote_pr_num = if let Some(pr_number) = pr_number {
         format!(" (#{pr_number})")
     } else {
         String::new()
     };
-    format!("===== Local PR #{local_pr_num} / {stable_handle}{remote_pr_num} : {head_branch} =====")
+    format!("===== Local PR #{local_pr_num} / {stable_handle}{remote_pr_num} =====")
 }
 
 fn derive_groups_and_identities(
@@ -460,7 +457,6 @@ fn render_pr_list(data: &PrListData, list_order: ListOrder) -> Vec<String> {
                 local_pr_num: group.local_pr_number,
                 stable_handle: &group.stable_handle,
                 short: short_sha(&group.first_commit_sha),
-                head_branch: &group.head_branch,
                 pr_number,
                 count: group.commit_count,
             }));
@@ -498,7 +494,6 @@ fn render_commit_list(data: &CommitListData, list_order: ListOrder) -> Vec<Strin
                 group.local_pr_number,
                 &group.stable_handle,
                 remote_pr_number,
-                &group.head_branch,
             ));
             let commit_iter: Box<dyn Iterator<Item = &CommitEntryData>> =
                 if list_order == ListOrder::RecentOnTop {
@@ -656,26 +651,44 @@ mod tests {
             local_pr_num: 2,
             stable_handle: "pr:beta",
             short: "abcdef12",
-            head_branch: "dank-spr/beta",
             pr_number: Some(17),
             count: 3,
         });
 
-        assert_eq!(
-            line,
-            "✓✓ LPR #2 / pr:beta - abcdef12 : dank-spr/beta (#17) - 3 commits"
-        );
+        assert_eq!(line, "✓✓ LPR #2 / pr:beta - abcdef12 (#17) - 3 commits");
     }
 
     #[test]
     fn commit_group_header_includes_stable_handle_for_any_display_order() {
         assert_eq!(
-            format_commit_group_header(2, "pr:beta", Some(17), "dank-spr/beta"),
-            "===== Local PR #2 / pr:beta (#17) : dank-spr/beta ====="
+            format_commit_group_header(2, "pr:beta", Some(17)),
+            "===== Local PR #2 / pr:beta (#17) ====="
         );
         assert_eq!(
-            format_commit_group_header(2, "pr:beta", None, "dank-spr/beta"),
-            "===== Local PR #2 / pr:beta : dank-spr/beta ====="
+            format_commit_group_header(2, "pr:beta", None),
+            "===== Local PR #2 / pr:beta ====="
+        );
+    }
+
+    #[test]
+    fn human_formatters_keep_explicit_branch_selector_without_duplicate_head() {
+        let line = format_pr_summary_line(PrSummaryLine {
+            ci_icon: "?",
+            rv_icon: "?",
+            local_pr_num: 1,
+            stable_handle: "branch:feature/login",
+            short: "abcdef12",
+            pr_number: None,
+            count: 1,
+        });
+
+        assert_eq!(
+            line,
+            "?? LPR #1 / branch:feature/login - abcdef12 - 1 commit"
+        );
+        assert_eq!(
+            format_commit_group_header(1, "branch:feature/login", None),
+            "===== Local PR #1 / branch:feature/login ====="
         );
     }
 
@@ -883,18 +896,12 @@ mod tests {
 
         let lines = render_pr_list(&data, ListOrder::RecentOnTop);
 
-        assert_eq!(
-            lines[2],
-            "?? LPR #2 / pr:beta - bbbbbbbb : dank-spr/beta - 1 commit"
-        );
+        assert_eq!(lines[2], "?? LPR #2 / pr:beta - bbbbbbbb - 1 commit");
         assert_eq!(
             lines[3],
             format!("{s}{s}{s}{s}{s}feat: beta", s = crate::format::EM_SPACE)
         );
-        assert_eq!(
-            lines[4],
-            "?? LPR #1 / pr:alpha - aaaaaaaa : dank-spr/alpha - 1 commit"
-        );
+        assert_eq!(lines[4], "?? LPR #1 / pr:alpha - aaaaaaaa - 1 commit");
     }
 
     #[test]
@@ -940,15 +947,9 @@ mod tests {
 
         let lines = render_commit_list(&data, ListOrder::RecentOnTop);
 
-        assert_eq!(
-            lines[0],
-            "===== Local PR #2 / pr:beta : dank-spr/beta ====="
-        );
+        assert_eq!(lines[0], "===== Local PR #2 / pr:beta =====");
         assert_eq!(lines[1], "   3  bbbbbbbb - feat: beta one");
-        assert_eq!(
-            lines[3],
-            "===== Local PR #1 / pr:alpha : dank-spr/alpha ====="
-        );
+        assert_eq!(lines[3], "===== Local PR #1 / pr:alpha =====");
         assert_eq!(lines[4], "   2  aaaaaaaa - feat: alpha two");
         assert_eq!(lines[5], "   1  aaaaaaaa - feat: alpha one");
     }

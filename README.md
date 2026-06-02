@@ -507,7 +507,7 @@ Operator rules:
 
 ### spr list pr
 
-Lists PRs in the current stack for the configured prefix. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers remain bottom → top, but the output now shows both the current `LPR #N` and each group's explicit selector.
+Lists PRs in the current stack for the configured prefix. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers remain bottom → top, and the human output shows both the current `LPR #N` and each group's explicit selector. The derived concrete head branch is omitted because it is redundant with the selector.
 
 Aliases:
 
@@ -522,7 +522,7 @@ Legend:
 Example summary line:
 
 ```text
-✓✓ LPR #2 / pr:beta - abcdef12 : dank-spr/beta (#17) - 3 commits
+✓✓ LPR #2 / pr:beta - abcdef12 (#17) - 3 commits
 ```
 
 Before listing, `spr list pr` validates that no two live PR groups derive
@@ -531,7 +531,8 @@ do, it halts before loading GitHub PR state.
 
 `spr list --json pr` emits one read-only JSON object instead of human-formatted lines.
 The payload always uses canonical bottom-up group order, includes remote PR metadata plus explicit
-CI/review state when available, and reports case-colliding concrete branch failures as a typed
+CI/review state when available, retains both `stable_handle` and `head_branch`, and reports
+case-colliding concrete branch failures as a typed
 `synthetic_branch_name_collision` error payload.
 
 ### spr status
@@ -550,7 +551,7 @@ top-level command identity as `status`.
 
 ### spr list commit
 
-Lists commits in the current stack, grouped by local PR. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers and commit indices remain bottom → top, and each group header also shows its explicit selector.
+Lists commits in the current stack, grouped by local PR. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers and commit indices remain bottom → top, and each human group header shows its explicit selector without repeating the derived concrete head branch.
 
 Before listing, `spr list commit` validates that no two live PR groups derive
 concrete branch names that collide under case-insensitive comparison. If they
@@ -558,7 +559,8 @@ do, it halts before loading GitHub PR state.
 
 `spr list --json commit` emits one read-only JSON object instead of human-formatted lines.
 The payload uses the same canonical bottom-up group order as `spr list --json pr`, keeps canonical
-global commit indices, and ignores `list_order` in JSON mode.
+global commit indices, retains both `stable_handle` and `head_branch`, and ignores `list_order` in
+JSON mode.
 
 Aliases:
 
