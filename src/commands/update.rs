@@ -13,14 +13,16 @@ use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
 use crate::execution::ExecutionMode;
 use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
 use crate::github::{
-    fetch_pr_bodies_graphql, get_repo_owner_name, graphql_escape, is_resource_limit_error,
-    list_recent_terminal_prs_for_heads, upsert_pr_cached, TerminalPrState,
+    convert_pull_requests_to_draft, fetch_pr_bodies_graphql, fetch_pr_stage_info_graphql,
+    get_repo_owner_name, graphql_escape, is_resource_limit_error,
+    list_recent_terminal_prs_for_heads, mark_pull_requests_ready_for_review, upsert_pr_cached,
+    PrStageInfo, TerminalPrState,
 };
 use crate::limit::{apply_limit_groups, Limit};
 use crate::parsing::Group;
 use crate::pr_base_chain::{
     build_desired_pr_base_chain, plan_base_reconciliation, verify_base_edits_converged,
-    BaseReconciliationAction, ObservedPrBaseChain,
+    BaseReconciliationAction, BaseReconciliationDecision, ObservedPrBaseChain,
 };
 use crate::update_output::{
     SkippedUpdateGroupData, UpdateEditAction, UpdateExecutionData, UpdateGroupData, UpdatePrAction,
@@ -208,6 +210,149 @@ struct PlannedPush {
     target_sha: String,
     remote_exists: bool,
     kind: PushKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DraftProtectedBaseTransition {
+    group_idx: usize,
+    remote_pr_number: u64,
+    head_branch: String,
+    target_head_sha: String,
+    current_base_ref: String,
+    desired_base_ref: String,
+}
+
+fn draft_protected_base_transitions(
+    base_reconciliation: &[BaseReconciliationDecision],
+    planned_pushes: &[PlannedPush],
+) -> Result<Vec<DraftProtectedBaseTransition>> {
+    base_reconciliation
+        .iter()
+        .filter(|decision| decision.action == BaseReconciliationAction::NeedsEdit)
+        .map(|decision| {
+            let planned_push = planned_pushes
+                .iter()
+                .find(|planned_push| planned_push.branch == decision.desired.head_branch)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Missing planned branch publication for {}",
+                        decision.desired.head_branch
+                    )
+                })?;
+            if planned_push.kind == PushKind::Skip {
+                Ok(None)
+            } else {
+                let current_base_ref = decision.current_base_ref.clone().ok_or_else(|| {
+                    anyhow!(
+                        "Missing current GitHub base ref for {}",
+                        decision.desired.head_branch
+                    )
+                })?;
+                Ok(decision
+                    .remote_pr_number
+                    .map(|remote_pr_number| DraftProtectedBaseTransition {
+                        group_idx: decision.desired.local_pr_number - 1,
+                        remote_pr_number,
+                        head_branch: decision.desired.head_branch.clone(),
+                        target_head_sha: planned_push.target_sha.clone(),
+                        current_base_ref: sanitize_gh_base_ref(&current_base_ref),
+                        desired_base_ref: decision.desired.expected_base_ref.clone(),
+                    }))
+            }
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|transitions| transitions.into_iter().flatten().collect())
+}
+
+fn base_ref_sha_after_branch_publication(
+    transition: &DraftProtectedBaseTransition,
+    planned_pushes: &[PlannedPush],
+    remote_map: &HashMap<String, String>,
+) -> Result<String> {
+    if let Some(planned_base_push) = planned_pushes
+        .iter()
+        .find(|planned_push| planned_push.branch == transition.current_base_ref)
+    {
+        Ok(planned_base_push.target_sha.clone())
+    } else {
+        remote_map
+            .get(&transition.current_base_ref)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Missing remote branch SHA for current GitHub base {} on PR #{} ({})",
+                    transition.current_base_ref,
+                    transition.remote_pr_number,
+                    transition.head_branch
+                )
+            })
+    }
+}
+
+fn ancestry_collapse_risk_transitions(
+    transitions: &[DraftProtectedBaseTransition],
+    planned_pushes: &[PlannedPush],
+    remote_map: &HashMap<String, String>,
+) -> Result<Vec<DraftProtectedBaseTransition>> {
+    transitions
+        .iter()
+        .map(|transition| {
+            let future_old_base_sha =
+                base_ref_sha_after_branch_publication(transition, planned_pushes, remote_map)?;
+            Ok(
+                git_is_ancestor(&transition.target_head_sha, &future_old_base_sha)?
+                    .then(|| transition.clone()),
+            )
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|transitions| transitions.into_iter().flatten().collect())
+}
+
+fn pr_stage_info_for_transition<'a>(
+    stage_info_by_number: &'a HashMap<u64, PrStageInfo>,
+    transition: &DraftProtectedBaseTransition,
+) -> Result<&'a PrStageInfo> {
+    stage_info_by_number
+        .get(&transition.remote_pr_number)
+        .ok_or_else(|| {
+            anyhow!(
+                "Missing GitHub draft-stage metadata for PR #{} ({})",
+                transition.remote_pr_number,
+                transition.head_branch
+            )
+        })
+}
+
+fn ready_pull_request_ids_requiring_temporary_draft(
+    transitions: &[DraftProtectedBaseTransition],
+    stage_info_by_number: &HashMap<u64, PrStageInfo>,
+) -> Result<Vec<String>> {
+    transitions
+        .iter()
+        .map(|transition| {
+            let stage_info = pr_stage_info_for_transition(stage_info_by_number, transition)?;
+            Ok((!stage_info.is_draft).then(|| stage_info.id.clone()))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|pull_request_ids| pull_request_ids.into_iter().flatten().collect())
+}
+
+fn draft_protected_base_update_inputs(
+    transitions: &[DraftProtectedBaseTransition],
+    stage_info_by_number: &HashMap<u64, PrStageInfo>,
+) -> Result<Vec<String>> {
+    transitions
+        .iter()
+        .map(|transition| {
+            let stage_info = pr_stage_info_for_transition(stage_info_by_number, transition)?;
+            let desired_base_ref = sanitize_gh_base_ref(&transition.desired_base_ref);
+            let fields = [
+                format!("pullRequestId:\"{}\"", stage_info.id),
+                format!("baseRefName:\"{}\"", graphql_escape(&desired_base_ref)),
+            ];
+            Ok(fields.join(", "))
+        })
+        .collect()
 }
 
 impl UpdatePushAction {
@@ -482,10 +627,24 @@ fn build_from_groups_internal(
         &prs_by_head,
     )?;
 
+    let initial_base_reconciliation = if no_pr {
+        Vec::new()
+    } else {
+        plan_base_reconciliation(&desired_chain, &observed_pr_bases)
+    };
     let mut branch_names = heads.clone();
     let base_ref_for_remote = sanitize_gh_base_ref(base);
     if !branch_names.contains(&base_ref_for_remote) {
         branch_names.push(base_ref_for_remote);
+    }
+    for current_base_ref in initial_base_reconciliation
+        .iter()
+        .filter_map(|decision| decision.current_base_ref.as_deref())
+        .map(sanitize_gh_base_ref)
+    {
+        if !branch_names.contains(&current_base_ref) {
+            branch_names.push(current_base_ref);
+        }
     }
     let remote_map = get_remote_branches_sha(&branch_names)?;
 
@@ -527,6 +686,66 @@ fn build_from_groups_internal(
             kind,
         });
     }
+
+    let draft_protected_transitions = if no_pr {
+        Vec::new()
+    } else {
+        draft_protected_base_transitions(&initial_base_reconciliation, &planned)?
+    };
+    let prepublish_base_transitions =
+        ancestry_collapse_risk_transitions(&draft_protected_transitions, &planned, &remote_map)?;
+    let ancestry_collapse_risk_pr_numbers = prepublish_base_transitions
+        .iter()
+        .map(|transition| transition.remote_pr_number)
+        .collect::<HashSet<_>>();
+    let ancestry_collapse_risk_head_branches = prepublish_base_transitions
+        .iter()
+        .map(|transition| transition.head_branch.clone())
+        .collect::<Vec<_>>();
+    let draft_protected_head_branches = draft_protected_transitions
+        .iter()
+        .map(|transition| transition.head_branch.clone())
+        .collect::<Vec<_>>();
+    let temporarily_drafted_pull_request_ids = if draft_protected_transitions.is_empty() {
+        Vec::new()
+    } else {
+        let protected_pr_numbers = draft_protected_transitions
+            .iter()
+            .map(|transition| transition.remote_pr_number)
+            .collect::<Vec<_>>();
+        let stage_info_by_number = fetch_pr_stage_info_graphql(&protected_pr_numbers)?;
+        let ready_pull_request_ids = ready_pull_request_ids_requiring_temporary_draft(
+            &draft_protected_transitions,
+            &stage_info_by_number,
+        )?;
+        info!(
+            "Guarding {} PR base/head transition(s) before branch publication",
+            draft_protected_transitions.len()
+        );
+        convert_pull_requests_to_draft(&ready_pull_request_ids, execution_mode)?;
+        let protected_base_updates = draft_protected_base_update_inputs(
+            &prepublish_base_transitions,
+            &stage_info_by_number,
+        )?;
+        run_update_mutations(
+            execution_mode,
+            protected_base_updates,
+            "Protecting PR bases before branch publication",
+            MAX_BASE_UPDATES_PER_MUTATION,
+            MAX_BASE_MUTATION_CHARS,
+            true,
+            render_progress,
+        )?;
+        if execution_mode == ExecutionMode::Apply {
+            let refreshed_pr_bases = ObservedPrBaseChain::observe_for_heads(&heads)?;
+            let refreshed_decisions = plan_base_reconciliation(&desired_chain, &refreshed_pr_bases);
+            verify_base_edits_converged(
+                &ancestry_collapse_risk_head_branches,
+                &refreshed_decisions,
+            )?;
+        }
+        ready_pull_request_ids
+    };
 
     let ff_refspecs: Vec<String> = planned
         .iter()
@@ -620,6 +839,9 @@ fn build_from_groups_internal(
         };
         groups.len()
     ];
+    for transition in &draft_protected_transitions {
+        base_actions_by_group[transition.group_idx] = UpdateEditAction::Updated;
+    }
     let mut description_actions_by_group: Vec<UpdateEditAction> = vec![
         if no_pr {
             UpdateEditAction::NotRequested
@@ -761,6 +983,7 @@ fn build_from_groups_internal(
                     .then_some(decision.remote_pr_number)
                     .flatten()
             })
+            .filter(|number| !ancestry_collapse_risk_pr_numbers.contains(number))
             .collect::<HashSet<_>>();
         for (&number, want_base) in &desired_base_by_number {
             if let Some(info) = bodies_by_number.get(&number) {
@@ -814,6 +1037,12 @@ fn build_from_groups_internal(
         } else {
             info!("All PR descriptions/base refs up-to-date; no edits needed");
         }
+        if !draft_protected_head_branches.is_empty() && execution_mode == ExecutionMode::Apply {
+            let refreshed_pr_bases = ObservedPrBaseChain::observe_for_heads(&heads)?;
+            let refreshed_decisions = plan_base_reconciliation(&desired_chain, &refreshed_pr_bases);
+            verify_base_edits_converged(&draft_protected_head_branches, &refreshed_decisions)?;
+        }
+        mark_pull_requests_ready_for_review(&temporarily_drafted_pull_request_ids, execution_mode)?;
     }
 
     if !no_pr {
@@ -995,17 +1224,24 @@ pub fn build_from_tags(
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_reuse_guard_window, build_from_groups, build_from_tags, head_key,
-        heads_without_open_prs, ignored_boundary_warning, parse_github_timestamp_rfc3339,
-        pr_number_for_head, recent_pr_age, recent_pr_age_blocks_recreation,
-        should_use_single_update_mutation, terminal_pr_action,
+        ancestry_collapse_risk_transitions, branch_reuse_guard_window, build_from_groups,
+        build_from_tags, draft_protected_base_transitions, head_key, heads_without_open_prs,
+        ignored_boundary_warning, parse_github_timestamp_rfc3339, pr_number_for_head,
+        ready_pull_request_ids_requiring_temporary_draft, recent_pr_age,
+        recent_pr_age_blocks_recreation, should_use_single_update_mutation, terminal_pr_action,
+        DraftProtectedBaseTransition, PlannedPush, PushKind,
     };
     use crate::branch_names::group_branch_identities;
     use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
     use crate::execution::ExecutionMode;
-    use crate::github::TerminalPrState;
+    use crate::github::{PrStageInfo, TerminalPrState};
     use crate::parsing::{split_groups_for_update, Group};
-    use crate::test_support::{init_case_conflicting_stack_repo, lock_cwd, DirGuard};
+    use crate::pr_base_chain::{
+        BaseReconciliationAction, BaseReconciliationDecision, DesiredPrBase,
+    };
+    use crate::test_support::{
+        commit_file, init_case_conflicting_stack_repo, init_repo, lock_cwd, DirGuard,
+    };
     use std::collections::HashMap;
     use time::{Duration as TimeDuration, OffsetDateTime};
 
@@ -1105,6 +1341,171 @@ mod tests {
     fn terminal_pr_action_describes_terminal_state() {
         assert_eq!(terminal_pr_action(TerminalPrState::Merged), "merged");
         assert_eq!(terminal_pr_action(TerminalPrState::Closed), "closed");
+    }
+
+    fn desired_base(head_branch: &str) -> DesiredPrBase {
+        DesiredPrBase {
+            local_pr_number: 1,
+            stable_handle: "pr:gamma".to_string(),
+            head_branch: head_branch.to_string(),
+            expected_base_ref: "main".to_string(),
+        }
+    }
+
+    fn planned_push(head_branch: &str, kind: PushKind) -> PlannedPush {
+        PlannedPush {
+            branch: head_branch.to_string(),
+            target_sha: "next".to_string(),
+            remote_exists: true,
+            kind,
+        }
+    }
+
+    #[test]
+    fn draft_protection_detects_base_retarget_plus_head_move() {
+        let head_branch = "dank-spr/gamma";
+        let decisions = vec![BaseReconciliationDecision {
+            desired: desired_base(head_branch),
+            current_base_ref: Some("dank-spr/beta".to_string()),
+            remote_pr_number: Some(3),
+            action: BaseReconciliationAction::NeedsEdit,
+        }];
+
+        let transitions = draft_protected_base_transitions(
+            &decisions,
+            &[planned_push(head_branch, PushKind::Force)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            transitions,
+            vec![DraftProtectedBaseTransition {
+                group_idx: 0,
+                remote_pr_number: 3,
+                head_branch: head_branch.to_string(),
+                target_head_sha: "next".to_string(),
+                current_base_ref: "dank-spr/beta".to_string(),
+                desired_base_ref: "main".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn draft_protection_ignores_base_retargets_without_head_moves() {
+        let head_branch = "dank-spr/gamma";
+        let decisions = vec![BaseReconciliationDecision {
+            desired: desired_base(head_branch),
+            current_base_ref: Some("dank-spr/beta".to_string()),
+            remote_pr_number: Some(3),
+            action: BaseReconciliationAction::NeedsEdit,
+        }];
+
+        let transitions = draft_protected_base_transitions(
+            &decisions,
+            &[planned_push(head_branch, PushKind::Skip)],
+        )
+        .unwrap();
+
+        assert!(transitions.is_empty());
+    }
+
+    #[test]
+    fn ready_pull_request_ids_only_restore_prs_that_spr_temporarily_drafts() {
+        let transitions = vec![
+            DraftProtectedBaseTransition {
+                group_idx: 0,
+                remote_pr_number: 3,
+                head_branch: "dank-spr/gamma".to_string(),
+                target_head_sha: "gamma-next".to_string(),
+                current_base_ref: "dank-spr/beta".to_string(),
+                desired_base_ref: "main".to_string(),
+            },
+            DraftProtectedBaseTransition {
+                group_idx: 1,
+                remote_pr_number: 4,
+                head_branch: "dank-spr/delta".to_string(),
+                target_head_sha: "delta-next".to_string(),
+                current_base_ref: "dank-spr/gamma".to_string(),
+                desired_base_ref: "dank-spr/gamma".to_string(),
+            },
+        ];
+        let stage_info_by_number = HashMap::from([
+            (
+                3,
+                PrStageInfo {
+                    id: "ready-pr".to_string(),
+                    is_draft: false,
+                },
+            ),
+            (
+                4,
+                PrStageInfo {
+                    id: "already-draft-pr".to_string(),
+                    is_draft: true,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            ready_pull_request_ids_requiring_temporary_draft(&transitions, &stage_info_by_number)
+                .unwrap(),
+            vec!["ready-pr".to_string()]
+        );
+    }
+
+    #[test]
+    fn ancestry_collapse_risk_tracks_the_old_base_branch_after_publication() {
+        let _lock = lock_cwd();
+        let dir = init_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+        let target_head_sha = commit_file(&repo, "gamma.txt", "gamma\n", "feat: gamma pr:gamma");
+        let future_old_base_sha = commit_file(&repo, "beta.txt", "beta\n", "feat: beta pr:beta");
+        let transitions = vec![DraftProtectedBaseTransition {
+            group_idx: 0,
+            remote_pr_number: 3,
+            head_branch: "dank-spr/gamma".to_string(),
+            target_head_sha: target_head_sha.clone(),
+            current_base_ref: "dank-spr/beta".to_string(),
+            desired_base_ref: "main".to_string(),
+        }];
+        let planned_pushes = vec![PlannedPush {
+            branch: "dank-spr/beta".to_string(),
+            target_sha: future_old_base_sha,
+            remote_exists: true,
+            kind: PushKind::Force,
+        }];
+
+        assert_eq!(
+            ancestry_collapse_risk_transitions(&transitions, &planned_pushes, &HashMap::new())
+                .unwrap(),
+            transitions
+        );
+    }
+
+    #[test]
+    fn ancestry_collapse_risk_rejects_unavailable_old_base_objects() {
+        let _lock = lock_cwd();
+        let dir = init_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+        let target_head_sha = commit_file(&repo, "gamma.txt", "gamma\n", "feat: gamma pr:gamma");
+        let transitions = vec![DraftProtectedBaseTransition {
+            group_idx: 0,
+            remote_pr_number: 3,
+            head_branch: "dank-spr/gamma".to_string(),
+            target_head_sha,
+            current_base_ref: "main".to_string(),
+            desired_base_ref: "dank-spr/alpha".to_string(),
+        }];
+        let remote_map = HashMap::from([(
+            "main".to_string(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+        )]);
+
+        let error = ancestry_collapse_risk_transitions(&transitions, &[], &remote_map).unwrap_err();
+
+        assert!(error.to_string().contains("git merge-base --is-ancestor"));
     }
 
     fn group(tag: &str) -> Group {
