@@ -45,6 +45,10 @@ spr update
 spr list pr
 spr list commit
 
+# Inspect only local Git history, without invoking GitHub
+spr ls p --local
+spr ls c -l
+
 # Discover which stack branch owns a canonical PR branch
 spr resolve-stack dank-spr/alpha
 
@@ -509,6 +513,21 @@ Operator rules:
 
 Lists PRs in the current stack for the configured prefix. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers remain bottom → top, and the human output shows both the current `LPR #N` and each group's explicit selector. The derived concrete head branch is omitted because it is redundant with the selector.
 
+The default mode performs one batched exact-head GitHub GraphQL request for up
+to 20 groups. It loads open PR identity, merged fallback identity, CI, and
+review state together. Read-only listing does not perform the slower
+case-insensitive remote branch audit; update, land, branch reuse, and other
+mutating paths retain that exhaustive safety check. If the rich status query
+is unavailable, listing retries identity-only and displays unknown status.
+
+Use `spr list pr --local` (or `spr ls p -l`) for a strictly local view. Local
+mode does not invoke `gh`, even for an availability check, and therefore omits
+the status legend, status icons, GitHub PR numbers, and open/merged state:
+
+```text
+LPR #3 / pr:updateUntil - fc01086e - 1 commit
+```
+
 Aliases:
 
 - `p`
@@ -534,6 +553,9 @@ The payload always uses canonical bottom-up group order, includes remote PR meta
 CI/review state when available, retains both `stable_handle` and `head_branch`, and reports
 case-colliding concrete branch failures as a typed
 `synthetic_branch_name_collision` error payload.
+With `--local`, each group reports `remote.kind` as `not_queried`. This differs
+from `no_remote`, which means GitHub was queried and no exact matching PR was
+found.
 
 ### spr status
 
@@ -542,6 +564,8 @@ Aliases:
 - `stat`
 
 Alias for `spr list pr`.
+
+`spr status --local` and `spr stat -l` use the same zero-network local mode.
 
 `spr status` runs the same early concrete branch-collision validation as
 `spr list pr` before printing anything.
@@ -553,6 +577,12 @@ top-level command identity as `status`.
 
 Lists commits in the current stack, grouped by local PR. Display order is controlled by `list_order` (default `recent_on_bottom`); local PR numbers and commit indices remain bottom → top, and each human group header shows its explicit selector without repeating the derived concrete head branch.
 
+The default mode makes one lightweight exact-open-head GitHub query for up to
+20 groups. It fetches only the PR identity and number needed by commit group
+headers; it does not request merged history, CI, or review state. Use
+`spr list commit --local` (or `spr ls c -l`) to skip GitHub entirely. Local
+commit formatting is unchanged except that GitHub PR numbers are unavailable.
+
 Before listing, `spr list commit` validates that no two live PR groups derive
 concrete branch names that collide under case-insensitive comparison. If they
 do, it halts before loading GitHub PR state.
@@ -561,10 +591,16 @@ do, it halts before loading GitHub PR state.
 The payload uses the same canonical bottom-up group order as `spr list --json pr`, keeps canonical
 global commit indices, retains both `stable_handle` and `head_branch`, and ignores `list_order` in
 JSON mode.
+With `--local`, remote state is `not_queried` for every group.
 
 Aliases:
 
 - `c`
+
+As a rough benchmark guide, the prior serialized remote path took about
+1.6–3 seconds in a representative stack. The batched remote path is expected
+to take roughly 0.6–0.9 seconds, while local mode is expected to take roughly
+0.1–0.4 seconds. These are operational estimates, not timing guarantees.
 
 ### spr move
 

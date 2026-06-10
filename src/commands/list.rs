@@ -19,9 +19,11 @@ use crate::branch_names::{
     CanonicalBranchConflictKey, GroupBranchIdentity, GroupBranchNameCollision,
 };
 use crate::config::{ListOrder, LocalPrBranchSyncPolicy};
+#[cfg(test)]
+use crate::github::PrInfoWithState;
 use crate::github::{
-    fetch_pr_ci_review_status, list_open_or_merged_prs_for_heads, PrCiReviewStatus, PrCiState,
-    PrInfoWithState, PrReviewDecision, PrState,
+    fetch_read_only_open_prs, fetch_read_only_pr_status, PrCiReviewStatus, PrCiState,
+    PrReviewDecision, PrState,
 };
 use crate::parsing::{derive_local_groups, Group};
 
@@ -57,6 +59,7 @@ pub struct RemotePrMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RemotePrState {
+    NotQueried,
     NoRemote,
     RemoteWithoutCiReview {
         pr_number: u64,
@@ -120,7 +123,7 @@ pub struct CommitListData {
 /// else would incorrectly imply CI/review information was fetched.
 fn status_icons(remote: &RemotePrMetadata) -> (&'static str, &'static str) {
     match &remote.state {
-        RemotePrState::NoRemote => ("?", "?"),
+        RemotePrState::NotQueried | RemotePrState::NoRemote => ("?", "?"),
         RemotePrState::RemoteWithoutCiReview {
             state: PrState::Merged,
             ..
@@ -215,6 +218,14 @@ fn format_pr_summary_line(line: PrSummaryLine<'_>) -> String {
     )
 }
 
+fn format_local_pr_summary_line(line: PrSummaryLine<'_>) -> String {
+    let plural = if line.count == 1 { "commit" } else { "commits" };
+    format!(
+        "LPR #{} / {} - {} - {} {}",
+        line.local_pr_num, line.stable_handle, line.short, line.count, plural
+    )
+}
+
 fn format_commit_group_header(
     local_pr_num: usize,
     stable_handle: &str,
@@ -251,21 +262,38 @@ fn fetch_remote_pr_metadata(
         .iter()
         .map(|identity| identity.exact.clone())
         .collect();
-    let prs = list_open_or_merged_prs_for_heads(&heads)?;
-    let open_numbers: Vec<u64> = prs
-        .iter()
-        .filter(|pr| pr.state == PrState::Open)
-        .map(|pr| pr.number)
-        .collect();
-    let status_map = if open_numbers.is_empty() {
-        Some(HashMap::new())
-    } else {
-        fetch_pr_ci_review_status(&open_numbers).ok()
-    };
-
-    Ok(build_remote_pr_metadata(prs, status_map.as_ref()))
+    let prs = fetch_read_only_pr_status(&heads)?;
+    Ok(prs
+        .into_values()
+        .map(|info| {
+            let pr = info.pr;
+            (
+                canonical_branch_conflict_key(&pr.head),
+                remote_pr_metadata(pr.number, pr.url, pr.base, pr.state, info.ci_review_status),
+            )
+        })
+        .collect())
 }
 
+fn fetch_open_remote_pr_metadata(
+    branch_identities: &[GroupBranchIdentity],
+) -> Result<HashMap<CanonicalBranchConflictKey, RemotePrMetadata>> {
+    let heads = branch_identities
+        .iter()
+        .map(|identity| identity.exact.clone())
+        .collect::<Vec<_>>();
+    Ok(fetch_read_only_open_prs(&heads)?
+        .into_values()
+        .map(|pr| {
+            (
+                canonical_branch_conflict_key(&pr.head),
+                remote_pr_metadata(pr.number, pr.url, pr.base, pr.state, None),
+            )
+        })
+        .collect())
+}
+
+#[cfg(test)]
 fn build_remote_pr_metadata(
     prs: Vec<PrInfoWithState>,
     status_map: Option<&HashMap<u64, PrCiReviewStatus>>,
@@ -290,6 +318,7 @@ fn build_pr_list_data(
     branch_identities: &[GroupBranchIdentity],
     remote_by_head: &HashMap<CanonicalBranchConflictKey, RemotePrMetadata>,
     local_pr_branch_drift: Vec<crate::local_pr_branches::LocalPrBranchAction>,
+    missing_remote_state: RemotePrState,
 ) -> PrListData {
     let groups = groups
         .iter()
@@ -307,7 +336,7 @@ fn build_pr_list_data(
                     .get(&identity.conflict_key)
                     .cloned()
                     .unwrap_or(RemotePrMetadata {
-                        state: RemotePrState::NoRemote,
+                        state: missing_remote_state.clone(),
                     }),
             }
         })
@@ -324,6 +353,7 @@ fn build_commit_list_data(
     branch_identities: &[GroupBranchIdentity],
     remote_by_head: &HashMap<CanonicalBranchConflictKey, RemotePrMetadata>,
     local_pr_branch_drift: Vec<crate::local_pr_branches::LocalPrBranchAction>,
+    missing_remote_state: RemotePrState,
 ) -> CommitListData {
     let group_start_indices: Vec<usize> = groups
         .iter()
@@ -358,7 +388,7 @@ fn build_commit_list_data(
                     .get(&identity.conflict_key)
                     .cloned()
                     .unwrap_or(RemotePrMetadata {
-                        state: RemotePrState::NoRemote,
+                        state: missing_remote_state.clone(),
                     }),
                 commits,
             }
@@ -376,10 +406,14 @@ pub fn collect_pr_list_data_for_json(
     prefix: &str,
     ignore_tag: &str,
     local_pr_branch_policy: LocalPrBranchSyncPolicy,
+    local: bool,
 ) -> std::result::Result<PrListData, ReadOnlyQueryError> {
     let (groups, branch_identities) = derive_groups_and_identities(base, prefix, ignore_tag)?;
-    let remote_by_head =
-        fetch_remote_pr_metadata(&branch_identities).map_err(ReadOnlyQueryError::Internal)?;
+    let remote_by_head = if local {
+        HashMap::new()
+    } else {
+        fetch_remote_pr_metadata(&branch_identities).map_err(ReadOnlyQueryError::Internal)?
+    };
     let targets = crate::local_pr_branches::targets_from_groups(prefix, &groups)
         .map_err(ReadOnlyQueryError::Internal)?;
     let local_pr_branch_drift =
@@ -390,6 +424,11 @@ pub fn collect_pr_list_data_for_json(
         &branch_identities,
         &remote_by_head,
         local_pr_branch_drift,
+        if local {
+            RemotePrState::NotQueried
+        } else {
+            RemotePrState::NoRemote
+        },
     ))
 }
 
@@ -398,8 +437,9 @@ pub fn collect_pr_list_data(
     prefix: &str,
     ignore_tag: &str,
     local_pr_branch_policy: LocalPrBranchSyncPolicy,
+    local: bool,
 ) -> Result<PrListData> {
-    collect_pr_list_data_for_json(base, prefix, ignore_tag, local_pr_branch_policy)
+    collect_pr_list_data_for_json(base, prefix, ignore_tag, local_pr_branch_policy, local)
         .map_err(anyhow::Error::from)
 }
 
@@ -408,10 +448,14 @@ pub fn collect_commit_list_data_for_json(
     prefix: &str,
     ignore_tag: &str,
     local_pr_branch_policy: LocalPrBranchSyncPolicy,
+    local: bool,
 ) -> std::result::Result<CommitListData, ReadOnlyQueryError> {
     let (groups, branch_identities) = derive_groups_and_identities(base, prefix, ignore_tag)?;
-    let remote_by_head =
-        fetch_remote_pr_metadata(&branch_identities).map_err(ReadOnlyQueryError::Internal)?;
+    let remote_by_head = if local {
+        HashMap::new()
+    } else {
+        fetch_open_remote_pr_metadata(&branch_identities).map_err(ReadOnlyQueryError::Internal)?
+    };
     let targets = crate::local_pr_branches::targets_from_groups(prefix, &groups)
         .map_err(ReadOnlyQueryError::Internal)?;
     let local_pr_branch_drift =
@@ -422,6 +466,11 @@ pub fn collect_commit_list_data_for_json(
         &branch_identities,
         &remote_by_head,
         local_pr_branch_drift,
+        if local {
+            RemotePrState::NotQueried
+        } else {
+            RemotePrState::NoRemote
+        },
     ))
 }
 
@@ -430,28 +479,33 @@ pub fn collect_commit_list_data(
     prefix: &str,
     ignore_tag: &str,
     local_pr_branch_policy: LocalPrBranchSyncPolicy,
+    local: bool,
 ) -> Result<CommitListData> {
-    collect_commit_list_data_for_json(base, prefix, ignore_tag, local_pr_branch_policy)
+    collect_commit_list_data_for_json(base, prefix, ignore_tag, local_pr_branch_policy, local)
         .map_err(anyhow::Error::from)
 }
 
-fn render_pr_list(data: &PrListData, list_order: ListOrder) -> Vec<String> {
+fn render_pr_list(data: &PrListData, list_order: ListOrder, local: bool) -> Vec<String> {
     if data.groups.is_empty() {
         vec!["No groups discovered; nothing to list.".to_string()]
     } else {
-        let mut lines = vec![
-            format!("┏━━{}CI status", crate::format::EM_SPACE),
-            format!("┃┏━{}review status", crate::format::EM_SPACE),
-        ];
+        let mut lines = if local {
+            Vec::new()
+        } else {
+            vec![
+                format!("┏━━{}CI status", crate::format::EM_SPACE),
+                format!("┃┏━{}review status", crate::format::EM_SPACE),
+            ]
+        };
         for group_idx in list_order.display_indices(data.groups.len()) {
             let group = &data.groups[group_idx];
             let (ci_icon, rv_icon) = status_icons(&group.remote);
             let pr_number = match &group.remote.state {
-                RemotePrState::NoRemote => None,
+                RemotePrState::NotQueried | RemotePrState::NoRemote => None,
                 RemotePrState::RemoteWithoutCiReview { pr_number, .. }
                 | RemotePrState::RemoteWithCiReview { pr_number, .. } => Some(*pr_number),
             };
-            lines.push(format_pr_summary_line(PrSummaryLine {
+            let summary = PrSummaryLine {
                 ci_icon,
                 rv_icon,
                 local_pr_num: group.local_pr_number,
@@ -459,7 +513,12 @@ fn render_pr_list(data: &PrListData, list_order: ListOrder) -> Vec<String> {
                 short: short_sha(&group.first_commit_sha),
                 pr_number,
                 count: group.commit_count,
-            }));
+            };
+            lines.push(if local {
+                format_local_pr_summary_line(summary)
+            } else {
+                format_pr_summary_line(summary)
+            });
             lines.push(format!(
                 "{s}{s}{s}{s}{s}{subject}",
                 s = crate::format::EM_SPACE,
@@ -552,9 +611,10 @@ pub fn list_prs_display(
     ignore_tag: &str,
     list_order: ListOrder,
     local_pr_branch_policy: LocalPrBranchSyncPolicy,
+    local: bool,
 ) -> Result<()> {
-    let data = collect_pr_list_data(base, prefix, ignore_tag, local_pr_branch_policy)?;
-    for line in render_pr_list(&data, list_order) {
+    let data = collect_pr_list_data(base, prefix, ignore_tag, local_pr_branch_policy, local)?;
+    for line in render_pr_list(&data, list_order, local) {
         info!("{line}");
     }
     for line in render_local_pr_branch_drift(&data.local_pr_branch_drift) {
@@ -575,8 +635,9 @@ pub fn list_commits_display(
     ignore_tag: &str,
     list_order: ListOrder,
     local_pr_branch_policy: LocalPrBranchSyncPolicy,
+    local: bool,
 ) -> Result<()> {
-    let data = collect_commit_list_data(base, prefix, ignore_tag, local_pr_branch_policy)?;
+    let data = collect_commit_list_data(base, prefix, ignore_tag, local_pr_branch_policy, local)?;
     for line in render_commit_list(&data, list_order) {
         info!("{line}");
     }
@@ -656,6 +717,21 @@ mod tests {
         });
 
         assert_eq!(line, "✓✓ LPR #2 / pr:beta - abcdef12 (#17) - 3 commits");
+    }
+
+    #[test]
+    fn local_pr_summary_omits_remote_status_and_number() {
+        let line = format_local_pr_summary_line(PrSummaryLine {
+            ci_icon: "✓",
+            rv_icon: "✓",
+            local_pr_num: 3,
+            stable_handle: "pr:updateUntil",
+            short: "fc01086e",
+            pr_number: Some(151),
+            count: 1,
+        });
+
+        assert_eq!(line, "LPR #3 / pr:updateUntil - fc01086e - 1 commit");
     }
 
     #[test]
@@ -742,7 +818,13 @@ mod tests {
             ),
         )]);
 
-        let data = build_pr_list_data(&groups, &branch_identities, &remote_by_head, Vec::new());
+        let data = build_pr_list_data(
+            &groups,
+            &branch_identities,
+            &remote_by_head,
+            Vec::new(),
+            RemotePrState::NoRemote,
+        );
         assert_eq!(data.groups[0].local_pr_number, 1);
         assert_eq!(data.groups[0].stable_handle, "pr:alpha");
         assert_eq!(data.groups[1].local_pr_number, 2);
@@ -769,7 +851,13 @@ mod tests {
             GroupBranchIdentity::new("dank-spr/beta".to_string()),
         ];
 
-        let data = build_pr_list_data(&groups, &branch_identities, &HashMap::new(), Vec::new());
+        let data = build_pr_list_data(
+            &groups,
+            &branch_identities,
+            &HashMap::new(),
+            Vec::new(),
+            RemotePrState::NoRemote,
+        );
 
         assert_eq!(data.groups[0].stable_handle, "branch:feature/login");
         assert_eq!(data.groups[0].head_branch, "feature/login");
@@ -849,7 +937,13 @@ mod tests {
             ),
         )]);
 
-        let data = build_commit_list_data(&groups, &branch_identities, &remote_by_head, Vec::new());
+        let data = build_commit_list_data(
+            &groups,
+            &branch_identities,
+            &remote_by_head,
+            Vec::new(),
+            RemotePrState::NoRemote,
+        );
 
         assert_eq!(data.groups[0].stable_handle, "pr:alpha");
         assert_eq!(
@@ -894,7 +988,7 @@ mod tests {
             local_pr_branch_drift: Vec::new(),
         };
 
-        let lines = render_pr_list(&data, ListOrder::RecentOnTop);
+        let lines = render_pr_list(&data, ListOrder::RecentOnTop, false);
 
         assert_eq!(lines[2], "?? LPR #2 / pr:beta - bbbbbbbb - 1 commit");
         assert_eq!(
@@ -902,6 +996,30 @@ mod tests {
             format!("{s}{s}{s}{s}{s}feat: beta", s = crate::format::EM_SPACE)
         );
         assert_eq!(lines[4], "?? LPR #1 / pr:alpha - aaaaaaaa - 1 commit");
+    }
+
+    #[test]
+    fn render_local_pr_list_omits_legend_icons_and_pr_numbers() {
+        let data = PrListData {
+            groups: vec![PrGroupData {
+                local_pr_number: 1,
+                stable_handle: "pr:alpha".to_string(),
+                head_branch: "dank-spr/alpha".to_string(),
+                first_commit_sha: "aaaaaaaa1".to_string(),
+                commit_count: 1,
+                first_subject: "feat: alpha".to_string(),
+                remote: RemotePrMetadata {
+                    state: RemotePrState::NotQueried,
+                },
+            }],
+            local_pr_branch_drift: Vec::new(),
+        };
+
+        let lines = render_pr_list(&data, ListOrder::RecentOnBottom, true);
+
+        assert_eq!(lines[0], "LPR #1 / pr:alpha - aaaaaaaa - 1 commit");
+        assert!(!lines.join("\n").contains("CI status"));
+        assert!(!lines.join("\n").contains("#17"));
     }
 
     #[test]
@@ -997,6 +1115,7 @@ mod tests {
             "dank-spr/",
             "ignore",
             LocalPrBranchSyncPolicy::Off,
+            false,
         )
         .expect_err("collision");
 

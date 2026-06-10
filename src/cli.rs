@@ -73,10 +73,26 @@ impl From<DryRunArgs> for ExecutionMode {
 pub enum ListWhat {
     /// List PRs in the stack (halts early if live groups derive case-colliding concrete branch names)
     #[command(alias = "p")]
-    Pr,
+    Pr {
+        /// Read only local Git state and skip all GitHub queries
+        #[arg(short = 'l', long)]
+        local: bool,
+    },
     /// List commits in the stack (halts early if live groups derive case-colliding concrete branch names)
     #[command(alias = "c")]
-    Commit,
+    Commit {
+        /// Read only local Git state and skip all GitHub queries
+        #[arg(short = 'l', long)]
+        local: bool,
+    },
+}
+
+impl ListWhat {
+    pub fn local(self) -> bool {
+        match self {
+            Self::Pr { local } | Self::Commit { local } => local,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -206,7 +222,11 @@ pub enum Cmd {
 
     /// Status overview (alias for `list pr`) with the same early concrete branch-collision guard
     #[command(alias = "stat")]
-    Status,
+    Status {
+        /// Read only local Git state and skip all GitHub queries
+        #[arg(short = 'l', long)]
+        local: bool,
+    },
 
     /// Reconcile local per-PR branches with the current stack using the configured sync policy
     SyncLocalBranches,
@@ -502,9 +522,9 @@ mod tests {
             assert!(scan.requested, "case did not request JSON: {case:?}");
             assert!(matches!(
                 cli.cmd,
-                Cmd::Status
+                Cmd::Status { .. }
                     | Cmd::List {
-                        what: super::ListWhat::Commit
+                        what: super::ListWhat::Commit { .. }
                     }
             ));
         }
@@ -630,7 +650,7 @@ mod tests {
 
         match cli.cmd {
             Cmd::List {
-                what: super::ListWhat::Pr,
+                what: super::ListWhat::Pr { local: false },
             } => {
                 assert_eq!(cli.output.format(), OutputFormat::Json);
             }
@@ -644,7 +664,7 @@ mod tests {
 
         match cli.cmd {
             Cmd::List {
-                what: super::ListWhat::Commit,
+                what: super::ListWhat::Commit { local: false },
             } => {
                 assert_eq!(cli.output.format(), OutputFormat::Json);
             }
@@ -659,7 +679,7 @@ mod tests {
         assert!(matches!(
             cli.cmd,
             Cmd::List {
-                what: super::ListWhat::Pr
+                what: super::ListWhat::Pr { local: false }
             }
         ));
         assert_eq!(cli.output.format(), OutputFormat::Json);
@@ -670,8 +690,44 @@ mod tests {
         let cli = Cli::try_parse_from(["spr", "status", "--json"]).unwrap();
 
         match cli.cmd {
-            Cmd::Status => assert_eq!(cli.output.format(), OutputFormat::Json),
+            Cmd::Status { local: false } => {
+                assert_eq!(cli.output.format(), OutputFormat::Json)
+            }
             other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn local_list_flags_parse_on_commands_and_aliases() {
+        let cases = [
+            (["spr", "list", "pr", "--local"], "pr"),
+            (["spr", "ls", "p", "-l"], "pr"),
+            (["spr", "list", "commit", "--local"], "commit"),
+            (["spr", "ls", "c", "-l"], "commit"),
+        ];
+
+        for (args, expected) in cases {
+            let cli = Cli::try_parse_from(args).unwrap();
+            match (cli.cmd, expected) {
+                (
+                    Cmd::List {
+                        what: super::ListWhat::Pr { local: true },
+                    },
+                    "pr",
+                )
+                | (
+                    Cmd::List {
+                        what: super::ListWhat::Commit { local: true },
+                    },
+                    "commit",
+                ) => {}
+                other => panic!("unexpected local list parse: {other:?}"),
+            }
+        }
+
+        for args in [["spr", "status", "--local"], ["spr", "stat", "-l"]] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.cmd, Cmd::Status { local: true }));
         }
     }
 
@@ -709,7 +765,7 @@ mod tests {
         let cli = Cli::try_parse_from(["spr", "status", "--cd", "/tmp/example"]).unwrap();
 
         assert_eq!(cli.cd, Some(PathBuf::from("/tmp/example")));
-        assert!(matches!(cli.cmd, Cmd::Status));
+        assert!(matches!(cli.cmd, Cmd::Status { local: false }));
         assert_eq!(cli.output.format(), OutputFormat::Human);
     }
 
@@ -718,7 +774,7 @@ mod tests {
         let cli = Cli::try_parse_from(["spr", "--cd", "/tmp/example", "status"]).unwrap();
 
         assert_eq!(cli.cd, Some(PathBuf::from("/tmp/example")));
-        assert!(matches!(cli.cmd, Cmd::Status));
+        assert!(matches!(cli.cmd, Cmd::Status { local: false }));
         assert_eq!(cli.output.format(), OutputFormat::Human);
     }
 }
