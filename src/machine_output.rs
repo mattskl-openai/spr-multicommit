@@ -19,6 +19,7 @@ pub enum MachineRewriteCommandKind {
     Absorb,
     Move,
     FixPr,
+    AdoptPrefix,
 }
 
 impl From<RewriteCommandKind> for MachineRewriteCommandKind {
@@ -28,6 +29,7 @@ impl From<RewriteCommandKind> for MachineRewriteCommandKind {
             RewriteCommandKind::Absorb => Self::Absorb,
             RewriteCommandKind::Move => Self::Move,
             RewriteCommandKind::FixPr => Self::FixPr,
+            RewriteCommandKind::AdoptPrefix => Self::AdoptPrefix,
         }
     }
 }
@@ -203,5 +205,33 @@ mod tests {
             }
             other => panic!("unexpected machine payload: {:?}", other),
         }
+    }
+
+    #[test]
+    fn completed_output_carries_destination_branch_when_present() {
+        let output = MachineOutput::completed_with_destination_branch(
+            MachineCommand::AdoptPrefix,
+            Some("stack".to_string()),
+            Vec::new(),
+        );
+        let json = serde_json::to_value(&output).unwrap();
+
+        assert_eq!(json["command"], "adopt-prefix");
+        assert_eq!(json["result"], "completed");
+        assert_eq!(json["destination_branch"], "stack");
+        assert_eq!(json["local_pr_branch_actions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn completed_output_omits_destination_branch_when_absent() {
+        let output = MachineOutput::completed_with_local_pr_branch_actions(
+            MachineCommand::Restack,
+            Vec::new(),
+        );
+        let json = serde_json::to_value(&output).unwrap();
+
+        assert_eq!(json["command"], "restack");
+        assert_eq!(json["result"], "completed");
+        assert!(json.get("destination_branch").is_none());
     }
 }

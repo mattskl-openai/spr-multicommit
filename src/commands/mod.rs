@@ -1,4 +1,5 @@
 pub mod absorb;
+pub mod adopt_prefix;
 pub mod cleanup;
 pub mod common;
 pub mod drop_merged_prefix;
@@ -17,6 +18,7 @@ pub mod update;
 pub use absorb::{
     absorb_branch_tails, query_absorb_changed_branches, AbsorbOptions, CopiedLaterStackCommitPolicy,
 };
+pub use adopt_prefix::{adopt_prefix, preview_adopt_prefix};
 pub use cleanup::{cleanup_remote_branches, print_cleanup_summary};
 pub use drop_merged_prefix::drop_merged_prefix;
 pub use fix_pr::fix_pr_tail;
