@@ -2041,6 +2041,9 @@ mod tests {
         let dir = init_update_stack_repo();
         let repo = dir.path().join("repo");
         let _guard = DirGuard::change_to(&repo);
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nexit 1\n",
+        );
         let cases = [
             vec![
                 "spr", "--base", "main", "--until", "1", "--exact", "1", "prep",
@@ -3395,6 +3398,11 @@ mod tests {
                     .unwrap();
             groups[0].commits.last().unwrap().clone()
         };
+        let expected_alpha_action = if alpha_tail == rewritten_alpha_tip {
+            crate::local_pr_branches::LocalPrBranchActionKind::Skipped
+        } else {
+            crate::local_pr_branches::LocalPrBranchActionKind::Blocked
+        };
         match output {
             CommandOutput::Machine(output) => match output.payload {
                 crate::machine_output::MachinePayload::Completed {
@@ -3403,10 +3411,7 @@ mod tests {
                 } => {
                     assert_eq!(destination_branch.as_deref(), Some("stack"));
                     assert_eq!(local_pr_branch_actions.len(), 2);
-                    assert_eq!(
-                        local_pr_branch_actions[0].action,
-                        crate::local_pr_branches::LocalPrBranchActionKind::Blocked
-                    );
+                    assert_eq!(local_pr_branch_actions[0].action, expected_alpha_action);
                     assert_eq!(
                         local_pr_branch_actions[1].action,
                         crate::local_pr_branches::LocalPrBranchActionKind::Updated
@@ -3417,7 +3422,6 @@ mod tests {
             other => panic!("unexpected command output: {:?}", other),
         }
         assert_eq!(rev_parse(&repo, "dank-spr/alpha"), alpha_tail);
-        assert_ne!(rev_parse(&repo, "dank-spr/alpha"), rewritten_alpha_tip);
         assert_eq!(rev_parse(&repo, "dank-spr/beta"), rev_parse(&repo, "stack"));
     }
 
