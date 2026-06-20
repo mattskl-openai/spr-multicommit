@@ -1204,6 +1204,14 @@ mod tests {
             "trace should contain native git rebase\n{trace}"
         );
         assert!(
+            trace.contains("\"--empty=ask\""),
+            "native rebase should use the Git 2.43-compatible empty spelling\n{trace}"
+        );
+        assert!(
+            !trace.contains("\"--empty=stop\""),
+            "native rebase must not use the Git 2.43-incompatible empty spelling\n{trace}"
+        );
+        assert!(
             !trace.contains("\"argv\":[\"git\",\"worktree\",\"add\""),
             "clean suffix restack should not create a rewrite worktree\n{trace}"
         );
