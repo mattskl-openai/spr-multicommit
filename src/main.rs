@@ -33,6 +33,8 @@ mod summary_output;
 #[cfg(test)]
 mod test_support;
 mod update_output;
+mod validation;
+mod validation_output;
 
 fn resolve_update_until_limit(
     groups: &[crate::parsing::Group],
@@ -68,6 +70,7 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
             .map(crate::commands::looks_like_pr_url)
             .unwrap_or(false),
         crate::cli::Cmd::Update { no_pr, .. } => !*no_pr,
+        crate::cli::Cmd::Validate { .. } => false,
         crate::cli::Cmd::List { .. }
         | crate::cli::Cmd::Status
         | crate::cli::Cmd::Prep { .. }
@@ -89,6 +92,7 @@ enum CommandOutput {
     RestackPreview(crate::restack_output::RestackPreviewOutput),
     ResolveStack(crate::commands::ResolveStackOutput),
     Update(crate::update_output::UpdateOutput),
+    Validate(crate::validation_output::ValidationOutput),
     Maintenance(Box<crate::maintenance_output::MaintenanceOutput>),
     Error(crate::json_output::ErrorOutput),
 }
@@ -438,6 +442,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
     let dirty_worktree_policy = cfg.dirty_worktree;
     let list_order = cfg.list_order;
     let branch_reuse_guard_days = cfg.branch_reuse_guard_days;
+    let update_validation = cfg.update_validation;
     let local_pr_branch_policy = cli.local_pr_branches.unwrap_or(cfg.local_pr_branches);
     match cli.cmd {
         crate::cli::Cmd::Update {
@@ -447,6 +452,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
             assume_existing_prs,
             pr_description_mode: pr_description_mode_override,
             allow_branch_reuse,
+            skip_validation,
             dry_run,
         } => {
             let execution_mode = ExecutionMode::from(dry_run);
@@ -457,7 +463,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     "`spr update --restack` is deprecated. Use `spr restack --after N` instead."
                 ))
             } else {
-                let (_merge_base, leading_ignored, all_groups) =
+                let (merge_base, leading_ignored, all_groups) =
                     crate::parsing::derive_groups_between_with_ignored(&base, &from, &ignore_tag)?;
                 if all_groups.is_empty() {
                     return Err(anyhow::anyhow!(
@@ -471,21 +477,38 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 crate::branch_names::group_branch_identities(&groups, &prefix)?;
                 let (limit, resolved_extent) =
                     resolve_update_until_limit(&groups, cli.until.as_ref())?;
+                let update_validation = if skip_validation {
+                    crate::commands::UpdatePushValidation::Skip
+                } else if update_validation == crate::config::UpdateValidationPolicy::Required {
+                    crate::commands::UpdatePushValidation::Required(
+                        crate::validation::build_descriptors(
+                            &base,
+                            &prefix,
+                            &ignore_tag,
+                            &merge_base,
+                            &crate::limit::apply_limit_groups(groups.clone(), limit)?,
+                        )?,
+                    )
+                } else {
+                    crate::commands::UpdatePushValidation::Legacy
+                };
                 if output_format == crate::cli::OutputFormat::Json {
-                    let execution = crate::commands::build_from_groups_with_summary(
-                        &base,
-                        &prefix,
-                        &skipped_handles,
-                        no_pr,
-                        execution_mode,
-                        pr_description_mode,
-                        limit,
-                        groups,
-                        list_order,
-                        allow_branch_reuse,
-                        branch_reuse_guard_days,
-                        local_pr_branch_policy,
-                    )?;
+                    let execution =
+                        crate::commands::build_from_groups_with_summary_with_validation(
+                            &base,
+                            &prefix,
+                            &skipped_handles,
+                            no_pr,
+                            execution_mode,
+                            pr_description_mode,
+                            limit,
+                            groups,
+                            list_order,
+                            allow_branch_reuse,
+                            branch_reuse_guard_days,
+                            local_pr_branch_policy,
+                            update_validation,
+                        )?;
                     let mut summary = crate::update_output::UpdateSummaryData::from_execution(
                         crate::update_output::UpdateRepoContext {
                             base: base.clone(),
@@ -498,6 +521,8 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                             no_pr,
                             pr_description_mode,
                             local_pr_branches: local_pr_branch_policy,
+                            update_validation: cfg.update_validation,
+                            skip_validation,
                         },
                         resolved_extent,
                         execution,
@@ -514,7 +539,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         summary,
                     )))
                 } else {
-                    crate::commands::build_from_groups(
+                    crate::commands::build_from_groups_with_validation(
                         &base,
                         &prefix,
                         &skipped_handles,
@@ -527,6 +552,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                         allow_branch_reuse,
                         branch_reuse_guard_days,
                         local_pr_branch_policy,
+                        update_validation,
                     )?;
                     if execution_mode == ExecutionMode::Apply
                         && refresh_metadata_after_update(&metadata_refresh_context)?
@@ -536,6 +562,21 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     }
                     Ok(CommandOutput::None)
                 }
+            }
+        }
+        crate::cli::Cmd::Validate { from } => {
+            let until = cli
+                .until
+                .unwrap_or(crate::selectors::InclusiveSelector::All);
+            let summary =
+                crate::validation::validate_stack(&base, &prefix, &ignore_tag, &from, &until)?;
+            if output_format == crate::cli::OutputFormat::Json {
+                Ok(CommandOutput::Validate(crate::validation_output::summary(
+                    summary,
+                )))
+            } else {
+                crate::validation::print_validation_summary(&summary);
+                Ok(CommandOutput::None)
             }
         }
         crate::cli::Cmd::Restack {
@@ -751,6 +792,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     local_pr_branch_policy,
                     selection,
                     execution_mode,
+                    update_validation,
                 },
             )?;
             if output_format == crate::cli::OutputFormat::Json {
@@ -1167,6 +1209,11 @@ fn main() {
                     exit_with_json(&output, output.exit_code());
                 }
             }
+            CommandOutput::Validate(output) => {
+                if output_format == crate::cli::OutputFormat::Json {
+                    exit_with_json(&output, output.exit_code());
+                }
+            }
             CommandOutput::Maintenance(output) => {
                 if output_format == crate::cli::OutputFormat::Json {
                     exit_with_json(&output, output.exit_code());
@@ -1211,6 +1258,7 @@ fn json_command_for_cli(cmd: &crate::cli::Cmd) -> crate::json_output::JsonComman
         crate::cli::Cmd::FixPr { .. } => crate::machine_output::MachineCommand::FixPr,
         crate::cli::Cmd::Move { .. } => crate::machine_output::MachineCommand::Move,
         crate::cli::Cmd::Update { .. } => crate::machine_output::MachineCommand::Update,
+        crate::cli::Cmd::Validate { .. } => crate::machine_output::MachineCommand::Validate,
         crate::cli::Cmd::Prep { .. } => crate::machine_output::MachineCommand::Prep,
         crate::cli::Cmd::List { what, .. } => match what {
             crate::cli::ListWhat::Pr => crate::machine_output::MachineCommand::ListPr,
@@ -1422,6 +1470,13 @@ mod tests {
     }
 
     #[test]
+    fn validate_stays_local_only_for_tool_checks() {
+        assert!(!command_requires_gh(&crate::cli::Cmd::Validate {
+            from: "HEAD".to_string(),
+        }));
+    }
+
+    #[test]
     fn update_without_no_pr_requires_github_cli() {
         assert!(command_requires_gh(&crate::cli::Cmd::Update {
             from: "HEAD".to_string(),
@@ -1430,6 +1485,7 @@ mod tests {
             assume_existing_prs: false,
             pr_description_mode: None,
             allow_branch_reuse: false,
+            skip_validation: false,
             dry_run: DryRunArgs::default(),
         }));
     }
@@ -1443,6 +1499,7 @@ mod tests {
             assume_existing_prs: false,
             pr_description_mode: None,
             allow_branch_reuse: false,
+            skip_validation: false,
             dry_run: DryRunArgs::default(),
         }));
     }
@@ -1483,6 +1540,7 @@ mod tests {
             ["config", "user.email", "spr@example.com"].as_slice(),
         );
         git(&repo, ["config", "user.name", "SPR Tests"].as_slice());
+        git(&repo, ["config", "core.hooksPath", ".git/hooks"].as_slice());
         write_file(&repo, "README.md", "init\n");
         git(&repo, ["add", "README.md"].as_slice());
         git(&repo, ["commit", "-m", "init"].as_slice());
@@ -1730,6 +1788,28 @@ mod tests {
     }
 
     #[test]
+    fn json_command_for_raw_args_detects_validate() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("validate"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(json_command_for_raw_args(&args), JsonCommand::Validate);
+    }
+
+    #[test]
+    fn json_command_for_raw_args_detects_validate_alias() {
+        let args = vec![
+            OsString::from("spr"),
+            OsString::from("v"),
+            OsString::from("--json"),
+        ];
+
+        assert_eq!(json_command_for_raw_args(&args), JsonCommand::Validate);
+    }
+
+    #[test]
     fn json_command_for_raw_args_detects_drop_merged_prefix() {
         let args = vec![
             OsString::from("spr"),
@@ -1805,6 +1885,178 @@ mod tests {
             .expect("json parse failure should serialize");
 
         assert_eq!(output.command, JsonCommand::Update);
+    }
+
+    #[test]
+    fn validate_json_reports_receipt_summary() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let dir = init_update_stack_repo();
+        std::env::set_current_dir(dir.path().join("repo")).unwrap();
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr", "--base", "main", "--prefix", "spr/", "validate",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::Validate(output) => {
+                assert_eq!(output.command, JsonCommand::Validate);
+                assert!(output.data.success);
+                assert_eq!(output.data.validated_group_count, 2);
+                assert_eq!(output.data.recorded_group_count, 2);
+                assert_eq!(output.data.reused_group_count, 0);
+                assert!(!output.data.pre_push_hook_present);
+                assert_eq!(output.data.receipts.len(), 2);
+                assert_eq!(output.data.receipts[0].stable_handle, "pr:alpha");
+                assert_eq!(output.data.receipts[1].stable_handle, "pr:beta");
+                assert!(output.data.receipts.iter().all(|receipt| {
+                    receipt.action == crate::validation::ValidationReceiptAction::Recorded
+                }));
+                assert!(output
+                    .data
+                    .receipts
+                    .iter()
+                    .all(|receipt| Path::new(&receipt.path).is_file()));
+            }
+            other => panic!("unexpected output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn required_update_until_uses_only_selected_validation_receipts() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        fs::write(
+            dir.path().join(".spr_multicommit_cfg.yml"),
+            "update_validation: required\n",
+        )
+        .unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let validate_cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--until",
+            "1",
+            "v",
+        ])
+        .unwrap();
+        run_cli(validate_cli, OutputFormat::Human).unwrap();
+
+        let partial_update_cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "--until",
+            "pr:alpha",
+            "update",
+            "--no-pr",
+        ])
+        .unwrap();
+        run_cli(partial_update_cli, OutputFormat::Human).unwrap();
+
+        let full_update_cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "update",
+            "--no-pr",
+        ])
+        .unwrap();
+        let err = run_cli(full_update_cli, OutputFormat::Human).unwrap_err();
+
+        assert!(format!("{err:#}").contains("pr:beta"));
+        let alpha_remote = git(
+            &repo,
+            ["ls-remote", "--heads", "origin", "dank-spr/alpha"].as_slice(),
+        );
+        let beta_remote = git(
+            &repo,
+            ["ls-remote", "--heads", "origin", "dank-spr/beta"].as_slice(),
+        );
+        assert!(!alpha_remote.trim().is_empty());
+        assert!(beta_remote.trim().is_empty());
+    }
+
+    #[test]
+    fn required_update_from_ref_accepts_matching_validate_from_receipts() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        git(&repo, ["branch", "old-stack", "HEAD"].as_slice());
+        commit_file(&repo, "gamma.txt", "gamma-1\n", "feat: gamma pr:gamma");
+        fs::write(
+            dir.path().join(".spr_multicommit_cfg.yml"),
+            "update_validation: required\n",
+        )
+        .unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let validate_cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "v",
+            "--from",
+            "old-stack",
+        ])
+        .unwrap();
+        run_cli(validate_cli, OutputFormat::Human).unwrap();
+
+        let update_cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "update",
+            "--from",
+            "old-stack",
+            "--no-pr",
+        ])
+        .unwrap();
+        run_cli(update_cli, OutputFormat::Human).unwrap();
+
+        assert!(!git(
+            &repo,
+            ["ls-remote", "--heads", "origin", "dank-spr/alpha"].as_slice(),
+        )
+        .trim()
+        .is_empty());
+        assert!(!git(
+            &repo,
+            ["ls-remote", "--heads", "origin", "dank-spr/beta"].as_slice(),
+        )
+        .trim()
+        .is_empty());
+        assert!(git(
+            &repo,
+            ["ls-remote", "--heads", "origin", "dank-spr/gamma"].as_slice(),
+        )
+        .trim()
+        .is_empty());
     }
 
     #[test]
@@ -2032,6 +2284,53 @@ mod tests {
                 other => panic!("unexpected maintenance payload: {:?}", other),
             },
             other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn required_validation_blocks_prep_publication_after_local_rewrite() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        fs::write(
+            dir.path().join(".spr_multicommit_cfg.yml"),
+            "update_validation: required\n",
+        )
+        .unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let origin_url = format!("file://{}", dir.path().join("origin.git").display());
+        git(
+            &repo,
+            ["remote", "set-url", "origin", origin_url.as_str()].as_slice(),
+        );
+        let original_head = rev_parse(&repo, "HEAD");
+        let log_path = repo.join("gh.log");
+        let script = prep_json_gh_script(&log_path);
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "prep",
+            "--json",
+        ])
+        .unwrap();
+
+        let error = run_cli(cli, OutputFormat::Json).unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing or stale"));
+        assert_ne!(rev_parse(&repo, "HEAD"), original_head);
+        for branch in ["dank-spr/alpha", "dank-spr/beta"] {
+            assert!(
+                git(&repo, ["ls-remote", "--heads", "origin", branch].as_slice())
+                    .trim()
+                    .is_empty()
+            );
         }
     }
 
@@ -2742,6 +3041,11 @@ mod tests {
                     data.options.local_pr_branches,
                     crate::config::LocalPrBranchSyncPolicy::Off
                 );
+                assert_eq!(
+                    data.options.update_validation,
+                    crate::config::UpdateValidationPolicy::Legacy
+                );
+                assert!(!data.options.skip_validation);
                 assert_eq!(data.extent, ResolvedUpdateLimit::All);
                 assert!(data.warnings.is_empty());
                 assert!(data.skipped_groups.is_empty());
@@ -2823,6 +3127,52 @@ mod tests {
                 assert!(!local_branch_exists(&repo, "dank-spr/beta"));
             }
             other => panic!("unexpected command output: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_json_reports_required_validation_and_skip_override() {
+        let _lock = lock_cwd();
+        let dir = init_update_stack_repo();
+        let repo = dir.path().join("repo");
+        let _guard = DirGuard::change_to(&repo);
+        fs::write(
+            dir.path().join(".spr_multicommit_cfg.yml"),
+            "update_validation: required\n",
+        )
+        .unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", dir.path().display().to_string());
+        let (_wrapper_dir, _path_guard) = install_failing_gh_wrapper();
+
+        for (extra_args, expected_skip) in [(&[][..], false), (&["--skip-validation"][..], true)] {
+            let mut args = vec![
+                "spr",
+                "--cd",
+                repo.to_str().unwrap(),
+                "--base",
+                "main",
+                "--prefix",
+                "dank-spr/",
+                "update",
+                "--dry-run",
+                "--json",
+                "--no-pr",
+            ];
+            args.extend_from_slice(extra_args);
+            let cli = crate::cli::Cli::try_parse_from(args).unwrap();
+
+            let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+            match output {
+                CommandOutput::Update(output) => {
+                    assert_eq!(
+                        output.data.options.update_validation,
+                        crate::config::UpdateValidationPolicy::Required
+                    );
+                    assert_eq!(output.data.options.skip_validation, expected_skip);
+                }
+                other => panic!("unexpected command output: {:?}", other),
+            }
         }
     }
 

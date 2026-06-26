@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::config::{LocalPrBranchSyncPolicy, PrDescriptionMode};
+use crate::config::{LocalPrBranchSyncPolicy, PrDescriptionMode, UpdateValidationPolicy};
 use crate::json_output::JsonCommand;
 use crate::local_pr_branches::LocalPrBranchAction;
 use crate::summary_output::SummaryOutput;
@@ -32,6 +32,8 @@ pub struct UpdateOptions {
     pub no_pr: bool,
     pub pr_description_mode: PrDescriptionMode,
     pub local_pr_branches: LocalPrBranchSyncPolicy,
+    pub update_validation: UpdateValidationPolicy,
+    pub skip_validation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
