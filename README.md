@@ -153,7 +153,7 @@ Global flags
 - `--base, -b <BRANCH>`: root base branch (default from config)
 - `--prefix <PREFIX>`: per-PR branch prefix (default from config, normalized to a single trailing `/`)
 - `--local-pr-branches <off|update-existing|create-or-update>`: override local per-PR branch synchronization for this run
-- `--until <N|0|name|pr:<label>|branch:<branch-name>>`: target range used by `prep` and `land` (`0` means all)
+- `--until <N|0|name|pr:<label>|branch:<branch-name>>`: target range used by `update`, `prep`, and `land` (`0` means all)
 - `--exact <I|name|pr:<label>|branch:<branch-name>>`: used by `prep` to select exactly one PR group
 - `--verbose`: enable verbose logging of underlying git/gh commands
 
@@ -181,10 +181,7 @@ Key options:
 - `--pr-description-mode <overwrite|stack_only>`: override `pr_description_mode` for this update run
 - `--allow-branch-reuse`: bypass the recent closed-or-merged branch-name reuse guard
 - `--json`: write exactly one update summary object to stdout
-- Extent (optional subcommand):
-  - `pr --to <N|name|pr:<label>|branch:<branch-name>>`: canonical selector for limiting updates to the first N PRs from the bottom
-  - `pr --n <N>`: legacy numeric-only form
-  - `pr <N>`: backward-compatible positional numeric form
+- `--until <N|0|name|pr:<label>|branch:<branch-name>>`: update only the lower prefix through one PR boundary (`0` means all)
 
 Behavior:
 
@@ -788,7 +785,7 @@ Examples
 spr update
 
 # Update only through the stable beta group
-spr update pr --to beta
+spr update --until beta
 
 # Prep the stack through the stable beta group
 spr prep --until beta
