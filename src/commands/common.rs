@@ -142,13 +142,54 @@ pub enum NativeRebaseOutcome {
     Aborted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeRebaseSnapshot {
+    head: String,
+    status: String,
+    rebase_apply_exists: bool,
+    rebase_merge_exists: bool,
+}
+
+impl NativeRebaseSnapshot {
+    fn has_rebase_state(&self) -> bool {
+        self.rebase_apply_exists || self.rebase_merge_exists
+    }
+}
+
+fn git_path_exists(path_key: &str) -> Result<bool> {
+    let path = git_ro(["rev-parse", "--git-path", path_key].as_slice())?
+        .trim()
+        .to_string();
+    Ok(Path::new(&path).exists())
+}
+
+fn capture_native_rebase_snapshot() -> Result<NativeRebaseSnapshot> {
+    Ok(NativeRebaseSnapshot {
+        head: git_ro(["rev-parse", "HEAD"].as_slice())?.trim().to_string(),
+        status: git_ro(["status", "--porcelain=v1"].as_slice())?,
+        rebase_apply_exists: git_path_exists("rebase-apply")?,
+        rebase_merge_exists: git_path_exists("rebase-merge")?,
+    })
+}
+
+fn can_fallback_after_failed_native_rebase(
+    before: &NativeRebaseSnapshot,
+    after: &NativeRebaseSnapshot,
+) -> bool {
+    before.head == after.head
+        && before.status == after.status
+        && !before.has_rebase_state()
+        && !after.has_rebase_state()
+}
+
 /// Runs a native `git rebase` command and aborts it before returning fallback.
 ///
 /// `args` must be the complete `git` argument vector for one rebase command,
 /// such as `["rebase", "--onto", ...]`. A failed rebase returns `Aborted` only
-/// after `git rebase --abort` succeeds; if the abort also fails, the original
-/// rebase error is returned with context that tells the user where to repair the
-/// repository.
+/// after `git rebase --abort` succeeds or when Git rejected the command before
+/// starting a rewrite and the repository snapshot remained unchanged. If abort
+/// fails after repository state changed, the original rebase error is returned
+/// with context that tells the user where to repair the repository.
 pub fn run_native_rebase_with_abort(
     execution_mode: ExecutionMode,
     args: &[&str],
@@ -160,17 +201,26 @@ pub fn run_native_rebase_with_abort(
             Ok(NativeRebaseOutcome::Completed)
         }
         ExecutionMode::Apply => {
+            let before = capture_native_rebase_snapshot()?;
             if let Err(rebase_err) = git_rw(ExecutionMode::Apply, args) {
                 if let Err(abort_err) =
                     git_rw(ExecutionMode::Apply, ["rebase", "--abort"].as_slice())
                 {
-                    let repo = repo_root()?.unwrap_or_else(|| ".".to_string());
-                    Err(rebase_err).with_context(|| {
-                        format!(
-                            "{command_label} rebase failed, and `git rebase --abort` also failed: {abort_err:#}. Inspect {} and run `git rebase --abort` there before retrying.",
-                            repo
-                        )
-                    })
+                    let after = capture_native_rebase_snapshot()?;
+                    if can_fallback_after_failed_native_rebase(&before, &after) {
+                        warn!(
+                            "{command_label} rebase failed before Git created rewrite state; falling back"
+                        );
+                        Ok(NativeRebaseOutcome::Aborted)
+                    } else {
+                        let repo = repo_root()?.unwrap_or_else(|| ".".to_string());
+                        Err(rebase_err).with_context(|| {
+                            format!(
+                                "{command_label} rebase failed, and `git rebase --abort` also failed: {abort_err:#}. Inspect {} and run `git rebase --abort` there before retrying.",
+                                repo
+                            )
+                        })
+                    }
                 } else {
                     Ok(NativeRebaseOutcome::Aborted)
                 }
@@ -260,7 +310,9 @@ fn cherry_pick_args<'a>(
 ) -> Vec<&'a str> {
     let mut args = vec!["-C", tmp_path, "cherry-pick"];
     if empty_policy == CherryPickEmptyPolicy::KeepRedundantCommits {
-        args.push("--empty=keep");
+        // Keep the legacy-compatible spelling: Git 2.43 supports this synonym,
+        // while the newer `--empty=keep` spelling is rejected.
+        args.push("--keep-redundant-commits");
     }
     args.extend_from_slice(tail_args);
     args
@@ -707,8 +759,10 @@ pub fn group_selector_text(group: &Group) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_head_base_chain, cleanup_temp_worktree, create_backup_tag, create_temp_worktree,
-        get_current_branch_and_short,
+        build_head_base_chain, can_fallback_after_failed_native_rebase, cherry_pick_args,
+        cleanup_temp_worktree, create_backup_tag, create_temp_worktree,
+        get_current_branch_and_short, run_native_rebase_with_abort, CherryPickEmptyPolicy,
+        NativeRebaseOutcome, NativeRebaseSnapshot,
     };
     use crate::execution::ExecutionMode;
     use crate::group_markers::GroupMarker;
@@ -775,6 +829,81 @@ mod tests {
                 ("release/docs".to_string(), "dank-spr/beta".to_string()),
             ]
         );
+    }
+
+    fn native_rebase_snapshot(head: &str, status: &str) -> NativeRebaseSnapshot {
+        NativeRebaseSnapshot {
+            head: head.to_string(),
+            status: status.to_string(),
+            rebase_apply_exists: false,
+            rebase_merge_exists: false,
+        }
+    }
+
+    #[test]
+    fn failed_native_rebase_fallback_requires_unchanged_repository_snapshot() {
+        let before = native_rebase_snapshot("head", "");
+
+        assert!(can_fallback_after_failed_native_rebase(
+            &before,
+            &native_rebase_snapshot("head", "")
+        ));
+        assert!(!can_fallback_after_failed_native_rebase(
+            &before,
+            &native_rebase_snapshot("other", "")
+        ));
+        assert!(!can_fallback_after_failed_native_rebase(
+            &before,
+            &native_rebase_snapshot("head", " M file.txt\n")
+        ));
+        assert!(!can_fallback_after_failed_native_rebase(
+            &before,
+            &NativeRebaseSnapshot {
+                rebase_merge_exists: true,
+                ..native_rebase_snapshot("head", "")
+            }
+        ));
+        assert!(!can_fallback_after_failed_native_rebase(
+            &NativeRebaseSnapshot {
+                rebase_apply_exists: true,
+                ..native_rebase_snapshot("head", "")
+            },
+            &native_rebase_snapshot("head", "")
+        ));
+    }
+
+    #[test]
+    fn unsupported_native_rebase_option_falls_back_without_rewrite_state() {
+        let _lock = lock_cwd();
+        let dir = init_repo();
+        let repo = dir.path().to_path_buf();
+        let _guard = DirGuard::change_to(&repo);
+        let head = git(&repo, ["rev-parse", "HEAD"].as_slice());
+
+        let outcome = run_native_rebase_with_abort(
+            ExecutionMode::Apply,
+            ["rebase", "--definitely-not-a-supported-option"].as_slice(),
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(outcome, NativeRebaseOutcome::Aborted);
+        assert_eq!(git(&repo, ["rev-parse", "HEAD"].as_slice()), head);
+        assert!(git(&repo, ["status", "--porcelain=v1"].as_slice())
+            .trim()
+            .is_empty());
+    }
+
+    #[test]
+    fn redundant_cherry_pick_uses_git_243_compatible_spelling() {
+        let args = cherry_pick_args(
+            "/tmp/example",
+            CherryPickEmptyPolicy::KeepRedundantCommits,
+            &["commit"],
+        );
+
+        assert!(args.contains(&"--keep-redundant-commits"));
+        assert!(!args.contains(&"--empty=keep"));
     }
 
     #[test]

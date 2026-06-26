@@ -457,7 +457,9 @@ fn try_fast_suffix_rebase(
     let rebase_args = [
         "rebase",
         "--reapply-cherry-picks",
-        "--empty=stop",
+        // Keep the legacy-compatible spelling: Git 2.43 supports `ask`, and
+        // newer Git treats it as the deprecated synonym for `stop`.
+        "--empty=ask",
         "--onto",
         metadata_context.base.as_str(),
         fast_plan.upstream_exclusive.as_str(),
@@ -1200,6 +1202,14 @@ mod tests {
         assert!(
             trace.contains("\"argv\":[\"git\",\"rebase\""),
             "trace should contain native git rebase\n{trace}"
+        );
+        assert!(
+            trace.contains("\"--empty=ask\""),
+            "native rebase should use the Git 2.43-compatible empty spelling\n{trace}"
+        );
+        assert!(
+            !trace.contains("\"--empty=stop\""),
+            "native rebase must not use the Git 2.43-incompatible empty spelling\n{trace}"
         );
         assert!(
             !trace.contains("\"argv\":[\"git\",\"worktree\",\"add\""),
