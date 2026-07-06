@@ -10,7 +10,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::branch_names::group_branch_identities;
-use crate::git::{git_common_dir, git_rev_parse, git_ro, repo_root};
+use crate::git::{git_common_dir, git_rev_parse, git_ro};
 use crate::parsing::{derive_groups_between_with_ignored, split_groups_for_update, Group};
 use crate::selectors::{resolve_inclusive_count, InclusiveSelector};
 
@@ -159,14 +159,19 @@ fn origin_push_url() -> Result<String> {
     }
 }
 
-fn pre_push_hook_fingerprint(repo_root: &Path) -> Result<HookFingerprint> {
-    let reported = git_ro(["rev-parse", "--git-path", "hooks/pre-push"].as_slice())?;
-    let reported = reported.trim();
-    let path = if Path::new(reported).is_absolute() {
-        PathBuf::from(reported)
-    } else {
-        repo_root.join(reported)
-    };
+fn pre_push_hook_fingerprint() -> Result<HookFingerprint> {
+    let path = PathBuf::from(
+        git_ro(
+            [
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "hooks/pre-push",
+            ]
+            .as_slice(),
+        )?
+        .trim(),
+    );
     let present = path.is_file();
     let executable = if present {
         fs::metadata(&path)
@@ -200,10 +205,9 @@ pub fn build_descriptors(
     merge_base: &str,
     groups: &[Group],
 ) -> Result<Vec<ValidationDescriptor>> {
-    let root = repo_root()?.ok_or_else(|| anyhow!("`spr` must run inside a git worktree"))?;
     let base_sha = git_rev_parse(base)?;
     let origin_push_url = origin_push_url()?;
-    let pre_push_hook = pre_push_hook_fingerprint(Path::new(&root))?;
+    let pre_push_hook = pre_push_hook_fingerprint()?;
     let branch_identities = group_branch_identities(groups, prefix)?;
     let mut previous_tip_sha = merge_base.to_string();
     groups
@@ -410,8 +414,7 @@ pub fn validate_stack(
     let pre_push_hook = if let Some(descriptor) = descriptors.first() {
         descriptor.pre_push_hook.clone()
     } else {
-        let root = repo_root()?.ok_or_else(|| anyhow!("`spr` must run inside a git worktree"))?;
-        pre_push_hook_fingerprint(Path::new(&root))?
+        pre_push_hook_fingerprint()?
     };
     let missing_indices = descriptors
         .iter()
@@ -866,6 +869,31 @@ mod tests {
         validate_current_stack("main", "spr/", "ignore", &InclusiveSelector::All).unwrap();
 
         assert_eq!(fs::read_to_string(&repo.log).unwrap(), "bb");
+    }
+
+    #[test]
+    fn nested_directory_uses_the_repository_pre_push_hook() {
+        let _cwd_lock = lock_cwd();
+        let repo = init_validation_repo();
+        let nested = repo.repo.join("deeply/nested/directory");
+        fs::create_dir_all(&nested).unwrap();
+        let _cwd = DirGuard::change_to(&nested);
+        install_hook(&repo, &format!("printf x >> '{}'", repo.log.display()));
+
+        let summary =
+            validate_current_stack("main", "spr/", "ignore", &InclusiveSelector::All).unwrap();
+
+        assert!(summary.pre_push_hook_present);
+        assert!(summary.pre_push_hook_executable);
+        assert_eq!(fs::read_to_string(&repo.log).unwrap(), "xx");
+        for receipt in summary.receipts {
+            let receipt: super::ValidationReceipt =
+                serde_json::from_slice(&fs::read(receipt.path).unwrap()).unwrap();
+            assert_eq!(
+                receipt.descriptor.pre_push_hook.path,
+                repo.repo.join(".git/hooks/pre-push").display().to_string()
+            );
+        }
     }
 
     #[test]
