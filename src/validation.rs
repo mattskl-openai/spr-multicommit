@@ -327,6 +327,13 @@ fn hook_input_path() -> PathBuf {
     std::env::temp_dir().join(format!("spr-validate-hook-input-{}", Uuid::new_v4()))
 }
 
+fn git_local_env_vars() -> Result<Vec<String>> {
+    Ok(git_ro(["rev-parse", "--local-env-vars"].as_slice())?
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
 fn run_pre_push_hook(
     worktree: &Path,
     pre_push_hook: &HookFingerprint,
@@ -335,6 +342,7 @@ fn run_pre_push_hook(
     previous_tip: &str,
     current_tip: &str,
 ) -> Result<()> {
+    let git_local_env_vars = git_local_env_vars()?;
     let input_path = hook_input_path();
     let ref_name = format!("refs/heads/{branch}");
     fs::write(
@@ -342,25 +350,17 @@ fn run_pre_push_hook(
         format!("{ref_name} {current_tip} {ref_name} {previous_tip}\n"),
     )
     .with_context(|| format!("failed to write hook input {}", input_path.display()))?;
-    let hooks_path = Path::new(&pre_push_hook.path)
-        .parent()
-        .ok_or_else(|| anyhow!("pre-push hook path {} has no parent", pre_push_hook.path))?;
-    let status = Command::new("git")
+    let input = fs::File::open(&input_path)
+        .with_context(|| format!("failed to open hook input {}", input_path.display()))?;
+    let mut command = Command::new(&pre_push_hook.path);
+    command
         .current_dir(worktree)
-        .args([
-            "-c",
-            &format!("core.hooksPath={}", hooks_path.display()),
-            "hook",
-            "run",
-            "--ignore-missing",
-            &format!("--to-stdin={}", input_path.display()),
-            "pre-push",
-            "--",
-            "origin",
-            origin_push_url,
-        ])
-        .status()
-        .context("failed to spawn git hook run pre-push")?;
+        .args(["origin", origin_push_url])
+        .stdin(Stdio::from(input));
+    for variable in git_local_env_vars {
+        command.env_remove(variable);
+    }
+    let status = command.status().context("failed to spawn pre-push hook")?;
     let _ = fs::remove_file(&input_path);
     if !status.success() {
         bail!("pre-push hook failed");
@@ -894,6 +894,29 @@ mod tests {
                 repo.repo.join(".git/hooks/pre-push").display().to_string()
             );
         }
+    }
+
+    #[test]
+    fn validation_hook_can_run_foreign_git_without_worktree_environment() {
+        let _cwd_lock = lock_cwd();
+        let repo = init_validation_repo();
+        let _cwd = DirGuard::change_to(&repo.repo);
+        let foreign_repo = repo._dir.path().join("foreign-repo");
+        install_hook(
+            &repo,
+            &format!(
+                "test -z \"${{GIT_DIR+x}}\" || exit 41\ngit init '{}' >/dev/null 2>&1 || exit 42\nprintf x >> '{}'",
+                foreign_repo.display(),
+                repo.log.display()
+            ),
+        );
+
+        let summary =
+            validate_current_stack("main", "spr/", "ignore", &InclusiveSelector::All).unwrap();
+
+        assert_receipt(&summary);
+        assert_eq!(fs::read_to_string(&repo.log).unwrap(), "xx");
+        assert!(foreign_repo.join(".git").is_dir());
     }
 
     #[test]
