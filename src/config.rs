@@ -62,6 +62,16 @@ pub enum DirtyWorktreePolicy {
     Halt,
 }
 
+/// How `spr update` handles pre-push validation.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateValidationPolicy {
+    /// Preserve Git's normal pre-push hook behavior.
+    Legacy,
+    /// Require matching `spr validate` receipts and skip push-time hooks.
+    Required,
+}
+
 /// Output ordering for list-style displays.
 ///
 /// The local stack order remains bottom-up and continues to define local PR numbers and
@@ -130,6 +140,8 @@ pub struct FileConfig {
     ///
     /// `0` effectively disables the guard for past terminal PRs.
     pub branch_reuse_guard_days: Option<u32>,
+    /// How `spr update` handles explicit per-PR validation receipts.
+    pub update_validation: Option<UpdateValidationPolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +166,8 @@ pub struct Config {
     ///
     /// `0` effectively disables the guard for past terminal PRs.
     pub branch_reuse_guard_days: u32,
+    /// How `spr update` handles explicit per-PR validation receipts.
+    pub update_validation: UpdateValidationPolicy,
 }
 
 /// Normalize a configured branch prefix and reject values outside the ASCII-only conflict domain.
@@ -193,6 +207,7 @@ fn default_config() -> Config {
         restack_conflict: RestackConflictPolicy::Halt,
         dirty_worktree: DirtyWorktreePolicy::Halt,
         branch_reuse_guard_days: 180,
+        update_validation: UpdateValidationPolicy::Legacy,
     }
 }
 
@@ -227,6 +242,9 @@ fn apply_overrides(config: &Config, overrides: FileConfig) -> Config {
     }
     if let Some(branch_reuse_guard_days) = overrides.branch_reuse_guard_days {
         merged.branch_reuse_guard_days = branch_reuse_guard_days;
+    }
+    if let Some(update_validation) = overrides.update_validation {
+        merged.update_validation = update_validation;
     }
     merged
 }
@@ -268,7 +286,7 @@ mod tests {
     use super::{
         apply_overrides, default_config, load_config, normalize_config, normalize_prefix,
         read_config_file, DirtyWorktreePolicy, FileConfig, LocalPrBranchSyncPolicy,
-        PrDescriptionMode, RestackConflictPolicy,
+        PrDescriptionMode, RestackConflictPolicy, UpdateValidationPolicy,
     };
     use crate::test_support::{git, init_repo, lock_cwd, DirGuard};
     use std::env;
@@ -468,6 +486,48 @@ restack_conflict: rollback
     }
 
     #[test]
+    fn default_config_preserves_legacy_update_validation() {
+        let cfg = default_config();
+
+        assert_eq!(cfg.update_validation, UpdateValidationPolicy::Legacy);
+    }
+
+    #[test]
+    fn read_config_file_parses_required_update_validation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".spr_multicommit_cfg.yml");
+        fs::write(&path, "update_validation: required\n").unwrap();
+
+        let cfg = read_config_file(&path).unwrap().unwrap();
+        assert_eq!(
+            cfg.update_validation,
+            Some(UpdateValidationPolicy::Required)
+        );
+    }
+
+    #[test]
+    fn apply_overrides_updates_validation_policy() {
+        let merged = apply_overrides(
+            &default_config(),
+            FileConfig {
+                base: None,
+                prefix: None,
+                land: None,
+                ignore_tag: None,
+                pr_description_mode: None,
+                list_order: None,
+                local_pr_branches: None,
+                restack_conflict: None,
+                dirty_worktree: None,
+                branch_reuse_guard_days: None,
+                update_validation: Some(UpdateValidationPolicy::Required),
+            },
+        );
+
+        assert_eq!(merged.update_validation, UpdateValidationPolicy::Required);
+    }
+
+    #[test]
     fn read_config_file_parses_local_pr_branch_sync_policy() {
         let dir = tempdir().unwrap();
         let mut path = dir.path().to_path_buf();
@@ -512,6 +572,7 @@ restack_conflict: rollback
                 restack_conflict: None,
                 dirty_worktree: None,
                 branch_reuse_guard_days: Some(30),
+                update_validation: None,
             },
         );
 
@@ -533,6 +594,7 @@ restack_conflict: rollback
                 restack_conflict: None,
                 dirty_worktree: None,
                 branch_reuse_guard_days: None,
+                update_validation: None,
             },
         );
 
