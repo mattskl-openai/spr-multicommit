@@ -11,7 +11,10 @@ use crate::branch_names::{
 use crate::commands::common;
 use crate::config::{ListOrder, LocalPrBranchSyncPolicy, PrDescriptionMode};
 use crate::execution::ExecutionMode;
-use crate::git::{get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw, sanitize_gh_base_ref};
+use crate::git::{
+    fetch_missing_remote_commit_objects, get_remote_branches_sha, gh_rw, git_is_ancestor, git_rw,
+    sanitize_gh_base_ref,
+};
 use crate::github::{
     convert_pull_requests_to_draft, fetch_pr_bodies_graphql, fetch_pr_stage_info_graphql,
     get_repo_owner_name, graphql_escape, is_resource_limit_error,
@@ -647,6 +650,7 @@ fn build_from_groups_internal(
         }
     }
     let remote_map = get_remote_branches_sha(&branch_names)?;
+    fetch_missing_remote_commit_objects(&remote_map.values().cloned().collect::<Vec<_>>())?;
 
     let display_indices = list_order.display_indices(groups.len());
     for (display_idx, group_idx) in display_indices.iter().enumerate() {
