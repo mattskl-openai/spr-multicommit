@@ -143,14 +143,24 @@ fn ensure_stack_context_matches(
     Ok(())
 }
 
+/// Verifies the recorded owner, or discovers candidates when ownership is unknown.
+///
+/// A consistent live selector owner excludes other stack records before their Git
+/// histories are read. The owner's branches must still pass normal verification;
+/// recorded ownership alone does not establish that any branch is safe to use.
 fn matching_verified_stack_ids(
     repo_path: &str,
     metadata: &StackMetadataFile,
     metadata_context: &RefreshMetadataContext,
     candidate_selectors: &[String],
+    recorded_stack_id: Option<&StackId>,
 ) -> Result<BTreeSet<StackId>> {
     let mut matching_stack_ids = BTreeSet::new();
-    for stack_id in metadata.stacks.keys() {
+    for stack_id in metadata
+        .stacks
+        .keys()
+        .filter(|stack_id| recorded_stack_id.is_none_or(|owner| owner == *stack_id))
+    {
         for branch in
             verified_stack_branches(repo_path, metadata, stack_id, &metadata_context.ignore_tag)?
         {
@@ -174,9 +184,15 @@ fn resolve_verified_owning_stack_target(
     metadata: &StackMetadataFile,
     metadata_context: &RefreshMetadataContext,
     candidate_selectors: &[String],
+    recorded_stack_id: Option<&StackId>,
 ) -> Result<Option<(StackId, String)>> {
-    let matching_stack_ids =
-        matching_verified_stack_ids(repo_path, metadata, metadata_context, candidate_selectors)?;
+    let matching_stack_ids = matching_verified_stack_ids(
+        repo_path,
+        metadata,
+        metadata_context,
+        candidate_selectors,
+        recorded_stack_id,
+    )?;
 
     if matching_stack_ids.is_empty() {
         return Ok(None);
@@ -228,10 +244,10 @@ fn resolve_stale_compatible_owning_stack_target(
     repo_path: &str,
     metadata: &StackMetadataFile,
     metadata_context: &RefreshMetadataContext,
-    selector_owners: &BTreeMap<String, StackId>,
+    recorded_stack_id: Option<StackId>,
     candidate_selectors: &[String],
 ) -> Result<(StackId, String)> {
-    let Some(stack_id) = recorded_owning_stack_id(selector_owners, candidate_selectors)? else {
+    let Some(stack_id) = recorded_stack_id else {
         bail!(
             "candidate selector prefix [{}] does not match any verified stack history",
             candidate_selectors.join(", ")
@@ -283,21 +299,24 @@ fn resolve_owning_stack_target(
         bail!("candidate history contains no explicit selectors to identify an owning stack");
     }
     let selector_owners = live_selector_owners(metadata)?;
+    let recorded_stack_id = recorded_owning_stack_id(&selector_owners, candidate_selectors)?;
     if let Some(target) = resolve_verified_owning_stack_target(
         repo_path,
         metadata,
         metadata_context,
         candidate_selectors,
+        recorded_stack_id.as_ref(),
     )? {
-        return Ok(target);
+        Ok(target)
+    } else {
+        resolve_stale_compatible_owning_stack_target(
+            repo_path,
+            metadata,
+            metadata_context,
+            recorded_stack_id,
+            candidate_selectors,
+        )
     }
-    resolve_stale_compatible_owning_stack_target(
-        repo_path,
-        metadata,
-        metadata_context,
-        &selector_owners,
-        candidate_selectors,
-    )
 }
 
 fn verified_owning_stack_branch(
