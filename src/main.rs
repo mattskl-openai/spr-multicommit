@@ -3266,7 +3266,11 @@ mod tests {
         let rewritten_beta_tip = groups[1].commits.last().unwrap();
         assert_eq!(groups[0].commits.len(), 3);
         assert_eq!(groups[1].commits.len(), 2);
-        assert_ne!(rewritten_alpha_tip, &alpha_tail);
+        // Replaying alpha can reproduce its commit ID; its contents must survive.
+        assert_eq!(
+            rev_parse(&repo, &format!("{rewritten_alpha_tip}^{{tree}}")),
+            rev_parse(&repo, &format!("{alpha_tail}^{{tree}}"))
+        );
         assert_ne!(rewritten_beta_tip, &beta_tail);
         assert_eq!(current_branch(&repo), "dank-spr/alpha");
         assert_eq!(rev_parse(&repo, "dank-spr/alpha"), alpha_tail);
@@ -3405,6 +3409,15 @@ mod tests {
         git(&repo, ["branch", "dank-spr/alpha", &alpha_tip].as_slice());
         git(&repo, ["branch", "dank-spr/beta", &beta_tip].as_slice());
         refresh_current_stack_metadata(&repo);
+
+        // Reword the stack's alpha tip without changing its patch. The branch
+        // tail must then get a different parent, forcing a checked-out move.
+        git(&repo, ["checkout", "-B", "stack", &alpha_tip].as_slice());
+        git(
+            &repo,
+            ["commit", "--amend", "-m", "feat: alpha follow-up rewritten"].as_slice(),
+        );
+        git(&repo, ["cherry-pick", &beta_tip].as_slice());
 
         git(&repo, ["checkout", "dank-spr/alpha"].as_slice());
         let alpha_tail = commit_file(
