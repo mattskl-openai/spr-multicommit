@@ -146,6 +146,7 @@ fn init_stale_absorb_metadata_repo() -> (TempDir, std::path::PathBuf) {
     fs::write(repo.join("README.md"), "init\n").unwrap();
     git(&repo, ["add", "README.md"].as_slice());
     git(&repo, ["commit", "-m", "init"].as_slice());
+    commit_file(&repo, "README.md", "init\nbase\n", "advance main");
     let origin = dir.path().join("origin.git");
     git(
         &repo,
@@ -428,6 +429,123 @@ fn absorb_query_json_recovers_same_context_stale_metadata() {
         from_stack_branch,
         &["stack", "dank-spr/alpha", "dank-spr/beta"],
     );
+}
+
+// Verifies: absorption uses the recorded owner despite unrelated shallow history.
+// Catches: scanning an unrelated stack before resolving stale owner metadata.
+#[test]
+fn absorb_ignores_unrelated_shallow_stack_history() {
+    let (_dir, repo) = init_stale_absorb_metadata_repo();
+    let base = git(&repo, &["rev-parse", "main"]).trim().to_string();
+    git(&repo, &["checkout", "-b", "old-stack", "main^"]);
+    commit_file(&repo, "old.txt", "old\n", "feat: old start pr:old");
+    let update = run_spr(&[
+        "--cd",
+        repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--prefix",
+        "dank-spr/",
+        "update",
+        "--no-pr",
+        "--json",
+    ]);
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stdout)
+    );
+    let old_tip = git(&repo, &["rev-parse", "old-stack"]);
+
+    // Both stacks share an older commit, but only the target descends from
+    // the shallow boundary. Its unrelated predecessor must not block absorb.
+    let shallow_path = repo.join(".git/shallow");
+    let shallow_contents = format!("{base}\n");
+    fs::write(&shallow_path, &shallow_contents).unwrap();
+    let unrelated_history = Command::new("git")
+        .current_dir(&repo)
+        .args(["merge-base", "main", "old-stack"])
+        .output()
+        .unwrap();
+    assert_eq!(unrelated_history.status.code(), Some(1));
+
+    for branch in ["dank-spr/alpha", "stack"] {
+        git(&repo, &["checkout", branch]);
+        let query = run_spr(&[
+            "--cd",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "absorb",
+            "--from",
+            "pr:alpha",
+            "--query-changed-branches",
+            "--json",
+        ]);
+        assert_absorb_changed_branches(query, &["stack", "dank-spr/alpha", "dank-spr/beta"]);
+    }
+
+    let apply = run_spr(&[
+        "--cd",
+        repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--prefix",
+        "dank-spr/",
+        "absorb",
+        "--from",
+        "pr:alpha",
+        "--json",
+    ]);
+    assert!(
+        apply.status.success(),
+        "spr absorb failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert_eq!(stdout_json(&apply)["result"], "completed");
+    let subjects = git(&repo, &["log", "--reverse", "--format=%s", "main..stack"]);
+    assert_eq!(
+        subjects.lines().collect::<Vec<_>>(),
+        [
+            "feat: alpha start pr:alpha",
+            "feat: alpha follow-up",
+            "feat: alpha branch tail",
+            "feat: beta start pr:beta",
+            "feat: beta stack drift",
+        ]
+    );
+    assert_eq!(git(&repo, &["merge-base", "main", "stack"]).trim(), base);
+    assert_eq!(git(&repo, &["rev-parse", "old-stack"]), old_tip);
+    assert_eq!(fs::read_to_string(shallow_path).unwrap(), shallow_contents);
+}
+
+// Negative test: an unreadable owner base validates error handling instead of skipping it.
+#[test]
+fn absorb_query_json_rejects_unreadable_recorded_owner_history() {
+    let (_dir, repo) = init_stale_absorb_metadata_repo();
+    mutate_first_stack_record(&repo, |stack_record| {
+        stack_record.insert(
+            "base".to_string(),
+            Value::String("missing-base".to_string()),
+        );
+    });
+    let output = run_spr(&[
+        "--cd",
+        repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--prefix",
+        "dank-spr/",
+        "absorb",
+        "--from",
+        "pr:alpha",
+        "--query-changed-branches",
+        "--json",
+    ]);
+    assert_absorb_json_error_contains(output, "missing-base");
 }
 
 #[test]
