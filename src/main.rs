@@ -3566,7 +3566,7 @@ mod tests {
     }
 
     #[test]
-    fn update_json_until_selector_reports_resolved_pr_extent() {
+    fn update_json_until_selector_limits_published_groups() {
         let _lock = lock_cwd();
         let dir = init_update_stack_repo();
         let repo = dir.path().join("repo");
@@ -3586,7 +3586,7 @@ mod tests {
             "--json",
             "--no-pr",
             "--until",
-            "pr:beta",
+            "pr:alpha",
         ])
         .unwrap();
 
@@ -3594,8 +3594,9 @@ mod tests {
 
         match output {
             CommandOutput::Update(output) => {
-                assert_eq!(output.data.extent, ResolvedUpdateLimit::ByPr { count: 2 });
-                assert_eq!(output.data.groups.len(), 2);
+                assert_eq!(output.data.extent, ResolvedUpdateLimit::ByPr { count: 1 });
+                assert_eq!(output.data.groups.len(), 1);
+                assert_eq!(output.data.groups[0].stable_handle, "pr:alpha");
             }
             other => panic!("unexpected command output: {:?}", other),
         }
