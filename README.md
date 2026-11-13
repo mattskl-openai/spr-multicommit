@@ -57,6 +57,16 @@ spr list commit
 spr update
 ```
 
+Markers can occur anywhere in a commit message, including its subject or body.
+`pr:` and `branch:` must begin the message or immediately follow whitespace
+(including spaces, tabs, newlines and Unicode whitespace). The keywords are
+case-insensitive, and the label or branch name must immediately follow the colon.
+For example, `feat: parser pr:alpha` and a separate `branch:feature/login` line
+contain markers. `Upstream-PR:`, `upstreampr:alpha`, `upstreambranch:feature/login`
+and `,pr:alpha` are ordinary text. A commit without a recognized marker joins
+the current group or ignore block, or remains ungrouped before the first marker.
+This boundary also governs removal of markers from generated PR titles and bodies.
+
 Each PR group has exactly one marker. `pr:<tag>` derives `prefix + tag`, while
 `branch:<branch-name>` preserves that exact Git branch name. `pr:` labels must
 start with an ASCII letter; `branch:` payloads use Git branch-name validation.
