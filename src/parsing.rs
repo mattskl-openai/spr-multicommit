@@ -453,6 +453,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_groups_ignores_upstream_pr_trailers() {
+        let raw = make_log(&[
+            ("a1", "feat: alpha pr:alpha"),
+            (
+                "a2",
+                "feat: follow-up\n\nUpstream-PR: https://github.com/google/xls/pull/5056",
+            ),
+            (
+                "b1",
+                "feat: beta\n\nUpstream-PR: https://github.com/google/xls/pull/5056\n\npr:beta",
+            ),
+        ]);
+
+        let groups = parse_groups(&raw, "ignore").unwrap();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].bare_selector_text(), "alpha");
+        assert_eq!(groups[0].commits, vec!["a1", "a2"]);
+        assert_eq!(groups[1].bare_selector_text(), "beta");
+        assert_eq!(groups[1].commits, vec!["b1"]);
+    }
+
+    // Verifies: only whitespace-delimited markers start groups or ignore blocks.
+    // Catches: punctuation-prefixed prose changing the grouping of commits.
+    #[test]
+    fn parse_groups_requires_whitespace_before_markers() {
+        let raw = make_log(&[
+            ("a1", "pr:alpha"),
+            ("a2", "feat: follow-up,pr:beta"),
+            ("a3", "feat: follow-up,pr:ignore"),
+            ("a4", "feat: follow-up,branch:feature/other"),
+            ("b1", "feat: beta\n\n,pr:mentioned\n\tbranch:feature/beta"),
+        ]);
+
+        let groups = parse_groups(&raw, "ignore").unwrap();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].selector_text(), "pr:alpha");
+        assert_eq!(groups[0].commits, vec!["a1", "a2", "a3", "a4"]);
+        assert!(groups[0].ignored_after.is_empty());
+        assert_eq!(groups[1].selector_text(), "branch:feature/beta");
+        assert_eq!(groups[1].commits, vec!["b1"]);
+    }
+
+    #[test]
     fn parse_groups_accepts_mixed_pr_and_branch_markers() {
         let raw = make_log(&[
             ("a1", "feat: login start branch:feature/login"),
