@@ -83,9 +83,9 @@ fn command_requires_gh(cmd: &crate::cli::Cmd) -> bool {
             .map(crate::commands::looks_like_pr_url)
             .unwrap_or(false),
         crate::cli::Cmd::Update { no_pr, .. } => !*no_pr,
-        crate::cli::Cmd::List { .. }
-        | crate::cli::Cmd::Status
-        | crate::cli::Cmd::Prep { .. }
+        crate::cli::Cmd::List { what } => !what.local(),
+        crate::cli::Cmd::Status { local } => !*local,
+        crate::cli::Cmd::Prep { .. }
         | crate::cli::Cmd::DropMergedPrefix { .. }
         | crate::cli::Cmd::Land { .. }
         | crate::cli::Cmd::RelinkPrs { .. }
@@ -313,12 +313,14 @@ fn read_only_pr_list_output(
     prefix: &str,
     ignore_tag: &str,
     local_pr_branch_policy: crate::config::LocalPrBranchSyncPolicy,
+    local: bool,
 ) -> std::result::Result<crate::read_only_output::ReadOnlyOutput, crate::json_output::ErrorOutput> {
     match crate::commands::collect_pr_list_data_for_json(
         base,
         prefix,
         ignore_tag,
         local_pr_branch_policy,
+        local,
     ) {
         Ok(data) => Ok(crate::read_only_output::pr_list(command, data)),
         Err(crate::commands::ReadOnlyQueryError::SyntheticBranchNameCollision(collision)) => Err(
@@ -336,12 +338,14 @@ fn read_only_commit_list_output(
     prefix: &str,
     ignore_tag: &str,
     local_pr_branch_policy: crate::config::LocalPrBranchSyncPolicy,
+    local: bool,
 ) -> std::result::Result<crate::read_only_output::ReadOnlyOutput, crate::json_output::ErrorOutput> {
     match crate::commands::collect_commit_list_data_for_json(
         base,
         prefix,
         ignore_tag,
         local_pr_branch_policy,
+        local,
     ) {
         Ok(data) => Ok(crate::read_only_output::commit_list(command, data)),
         Err(crate::commands::ReadOnlyQueryError::SyntheticBranchNameCollision(collision)) => Err(
@@ -790,25 +794,28 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 Ok(CommandOutput::None)
             }
         }
-        crate::cli::Cmd::List { what, .. } => {
+        crate::cli::Cmd::List { what } => {
+            let local = what.local();
             if output_format == crate::cli::OutputFormat::Json {
                 match what {
-                    crate::cli::ListWhat::Pr => match read_only_pr_list_output(
+                    crate::cli::ListWhat::Pr { .. } => match read_only_pr_list_output(
                         crate::json_output::JsonCommand::ListPr,
                         &base,
                         &prefix,
                         &ignore_tag,
                         local_pr_branch_policy,
+                        local,
                     ) {
                         Ok(output) => Ok(CommandOutput::ReadOnly(output)),
                         Err(output) => Ok(CommandOutput::Error(output)),
                     },
-                    crate::cli::ListWhat::Commit => match read_only_commit_list_output(
+                    crate::cli::ListWhat::Commit { .. } => match read_only_commit_list_output(
                         crate::json_output::JsonCommand::ListCommit,
                         &base,
                         &prefix,
                         &ignore_tag,
                         local_pr_branch_policy,
+                        local,
                     ) {
                         Ok(output) => Ok(CommandOutput::ReadOnly(output)),
                         Err(output) => Ok(CommandOutput::Error(output)),
@@ -816,25 +823,27 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                 }
             } else {
                 match what {
-                    crate::cli::ListWhat::Pr => crate::commands::list_prs_display(
+                    crate::cli::ListWhat::Pr { .. } => crate::commands::list_prs_display(
                         &base,
                         &prefix,
                         &ignore_tag,
                         list_order,
                         local_pr_branch_policy,
+                        local,
                     )?,
-                    crate::cli::ListWhat::Commit => crate::commands::list_commits_display(
+                    crate::cli::ListWhat::Commit { .. } => crate::commands::list_commits_display(
                         &base,
                         &prefix,
                         &ignore_tag,
                         list_order,
                         local_pr_branch_policy,
+                        local,
                     )?,
                 }
                 Ok(CommandOutput::None)
             }
         }
-        crate::cli::Cmd::Status => {
+        crate::cli::Cmd::Status { local } => {
             if output_format == crate::cli::OutputFormat::Json {
                 match read_only_pr_list_output(
                     crate::json_output::JsonCommand::Status,
@@ -842,6 +851,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     &prefix,
                     &ignore_tag,
                     local_pr_branch_policy,
+                    local,
                 ) {
                     Ok(output) => Ok(CommandOutput::ReadOnly(output)),
                     Err(output) => Ok(CommandOutput::Error(output)),
@@ -853,6 +863,7 @@ fn run_cli(cli: crate::cli::Cli, output_format: crate::cli::OutputFormat) -> Res
                     &ignore_tag,
                     list_order,
                     local_pr_branch_policy,
+                    local,
                 )?;
                 Ok(CommandOutput::None)
             }
@@ -1240,11 +1251,13 @@ fn json_command_for_cli(cmd: &crate::cli::Cmd) -> crate::json_output::JsonComman
         crate::cli::Cmd::Move { .. } => crate::machine_output::MachineCommand::Move,
         crate::cli::Cmd::Update { .. } => crate::machine_output::MachineCommand::Update,
         crate::cli::Cmd::Prep { .. } => crate::machine_output::MachineCommand::Prep,
-        crate::cli::Cmd::List { what, .. } => match what {
-            crate::cli::ListWhat::Pr => crate::machine_output::MachineCommand::ListPr,
-            crate::cli::ListWhat::Commit => crate::machine_output::MachineCommand::ListCommit,
+        crate::cli::Cmd::List { what } => match what {
+            crate::cli::ListWhat::Pr { .. } => crate::machine_output::MachineCommand::ListPr,
+            crate::cli::ListWhat::Commit { .. } => {
+                crate::machine_output::MachineCommand::ListCommit
+            }
         },
-        crate::cli::Cmd::Status => crate::machine_output::MachineCommand::Status,
+        crate::cli::Cmd::Status { .. } => crate::machine_output::MachineCommand::Status,
         crate::cli::Cmd::SyncLocalBranches => {
             crate::machine_output::MachineCommand::SyncLocalBranches
         }
@@ -1453,7 +1466,22 @@ mod tests {
 
     #[test]
     fn status_requires_github_cli() {
-        assert!(command_requires_gh(&crate::cli::Cmd::Status));
+        assert!(command_requires_gh(&crate::cli::Cmd::Status {
+            local: false,
+        }));
+    }
+
+    #[test]
+    fn local_list_and_status_skip_github_cli_checks() {
+        assert!(!command_requires_gh(&crate::cli::Cmd::List {
+            what: crate::cli::ListWhat::Pr { local: true },
+        }));
+        assert!(!command_requires_gh(&crate::cli::Cmd::List {
+            what: crate::cli::ListWhat::Commit { local: true },
+        }));
+        assert!(!command_requires_gh(&crate::cli::Cmd::Status {
+            local: true,
+        }));
     }
 
     #[test]
@@ -1941,15 +1969,55 @@ mod tests {
 
     fn list_json_gh_script(
         log_path: &std::path::Path,
-        open_json_path: &std::path::Path,
-        status_json_path: &std::path::Path,
+        response_json_path: &std::path::Path,
     ) -> String {
         format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'gh test wrapper'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  query_arg=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"-f\" ]; then\n      query_arg=\"$2\"\n      break\n    fi\n    shift\n  done\n  case \"$query_arg\" in\n    *\"states:[OPEN]\"*)\n      cat \"{}\" ;;\n    *\"is:pr is:open head:dank-spr/alpha\"*)\n      echo '{{\"data\":{{\"pr0\":{{\"nodes\":[]}},\"pr1\":{{\"nodes\":[]}}}}}}' ;;\n    *\"pullRequest(number: 17)\"*\"pullRequest(number: 18)\"*)\n      cat \"{}\" ;;\n    *)\n      echo '{{\"data\":{{}}}}' ;;\n  esac\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[]'\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'gh test wrapper'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  cat \"{}\"\n  exit 0\nfi\necho \"unexpected gh invocation: $*\" >&2\nexit 1\n",
             log_path.display(),
-            open_json_path.display(),
-            status_json_path.display()
+            response_json_path.display()
         )
+    }
+
+    fn list_json_response() -> String {
+        serde_json::to_string(&serde_json::json!({
+            "data": {
+                "repository": {
+                    "open0": {
+                        "nodes": [{
+                            "number": 17,
+                            "headRefName": "dank-spr/alpha",
+                            "baseRefName": "main",
+                            "state": "OPEN",
+                            "mergedAt": serde_json::Value::Null,
+                            "url": "https://github.com/o/r/pull/17",
+                            "reviewDecision": "APPROVED",
+                            "reviews": { "nodes": [{ "state": "APPROVED" }] },
+                            "commits": { "nodes": [{ "commit": {
+                                "statusCheckRollup": { "state": "SUCCESS" }
+                            }}] }
+                        }]
+                    },
+                    "merged0": { "nodes": [] },
+                    "open1": {
+                        "nodes": [{
+                            "number": 18,
+                            "headRefName": "dank-spr/beta",
+                            "baseRefName": "dank-spr/alpha",
+                            "state": "OPEN",
+                            "mergedAt": serde_json::Value::Null,
+                            "url": "https://github.com/o/r/pull/18",
+                            "reviewDecision": "REVIEW_REQUIRED",
+                            "reviews": { "nodes": [] },
+                            "commits": { "nodes": [{ "commit": {
+                                "statusCheckRollup": { "state": "PENDING" }
+                            }}] }
+                        }]
+                    },
+                    "merged1": { "nodes": [] }
+                }
+            }
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -2210,81 +2278,9 @@ mod tests {
         let _restore = CurrentDirGuard::capture();
         let repo = init_local_stack_repo();
         let log_path = repo.path().join("gh.log");
-        let open_json_path = repo.path().join("gh-open.json");
-        let status_json_path = repo.path().join("gh-status.json");
-        fs::write(
-            &open_json_path,
-            serde_json::to_string(&serde_json::json!({
-                "data": {
-                    "repository": {
-                        "pr0": {
-                            "nodes": [{
-                                "number": 17,
-                                "headRefName": "dank-spr/alpha",
-                                "baseRefName": "main",
-                                "state": "OPEN",
-                                "mergedAt": serde_json::Value::Null,
-                                "closedAt": serde_json::Value::Null,
-                                "url": "https://github.com/o/r/pull/17",
-                                "autoMergeRequest": serde_json::Value::Null
-                            }]
-                        },
-                        "pr1": {
-                            "nodes": [{
-                                "number": 18,
-                                "headRefName": "dank-spr/beta",
-                                "baseRefName": "main",
-                                "state": "OPEN",
-                                "mergedAt": serde_json::Value::Null,
-                                "closedAt": serde_json::Value::Null,
-                                "url": "https://github.com/o/r/pull/18",
-                                "autoMergeRequest": serde_json::Value::Null
-                            }]
-                        }
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            &status_json_path,
-            serde_json::to_string(&serde_json::json!({
-                "data": {
-                    "repository": {
-                        "pr0": {
-                            "reviewDecision": "APPROVED",
-                            "isDraft": false,
-                            "reviewRequests": { "totalCount": 0 },
-                            "reviews": { "nodes": [{ "state": "APPROVED" }] },
-                            "commits": {
-                                "nodes": [{
-                                    "commit": {
-                                        "statusCheckRollup": { "state": "SUCCESS" }
-                                    }
-                                }]
-                            }
-                        },
-                        "pr1": {
-                            "reviewDecision": "REVIEW_REQUIRED",
-                            "isDraft": false,
-                            "reviewRequests": { "totalCount": 0 },
-                            "reviews": { "nodes": [] },
-                            "commits": {
-                                "nodes": [{
-                                    "commit": {
-                                        "statusCheckRollup": { "state": "PENDING" }
-                                    }
-                                }]
-                            }
-                        }
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let script = list_json_gh_script(&log_path, &open_json_path, &status_json_path);
+        let response_json_path = repo.path().join("gh-list.json");
+        fs::write(&response_json_path, list_json_response()).unwrap();
+        let script = list_json_gh_script(&log_path, &response_json_path);
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
         let cli = crate::cli::Cli::try_parse_from([
             "spr",
@@ -2332,6 +2328,59 @@ mod tests {
             }
             other => panic!("unexpected command output: {:?}", other),
         }
+        let gh_log = fs::read_to_string(log_path).unwrap();
+        assert_eq!(gh_log.lines().count(), 1, "{gh_log}");
+        assert!(!gh_log.contains("search(query:"), "{gh_log}");
+    }
+
+    #[test]
+    fn run_cli_local_pr_json_never_invokes_github() {
+        let _lock = lock_cwd();
+        let _restore = CurrentDirGuard::capture();
+        let repo = init_local_stack_repo();
+        let log_path = repo.path().join("gh.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\necho 'gh must not run in local mode' >&2\nexit 1\n",
+            log_path.display()
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+        let cli = crate::cli::Cli::try_parse_from([
+            "spr",
+            "--cd",
+            repo.path().to_str().unwrap(),
+            "--base",
+            "main",
+            "--prefix",
+            "dank-spr/",
+            "list",
+            "--json",
+            "pr",
+            "--local",
+        ])
+        .unwrap();
+
+        let output = run_cli(cli, OutputFormat::Json).unwrap();
+
+        match output {
+            CommandOutput::ReadOnly(output) => match output.data {
+                ReadOnlyPayload::PrList { data } => {
+                    assert_eq!(data.groups.len(), 2);
+                    assert!(data.groups.iter().all(|group| matches!(
+                        group.remote.state,
+                        crate::commands::RemotePrState::NotQueried
+                    )));
+                    let json = serde_json::to_value(crate::read_only_output::pr_list(
+                        JsonCommand::ListPr,
+                        data,
+                    ))
+                    .unwrap();
+                    assert_eq!(json["data"]["groups"][0]["remote"]["kind"], "not_queried");
+                }
+                other => panic!("unexpected read-only payload: {other:?}"),
+            },
+            other => panic!("unexpected command output: {other:?}"),
+        }
+        assert!(!log_path.exists(), "local mode invoked gh");
     }
 
     #[test]
@@ -2345,15 +2394,13 @@ mod tests {
             ["branch", "dank-spr/alpha", &alpha_tip].as_slice(),
         );
         let log_path = repo.path().join("gh.log");
-        let open_json_path = repo.path().join("gh-open.json");
-        let status_json_path = repo.path().join("gh-status.json");
+        let response_json_path = repo.path().join("gh-list.json");
         fs::write(
-            &open_json_path,
-            "{\"data\":{\"repository\":{\"pr0\":{\"nodes\":[]},\"pr1\":{\"nodes\":[]}}}}",
+            &response_json_path,
+            "{\"data\":{\"repository\":{\"open0\":{\"nodes\":[]},\"merged0\":{\"nodes\":[]},\"open1\":{\"nodes\":[]},\"merged1\":{\"nodes\":[]}}}}",
         )
         .unwrap();
-        fs::write(&status_json_path, "{\"data\":{\"repository\":{}}}").unwrap();
-        let script = list_json_gh_script(&log_path, &open_json_path, &status_json_path);
+        let script = list_json_gh_script(&log_path, &response_json_path);
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
         let cli = crate::cli::Cli::try_parse_from([
             "spr",
@@ -2465,81 +2512,9 @@ mod tests {
         let _restore = CurrentDirGuard::capture();
         let repo = init_local_stack_repo();
         let log_path = repo.path().join("gh.log");
-        let open_json_path = repo.path().join("gh-open.json");
-        let status_json_path = repo.path().join("gh-status.json");
-        fs::write(
-            &open_json_path,
-            serde_json::to_string(&serde_json::json!({
-                "data": {
-                    "repository": {
-                        "pr0": {
-                            "nodes": [{
-                                "number": 17,
-                                "headRefName": "dank-spr/alpha",
-                                "baseRefName": "main",
-                                "state": "OPEN",
-                                "mergedAt": serde_json::Value::Null,
-                                "closedAt": serde_json::Value::Null,
-                                "url": "https://github.com/o/r/pull/17",
-                                "autoMergeRequest": serde_json::Value::Null
-                            }]
-                        },
-                        "pr1": {
-                            "nodes": [{
-                                "number": 18,
-                                "headRefName": "dank-spr/beta",
-                                "baseRefName": "main",
-                                "state": "OPEN",
-                                "mergedAt": serde_json::Value::Null,
-                                "closedAt": serde_json::Value::Null,
-                                "url": "https://github.com/o/r/pull/18",
-                                "autoMergeRequest": serde_json::Value::Null
-                            }]
-                        }
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            &status_json_path,
-            serde_json::to_string(&serde_json::json!({
-                "data": {
-                    "repository": {
-                        "pr0": {
-                            "reviewDecision": "APPROVED",
-                            "isDraft": false,
-                            "reviewRequests": { "totalCount": 0 },
-                            "reviews": { "nodes": [{ "state": "APPROVED" }] },
-                            "commits": {
-                                "nodes": [{
-                                    "commit": {
-                                        "statusCheckRollup": { "state": "SUCCESS" }
-                                    }
-                                }]
-                            }
-                        },
-                        "pr1": {
-                            "reviewDecision": "REVIEW_REQUIRED",
-                            "isDraft": false,
-                            "reviewRequests": { "totalCount": 0 },
-                            "reviews": { "nodes": [] },
-                            "commits": {
-                                "nodes": [{
-                                    "commit": {
-                                        "statusCheckRollup": { "state": "PENDING" }
-                                    }
-                                }]
-                            }
-                        }
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let script = list_json_gh_script(&log_path, &open_json_path, &status_json_path);
+        let response_json_path = repo.path().join("gh-list.json");
+        fs::write(&response_json_path, list_json_response()).unwrap();
+        let script = list_json_gh_script(&log_path, &response_json_path);
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
         let list_cli = crate::cli::Cli::try_parse_from([
             "spr",
@@ -2586,35 +2561,30 @@ mod tests {
         let _restore = CurrentDirGuard::capture();
         let repo = init_local_stack_repo();
         let log_path = repo.path().join("gh.log");
-        let open_json_path = repo.path().join("gh-open.json");
-        let status_json_path = repo.path().join("gh-status.json");
+        let response_json_path = repo.path().join("gh-list.json");
         fs::write(
-            &open_json_path,
+            &response_json_path,
             serde_json::to_string(&serde_json::json!({
                 "data": {
                     "repository": {
-                        "pr0": {
+                        "open0": {
                             "nodes": [{
                                 "number": 17,
                                 "headRefName": "dank-spr/alpha",
                                 "baseRefName": "main",
                                 "state": "OPEN",
                                 "mergedAt": serde_json::Value::Null,
-                                "closedAt": serde_json::Value::Null,
-                                "url": "https://github.com/o/r/pull/17",
-                                "autoMergeRequest": serde_json::Value::Null
+                                "url": "https://github.com/o/r/pull/17"
                             }]
                         },
-                        "pr1": {
+                        "open1": {
                             "nodes": [{
                                 "number": 18,
                                 "headRefName": "dank-spr/beta",
                                 "baseRefName": "main",
                                 "state": "OPEN",
                                 "mergedAt": serde_json::Value::Null,
-                                "closedAt": serde_json::Value::Null,
-                                "url": "https://github.com/o/r/pull/18",
-                                "autoMergeRequest": serde_json::Value::Null
+                                "url": "https://github.com/o/r/pull/18"
                             }]
                         }
                     }
@@ -2623,44 +2593,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        fs::write(
-            &status_json_path,
-            serde_json::to_string(&serde_json::json!({
-                "data": {
-                    "repository": {
-                        "pr0": {
-                            "reviewDecision": "APPROVED",
-                            "isDraft": false,
-                            "reviewRequests": { "totalCount": 0 },
-                            "reviews": { "nodes": [{ "state": "APPROVED" }] },
-                            "commits": {
-                                "nodes": [{
-                                    "commit": {
-                                        "statusCheckRollup": { "state": "SUCCESS" }
-                                    }
-                                }]
-                            }
-                        },
-                        "pr1": {
-                            "reviewDecision": "REVIEW_REQUIRED",
-                            "isDraft": false,
-                            "reviewRequests": { "totalCount": 0 },
-                            "reviews": { "nodes": [] },
-                            "commits": {
-                                "nodes": [{
-                                    "commit": {
-                                        "statusCheckRollup": { "state": "PENDING" }
-                                    }
-                                }]
-                            }
-                        }
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let script = list_json_gh_script(&log_path, &open_json_path, &status_json_path);
+        let script = list_json_gh_script(&log_path, &response_json_path);
         let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
         let cli = crate::cli::Cli::try_parse_from([
             "spr",
@@ -2692,11 +2625,23 @@ mod tests {
                     );
                     assert_eq!(data.groups[1].stable_handle, "pr:beta");
                     assert_eq!(data.groups[1].commits[0].global_commit_index, 3);
+                    assert!(matches!(
+                        &data.groups[0].remote.state,
+                        crate::commands::RemotePrState::RemoteWithoutCiReview { url, .. }
+                            if url == "https://github.com/o/r/pull/17"
+                    ));
                 }
                 other => panic!("unexpected read-only payload: {:?}", other),
             },
             other => panic!("unexpected command output: {:?}", other),
         }
+
+        let requests = fs::read_to_string(log_path).unwrap();
+        assert_eq!(requests.lines().count(), 1);
+        assert!(requests.contains("states:[OPEN]"));
+        assert!(!requests.contains("merged0:"));
+        assert!(!requests.contains("reviewDecision"));
+        assert!(!requests.contains("search(query:"));
     }
 
     #[test]

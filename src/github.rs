@@ -3,12 +3,12 @@
 //! This module centralizes read/write calls to GitHub so command modules can operate on
 //! typed results instead of raw JSON. The status-list path relies on branch-name lookups:
 //! for each local stack head, we resolve either the currently open PR or (if none is open)
-//! the latest merged PR for that exact synthetic branch name, while still treating case-only
-//! remote head variants as explicit conflicts. The update preflight separately looks up the
-//! latest terminal PR event for a canonical head ref so branch-name reuse can be blocked after
-//! recent merges or closes.
+//! the latest merged PR for that exact synthetic branch name. Read-only list queries intentionally
+//! avoid case-insensitive conflict searches; mutating commands retain those exhaustive guards. The
+//! update preflight separately looks up the latest terminal PR event for a canonical head ref so
+//! branch-name reuse can be blocked after recent merges or closes.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -97,11 +97,14 @@ const MAX_CONFLICT_HEADS_PER_QUERY: usize = 10;
 const MAX_TERMINAL_HEADS_PER_QUERY: usize = 10;
 const MAX_PR_BODIES_PER_QUERY: usize = 10;
 const MAX_PR_STATUS_PER_QUERY: usize = 20;
+const MAX_LIST_HEADS_PER_QUERY: usize = 20;
 const HEAD_SEARCH_FIELDS: &str =
     "number,headRefName,baseRefName,state,mergedAt,closedAt,url,autoMergeRequest";
 const EXACT_HEAD_QUERY_LIMIT: usize = 10;
 const EXACT_PR_GRAPHQL_FIELDS: &str =
     "number headRefName baseRefName state mergedAt closedAt url autoMergeRequest { enabledAt }";
+const LIST_PR_IDENTITY_FIELDS: &str = "number headRefName baseRefName state mergedAt url";
+const LIST_PR_STATUS_FIELDS: &str = "reviewDecision reviews(last:50, states:[APPROVED,CHANGES_REQUESTED]) { nodes { state } } commits(last:1) { nodes { commit { statusCheckRollup { state } } } }";
 const TERMINAL_PR_SEARCH_GRAPHQL_FIELDS: &str = "number headRefName state mergedAt closedAt url";
 
 #[derive(Debug, Deserialize, Clone)]
@@ -933,6 +936,261 @@ pub struct PrCiReviewStatus {
     pub review_decision: PrReviewDecision,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReadOnlyListPrInfo {
+    pub pr: PrInfoWithState,
+    pub ci_review_status: Option<PrCiReviewStatus>,
+}
+
+fn parse_pr_ci_review_status(node: &serde_json::Value) -> PrCiReviewStatus {
+    let mut review = node["reviewDecision"]
+        .as_str()
+        .map(PrReviewDecision::from_graphql_state)
+        .unwrap_or(PrReviewDecision::Unknown);
+    let mut ci = PrCiState::Success;
+    if let Some(commit) = node["commits"]["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.first())
+    {
+        if let Some(state) = commit["commit"]["statusCheckRollup"]["state"].as_str() {
+            ci = PrCiState::from_graphql_state(state);
+        }
+    }
+    if review == PrReviewDecision::Unknown {
+        let mut has_changes_requested = false;
+        let mut has_approved = false;
+        if let Some(nodes) = node["reviews"]["nodes"].as_array() {
+            for review_node in nodes {
+                match review_node["state"].as_str().unwrap_or("") {
+                    "CHANGES_REQUESTED" => has_changes_requested = true,
+                    "APPROVED" => has_approved = true,
+                    _ => {}
+                }
+            }
+        }
+        review = if has_changes_requested {
+            PrReviewDecision::ChangesRequested
+        } else if has_approved {
+            PrReviewDecision::Approved
+        } else {
+            PrReviewDecision::ReviewRequired
+        };
+    }
+
+    PrCiReviewStatus {
+        ci_state: ci,
+        review_decision: review,
+    }
+}
+
+fn read_only_list_pr_from_head_search(
+    pr: HeadSearchPr,
+    requested_head: &str,
+    state: PrState,
+    ci_review_status: Option<PrCiReviewStatus>,
+) -> Result<ReadOnlyListPrInfo> {
+    let base = pr.base.ok_or_else(|| {
+        anyhow!(
+            "PR #{} missing baseRefName for requested head {}",
+            pr.number,
+            requested_head
+        )
+    })?;
+    let url = pr.url.ok_or_else(|| {
+        anyhow!(
+            "PR #{} missing url for requested head {}",
+            pr.number,
+            requested_head
+        )
+    })?;
+    Ok(ReadOnlyListPrInfo {
+        pr: PrInfoWithState {
+            number: pr.number,
+            head: pr.head,
+            base,
+            state,
+            url,
+        },
+        ci_review_status,
+    })
+}
+
+fn fetch_read_only_pr_status_chunk(
+    heads: &[String],
+    include_status: bool,
+) -> Result<HashMap<String, ReadOnlyListPrInfo>> {
+    let mut out = HashMap::new();
+    if heads.is_empty() {
+        return Ok(out);
+    }
+    let (owner, name) = get_repo_owner_name()?;
+    let open_fields = if include_status {
+        format!("{LIST_PR_IDENTITY_FIELDS} {LIST_PR_STATUS_FIELDS}")
+    } else {
+        LIST_PR_IDENTITY_FIELDS.to_string()
+    };
+    let mut query =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (index, head) in heads.iter().enumerate() {
+        let escaped_head = graphql_escape(head);
+        query.push_str(&format!(
+            "open{index}: pullRequests(headRefName:\"{escaped_head}\", states:[OPEN], first:{EXACT_HEAD_QUERY_LIMIT}, orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ {open_fields} }} }} "
+        ));
+        query.push_str(&format!(
+            "merged{index}: pullRequests(headRefName:\"{escaped_head}\", states:[MERGED], first:{EXACT_HEAD_QUERY_LIMIT}, orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ {LIST_PR_IDENTITY_FIELDS} }} }} "
+        ));
+    }
+    query.push_str("} }");
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-F",
+            &format!("owner={owner}"),
+            "-F",
+            &format!("name={name}"),
+        ]
+        .as_slice(),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &value["data"]["repository"];
+    for (index, head) in heads.iter().enumerate() {
+        let open_nodes = repo[format!("open{index}")]["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let open_matches = open_nodes
+            .iter()
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<Vec<HeadSearchPr>, _>>()?;
+        if let Some(pr) = select_single_open_pr_match(head, open_matches)? {
+            let status = if include_status {
+                open_nodes
+                    .iter()
+                    .find(|node| node["number"].as_u64() == Some(pr.number))
+                    .map(parse_pr_ci_review_status)
+            } else {
+                None
+            };
+            out.insert(
+                head.clone(),
+                read_only_list_pr_from_head_search(pr, head, PrState::Open, status)?,
+            );
+            continue;
+        }
+
+        let merged_matches = repo[format!("merged{index}")]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<Vec<HeadSearchPr>, _>>()?;
+        if let Some(pr) = select_latest_merged_pr_match(head, &merged_matches)? {
+            out.insert(
+                head.clone(),
+                read_only_list_pr_from_head_search(pr, head, PrState::Merged, None)?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+pub fn fetch_read_only_pr_status(heads: &[String]) -> Result<HashMap<String, ReadOnlyListPrInfo>> {
+    let mut out = HashMap::new();
+    for chunk in heads.chunks(MAX_LIST_HEADS_PER_QUERY) {
+        let rich = run_read_chunk_with_retry(
+            chunk,
+            &|subset| fetch_read_only_pr_status_chunk(subset, true),
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        );
+        let chunk_out = match rich {
+            Ok(chunk_out) => chunk_out,
+            Err(rich_err) => run_read_chunk_with_retry(
+                chunk,
+                &|subset| fetch_read_only_pr_status_chunk(subset, false),
+                &|mut left, right| {
+                    left.extend(right);
+                    left
+                },
+            )
+            .with_context(|| format!("status query failed: {rich_err:#}"))?,
+        };
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
+fn fetch_read_only_open_prs_chunk(heads: &[String]) -> Result<HashMap<String, PrInfoWithState>> {
+    let mut out = HashMap::new();
+    if heads.is_empty() {
+        return Ok(out);
+    }
+    let (owner, name) = get_repo_owner_name()?;
+    let mut query =
+        String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
+    for (index, head) in heads.iter().enumerate() {
+        query.push_str(&format!(
+            "open{index}: pullRequests(headRefName:\"{}\", states:[OPEN], first:{EXACT_HEAD_QUERY_LIMIT}, orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ {LIST_PR_IDENTITY_FIELDS} }} }} ",
+            graphql_escape(head)
+        ));
+    }
+    query.push_str("} }");
+    let json = gh_ro(
+        [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-F",
+            &format!("owner={owner}"),
+            "-F",
+            &format!("name={name}"),
+        ]
+        .as_slice(),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let repo = &value["data"]["repository"];
+    for (index, head) in heads.iter().enumerate() {
+        let matches = repo[format!("open{index}")]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<Vec<HeadSearchPr>, _>>()?;
+        if let Some(pr) = select_single_open_pr_match(head, matches)? {
+            out.insert(
+                head.clone(),
+                read_only_list_pr_from_head_search(pr, head, PrState::Open, None)?.pr,
+            );
+        }
+    }
+    Ok(out)
+}
+
+pub fn fetch_read_only_open_prs(heads: &[String]) -> Result<HashMap<String, PrInfoWithState>> {
+    let mut out = HashMap::new();
+    for chunk in heads.chunks(MAX_LIST_HEADS_PER_QUERY) {
+        let chunk_out = run_read_chunk_with_retry(
+            chunk,
+            &fetch_read_only_open_prs_chunk,
+            &|mut left, right| {
+                left.extend(right);
+                left
+            },
+        )?;
+        out.extend(chunk_out);
+    }
+    Ok(out)
+}
+
 pub fn fetch_pr_ci_review_status(numbers: &[u64]) -> Result<HashMap<u64, PrCiReviewStatus>> {
     let mut out = HashMap::new();
     for chunk in numbers.chunks(MAX_PR_STATUS_PER_QUERY) {
@@ -959,8 +1217,8 @@ fn fetch_pr_ci_review_status_chunk(numbers: &[u64]) -> Result<HashMap<u64, PrCiR
         String::from("query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ");
     for (i, n) in numbers.iter().enumerate() {
         q.push_str(&format!(
-            "pr{}: pullRequest(number: {}) {{ reviewDecision isDraft reviewRequests(first:1){{ totalCount }} reviews(last:50, states:[APPROVED,CHANGES_REQUESTED]){{ nodes {{ state }} }} commits(last:1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} ",
-            i, n
+            "pr{}: pullRequest(number: {}) {{ {} }} ",
+            i, n, LIST_PR_STATUS_FIELDS
         ));
     }
     q.push_str("} }");
@@ -981,48 +1239,7 @@ fn fetch_pr_ci_review_status_chunk(numbers: &[u64]) -> Result<HashMap<u64, PrCiR
     let repo = &v["data"]["repository"];
     for (i, n) in numbers.iter().enumerate() {
         let key = format!("pr{}", i);
-        let mut review = repo[&key]["reviewDecision"]
-            .as_str()
-            .map(PrReviewDecision::from_graphql_state)
-            .unwrap_or(PrReviewDecision::Unknown);
-        // Default when missing (no CI configured) → treat as passing
-        let mut ci = PrCiState::Success;
-        if let Some(nodes) = repo[&key]["commits"]["nodes"].as_array() {
-            if let Some(node) = nodes.first() {
-                if let Some(state) = node["commit"]["statusCheckRollup"]["state"].as_str() {
-                    ci = PrCiState::from_graphql_state(state);
-                }
-            }
-        }
-        if review == PrReviewDecision::Unknown {
-            // Fallback heuristic when reviewDecision is not available (e.g., no protected branch rules)
-            let mut has_changes_requested = false;
-            let mut has_approved = false;
-            if let Some(nodes) = repo[&key]["reviews"]["nodes"].as_array() {
-                for node in nodes {
-                    match node["state"].as_str().unwrap_or("") {
-                        "CHANGES_REQUESTED" => has_changes_requested = true,
-                        "APPROVED" => has_approved = true,
-                        _ => {}
-                    }
-                }
-            }
-            if has_changes_requested {
-                review = PrReviewDecision::ChangesRequested;
-            } else if has_approved {
-                review = PrReviewDecision::Approved;
-            } else {
-                review = PrReviewDecision::ReviewRequired;
-            }
-        }
-
-        out.insert(
-            *n,
-            PrCiReviewStatus {
-                ci_state: ci,
-                review_decision: review,
-            },
-        );
+        out.insert(*n, parse_pr_ci_review_status(&repo[&key]));
     }
     Ok(out)
 }
@@ -1516,10 +1733,10 @@ pub fn append_warning_to_pr(
 mod tests {
     use super::{
         fetch_merged_pr_merge_commit_oids, fetch_pr_bodies_graphql,
-        fetch_pr_issue_comment_bodies_graphql, filter_case_variant_head_search_matches,
-        filter_head_search_matches, is_resource_limit_error,
-        list_conflicting_prs_for_heads_search_exhaustive, list_exact_prs_for_heads,
-        list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
+        fetch_pr_issue_comment_bodies_graphql, fetch_read_only_pr_status,
+        filter_case_variant_head_search_matches, filter_head_search_matches,
+        is_resource_limit_error, list_conflicting_prs_for_heads_search_exhaustive,
+        list_exact_prs_for_heads, list_open_or_merged_prs_for_heads, list_open_prs_for_heads,
         list_recent_terminal_prs_for_heads, parse_open_pr_automerge_node, resolve_pr_url_head_ref,
         run_read_chunk_with_retry, select_latest_merged_pr_match, select_single_open_pr_match,
         HeadSearchPr, PrState, TerminalPrState, EXACT_HEAD_QUERY_LIMIT,
@@ -1606,6 +1823,21 @@ mod tests {
             "Resource limits for this query exceeded"
         )));
         assert!(!is_resource_limit_error(&anyhow!("different failure")));
+    }
+
+    fn init_github_query_repo() -> TempDir {
+        let repo = init_repo();
+        crate::test_support::git(
+            repo.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/spr-test.git",
+            ]
+            .as_slice(),
+        );
+        repo
     }
 
     fn install_gh_wrapper(script_body: &str) -> (TempDir, EnvVarGuard) {
@@ -1705,6 +1937,136 @@ mod tests {
             path_guard,
             log_path.display().to_string(),
         )
+    }
+
+    #[test]
+    fn read_only_status_prefers_open_and_falls_back_to_latest_merged() {
+        let _lock = lock_cwd();
+        let repo = init_github_query_repo();
+        let _guard = DirGuard::change_to(repo.path());
+        let response = json!({
+            "data": { "repository": {
+                "open0": { "nodes": [{
+                    "number": 17,
+                    "headRefName": "dank-spr/alpha",
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "url": "https://github.com/o/r/pull/17",
+                    "reviewDecision": "APPROVED",
+                    "reviews": { "nodes": [{ "state": "APPROVED" }] },
+                    "commits": { "nodes": [{ "commit": {
+                        "statusCheckRollup": { "state": "SUCCESS" }
+                    }}] }
+                }] },
+                "merged0": { "nodes": [{
+                    "number": 16,
+                    "headRefName": "dank-spr/alpha",
+                    "baseRefName": "main",
+                    "state": "MERGED",
+                    "mergedAt": "2026-01-01T00:00:00Z",
+                    "url": "https://github.com/o/r/pull/16"
+                }] },
+                "open1": { "nodes": [] },
+                "merged1": { "nodes": [
+                    {
+                        "number": 18,
+                        "headRefName": "dank-spr/beta",
+                        "baseRefName": "main",
+                        "state": "MERGED",
+                        "mergedAt": "2026-01-01T00:00:00Z",
+                        "url": "https://github.com/o/r/pull/18"
+                    },
+                    {
+                        "number": 19,
+                        "headRefName": "dank-spr/beta",
+                        "baseRefName": "main",
+                        "state": "MERGED",
+                        "mergedAt": "2026-02-01T00:00:00Z",
+                        "url": "https://github.com/o/r/pull/19"
+                    }
+                ] }
+            }}
+        })
+        .to_string();
+        let (_wrapper_dir, _data_dir, _path_guard, log_path) =
+            install_gh_number_query_wrapper(&response);
+
+        let result =
+            fetch_read_only_pr_status(&["dank-spr/alpha".to_string(), "dank-spr/beta".to_string()])
+                .unwrap();
+
+        assert_eq!(result["dank-spr/alpha"].pr.number, 17);
+        assert_eq!(result["dank-spr/alpha"].pr.state, PrState::Open);
+        assert!(result["dank-spr/alpha"].ci_review_status.is_some());
+        assert_eq!(result["dank-spr/beta"].pr.number, 19);
+        assert_eq!(result["dank-spr/beta"].pr.state, PrState::Merged);
+        assert_eq!(fs::read_to_string(log_path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn read_only_status_batches_twenty_heads_in_one_request() {
+        let _lock = lock_cwd();
+        let repo = init_github_query_repo();
+        let _guard = DirGuard::change_to(repo.path());
+        let mut repository = serde_json::Map::new();
+        for index in 0..20 {
+            repository.insert(format!("open{index}"), json!({ "nodes": [] }));
+            repository.insert(format!("merged{index}"), json!({ "nodes": [] }));
+        }
+        let response = json!({ "data": { "repository": repository } }).to_string();
+        let (_wrapper_dir, _data_dir, _path_guard, log_path) =
+            install_gh_number_query_wrapper(&response);
+        let heads = (0..20)
+            .map(|index| format!("dank-spr/group-{index}"))
+            .collect::<Vec<_>>();
+
+        let result = fetch_read_only_pr_status(&heads).unwrap();
+
+        assert!(result.is_empty());
+        let requests = fs::read_to_string(log_path).unwrap();
+        assert_eq!(requests.lines().count(), 1);
+        assert!(requests.contains("open19:"));
+        assert!(requests.contains("merged19:"));
+        assert!(!requests.contains("search(query:"));
+    }
+
+    #[test]
+    fn read_only_status_degrades_to_identity_when_rich_query_fails() {
+        let _lock = lock_cwd();
+        let repo = init_github_query_repo();
+        let _guard = DirGuard::change_to(repo.path());
+        let data_dir = tempfile::tempdir().unwrap();
+        let log_path = data_dir.path().join("gh.log");
+        let response_path = data_dir.path().join("response.json");
+        fs::write(
+            &response_path,
+            json!({ "data": { "repository": {
+                "open0": { "nodes": [{
+                    "number": 17,
+                    "headRefName": "dank-spr/alpha",
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "url": "https://github.com/o/r/pull/17"
+                }] },
+                "merged0": { "nodes": [] }
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *reviewDecision*) echo 'rich status unavailable' >&2; exit 1 ;;\nesac\ncat \"{}\"\n",
+            log_path.display(),
+            response_path.display()
+        );
+        let (_wrapper_dir, _path_guard) = install_gh_wrapper(&script);
+
+        let result = fetch_read_only_pr_status(&["dank-spr/alpha".to_string()]).unwrap();
+
+        assert_eq!(result["dank-spr/alpha"].pr.number, 17);
+        assert!(result["dank-spr/alpha"].ci_review_status.is_none());
+        assert_eq!(fs::read_to_string(log_path).unwrap().lines().count(), 2);
     }
 
     #[test]
