@@ -4,12 +4,13 @@
 //! `branch:<branch-name>`. `pr:` labels keep the historical compact grammar,
 //! while `branch:` names are validated through Git because real refname rules
 //! are wider than the label grammar.
+//! Markers begin at the start of the message or after Unicode whitespace.
 
 use anyhow::{bail, Result};
 use regex::{Captures, Regex};
 use std::sync::OnceLock;
 
-const CANDIDATE_MARKER_PATTERN: &str = r"(?i)(^|[^A-Za-z0-9_])(pr|branch):(\S*)";
+const CANDIDATE_MARKER_PATTERN: &str = r"(?i)(^|\s)(pr|branch):(\S*)";
 
 static CANDIDATE_MARKER_REGEX: OnceLock<Regex> = OnceLock::new();
 
@@ -174,6 +175,73 @@ mod tests {
         assert_eq!(markers[1].payload, "feature/login");
         assert_eq!(markers[2].kind, CandidateGroupMarkerKind::Branch);
         assert_eq!(markers[2].payload, "");
+    }
+
+    // Verifies: both marker forms require start of message or whitespace.
+    // Catches: incidental tokens being recognized or removed from commit prose.
+    #[test]
+    fn markers_require_start_or_whitespace() {
+        for (token, expected) in [
+            ("Pr:alpha", GroupMarker::PrLabel("alpha".to_string())),
+            (
+                "BRANCH:feature/login",
+                GroupMarker::BranchName("feature/login".to_string()),
+            ),
+        ] {
+            for prefix in [
+                "",
+                "subject ",
+                "subject\t",
+                "subject\n",
+                "subject\r\n",
+                "subject\u{00a0}",
+            ] {
+                let text = format!("{prefix}{token}");
+                let candidates = candidate_group_markers(&text);
+                assert_eq!(candidates.len(), 1, "{text:?}");
+                assert_eq!(candidates[0].clone().validate().unwrap(), expected);
+                assert_eq!(first_valid_group_marker(&text), Some(expected.clone()));
+                assert_eq!(strip_valid_group_markers(&text), prefix);
+            }
+
+            for prefix in ["upstream", "Upstream-", "_", ",", "(", "`", "é"] {
+                let text = format!("{prefix}{token}");
+                assert!(candidate_group_markers(&text).is_empty(), "{text:?}");
+                assert_eq!(first_valid_group_marker(&text), None, "{text:?}");
+                assert_eq!(strip_valid_group_markers(&text), text);
+            }
+        }
+    }
+
+    #[test]
+    fn hyphenated_trailers_are_preserved_alongside_real_markers() {
+        for (trailer, token, expected) in [
+            (
+                "Upstream-PR:upstream",
+                "Pr:alpha",
+                GroupMarker::PrLabel("alpha".to_string()),
+            ),
+            (
+                "Upstream-Branch:feature/upstream",
+                "BRANCH:feature/login",
+                GroupMarker::BranchName("feature/login".to_string()),
+            ),
+        ] {
+            assert!(candidate_group_markers(trailer).is_empty());
+            assert_eq!(first_valid_group_marker(trailer), None);
+            assert_eq!(strip_valid_group_markers(trailer), trailer);
+            for separator in ["\n", " "] {
+                let text = format!("{trailer}{separator}{token}");
+                let markers = candidate_group_markers(&text);
+                assert_eq!(markers.len(), 1);
+                assert_eq!(markers[0].clone().validate().unwrap(), expected);
+                assert_eq!(first_valid_group_marker(&text), Some(expected.clone()));
+                assert_eq!(
+                    strip_valid_group_markers(&text),
+                    format!("{trailer}{separator}")
+                );
+            }
+        }
     }
 
     #[test]
