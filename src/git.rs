@@ -395,6 +395,58 @@ pub fn get_remote_branches_sha(branches: &[String]) -> Result<HashMap<String, St
     Ok(out_map)
 }
 
+/// Ensure remote commit OIDs discovered via ls-remote are available locally.
+///
+/// ls-remote reports ref tips without downloading their objects. Update planning compares those
+/// tips with local commits, so fetch only the missing commit objects without moving any refs or
+/// writing FETCH_HEAD. This intentionally runs during dry-run too: it populates the object
+/// database so the same ancestry checks can produce an accurate plan without changing refs,
+/// index state, or the worktree.
+pub fn fetch_missing_remote_commit_objects(oids: &[String]) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    for oid in oids {
+        if !seen.insert(oid.clone()) {
+            continue;
+        }
+        let commit_spec = format!("{oid}^{{commit}}");
+        let status = Command::new("git")
+            .args(["cat-file", "-e", &commit_spec])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("failed to inspect local commit object {oid}"))?;
+        if !status.success() {
+            missing.push(oid.clone());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        "Fetching {} missing remote commit object(s) for update safety checks",
+        missing.len()
+    );
+    let mut owned_args = vec![
+        "fetch".to_string(),
+        "--no-tags".to_string(),
+        "--no-write-fetch-head".to_string(),
+        "origin".to_string(),
+    ];
+    owned_args.extend(missing.iter().cloned());
+    let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
+    verbose_log_cmd("git", &args);
+    run("git", &args).with_context(|| {
+        format!(
+            "failed to fetch missing remote commit object(s) from origin: {}",
+            missing.join(", ")
+        )
+    })?;
+
+    Ok(())
+}
+
 pub fn git_is_ancestor(ancestor: &str, descendant: &str) -> Result<bool> {
     let out = Command::new("git")
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
@@ -599,7 +651,21 @@ pub fn list_remote_branches_with_prefix(prefix: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_worktree_list_porcelain;
+    use super::{fetch_missing_remote_commit_objects, parse_worktree_list_porcelain};
+    use crate::test_support::{commit_file, git, init_repo, lock_cwd, DirGuard};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    fn commit_exists(repo: &Path, oid: &str) -> bool {
+        Command::new("git")
+            .current_dir(repo)
+            .args(["cat-file", "-e", &format!("{oid}^{{commit}}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn git cat-file")
+            .success()
+    }
 
     #[test]
     fn parse_worktree_list_porcelain_preserves_main_worktree_first() {
@@ -625,5 +691,87 @@ mod tests {
         assert_eq!(entries[0].branch, None);
         assert_eq!(entries[1].path, "/tmp/repo-stack");
         assert_eq!(entries[1].branch.as_deref(), Some("stack"));
+    }
+
+    #[test]
+    fn fetch_missing_remote_commit_objects_fetches_oid_without_moving_remote_refs() {
+        let _lock = lock_cwd();
+        let source = init_repo();
+        let parent = tempfile::tempdir().unwrap();
+        let origin = parent.path().join("origin.git");
+        git(
+            parent.path(),
+            [
+                "clone",
+                "--bare",
+                source.path().to_str().unwrap(),
+                origin.to_str().unwrap(),
+            ]
+            .as_slice(),
+        );
+        let clone = parent.path().join("clone");
+        git(
+            parent.path(),
+            ["clone", origin.to_str().unwrap(), clone.to_str().unwrap()].as_slice(),
+        );
+        let writer = parent.path().join("writer");
+        git(
+            parent.path(),
+            ["clone", origin.to_str().unwrap(), writer.to_str().unwrap()].as_slice(),
+        );
+        git(
+            &writer,
+            ["config", "user.email", "spr@example.com"].as_slice(),
+        );
+        git(&writer, ["config", "user.name", "SPR Tests"].as_slice());
+        let remote_tip = commit_file(&writer, "remote.txt", "remote\n", "remote advance");
+        git(&writer, ["push", "origin", "main"].as_slice());
+
+        let tracking_before = git(&clone, ["rev-parse", "refs/remotes/origin/main"].as_slice());
+        assert!(!commit_exists(&clone, &remote_tip));
+
+        let _guard = DirGuard::change_to(&clone);
+        fetch_missing_remote_commit_objects(&[remote_tip.clone(), remote_tip.clone()]).unwrap();
+
+        assert!(commit_exists(&clone, &remote_tip));
+        assert_eq!(
+            git(&clone, ["rev-parse", "refs/remotes/origin/main"].as_slice(),),
+            tracking_before
+        );
+    }
+
+    #[test]
+    fn fetch_missing_remote_commit_objects_skips_fetch_for_local_commits() {
+        let _lock = lock_cwd();
+        let repo = init_repo();
+        let local_head = git(repo.path(), ["rev-parse", "HEAD"].as_slice())
+            .trim()
+            .to_string();
+        git(
+            repo.path(),
+            ["remote", "add", "origin", "/definitely/missing/origin"].as_slice(),
+        );
+
+        let _guard = DirGuard::change_to(repo.path());
+        fetch_missing_remote_commit_objects(&[local_head]).unwrap();
+    }
+
+    #[test]
+    fn fetch_missing_remote_commit_objects_reports_explicit_fetch_failure() {
+        let _lock = lock_cwd();
+        let repo = init_repo();
+        git(
+            repo.path(),
+            ["remote", "add", "origin", "/definitely/missing/origin"].as_slice(),
+        );
+        let missing_oid = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+
+        let _guard = DirGuard::change_to(repo.path());
+        let error = fetch_missing_remote_commit_objects(&[missing_oid.clone()]).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to fetch missing remote commit object(s) from origin"));
+        assert!(message.contains(&missing_oid));
+        assert!(!message.contains("merge-base"));
     }
 }
